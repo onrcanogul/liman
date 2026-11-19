@@ -189,6 +189,45 @@ Only one deploy or stop per app runs at a time; a second one is refused.
 Environment variable values are never printed. liman only lists and touches
 containers it started itself (label `liman.app`).
 
+## Secrets
+
+Passwords and API keys do not belong in `app.yaml`, which is committed to a
+repository. The definition only names them:
+
+```yaml
+secrets:
+  - DATABASE_URL
+  - API_KEY
+```
+
+The values are given to the daemon once, and it adds them to the container's
+environment under the same names on every deploy:
+
+```sh
+liman secret set orders-api DATABASE_URL       # prompts; the input is not shown
+cat key.txt | liman secret set orders-api API_KEY
+liman secret list orders-api                   # names and dates, never values
+liman secret rm orders-api API_KEY
+```
+
+The value is never a command line argument (that would put it in the shell
+history and the process list). A deploy that refers to a secret that is not
+set is refused before anything is pulled or started. A changed secret takes
+effect on the next deploy.
+
+Values are encrypted with AES-256-GCM before they are stored. Each one is
+bound to its app and name, so a ciphertext copied to another row does not
+decrypt. The key is `master.key` in `$LIMAN_HOME`, created on the first start
+(or set `secrets.key_file` in `config.yaml`). **Back it up, and not next to
+the database**: without it the secrets cannot be recovered, and the daemon
+refuses to start rather than create a new key when secrets exist but the key
+is gone. It also refuses a key file that other users can read.
+
+What this protects is the database and its backups. It does not hide a secret
+from someone who can run `docker inspect` on the server, or from the app
+itself: the value is in the container's environment in plain text. There is
+no API to read a secret back.
+
 ## The daemon
 
 `limand` keeps its files in `$LIMAN_HOME` (default `~/.liman`):
@@ -196,7 +235,8 @@ containers it started itself (label `liman.app`).
 | File | Content |
 |---|---|
 | `config.yaml` | Optional settings, see below |
-| `liman.db` | SQLite database: step and restart history, releases, token hashes |
+| `liman.db` | SQLite database: step and restart history, releases, token hashes, encrypted secrets |
+| `master.key` | The key the secrets are encrypted with; created on first start |
 
 ```yaml
 # config.yaml
@@ -250,6 +290,9 @@ The environment variables `LIMAN_URL` and `LIMAN_TOKEN` take precedence.
 | `POST /v1/apps/{name}/rollback[?dry_run=true][&step=true]` | Put the previous release back into service; streams like a deploy |
 | `DELETE /v1/apps/{name}` | Stop and remove an app |
 | `GET /v1/history[?app=][&limit=]` | Executed steps |
+| `GET /v1/apps/{name}/secrets` | Names of an app's secrets, never values |
+| `PUT /v1/apps/{name}/secrets/{key}` | Body: the value. Stores it encrypted |
+| `DELETE /v1/apps/{name}/secrets/{key}` | Removes a secret |
 
 ## Security
 
@@ -269,8 +312,10 @@ is equivalent to root. The API is built around keeping everyone else out:
 - **Input.** Every field of an app definition and every app name in a URL is
   checked against an allowlist of characters and a maximum length. Values are
   never concatenated into SQL, shell commands or file paths.
-- **Files.** `liman.db` and `client.yaml` are readable by their owner only.
-  Tokens and environment variable values are never written to logs.
+- **Files.** `liman.db`, `master.key` and `client.yaml` are readable by their
+  owner only. Tokens, secrets and environment variable values are never
+  written to logs.
+- **Secrets.** Encrypted at rest and write-only over the API (see Secrets).
 
 Known limits: no TLS of its own, no scopes (every token can do everything),
 tokens do not expire, and the failed-attempt limit is per address and kept in
@@ -416,7 +461,8 @@ internal/cli/        the liman command: arguments, output, exit codes
 internal/daemon/     the limand command: serving and token management
 internal/api/        wire types and the HTTP client (what the CLI links)
 internal/server/     HTTP handlers, streaming, auth, per-app locking
-internal/store/      SQLite: history, releases, tokens
+internal/store/      SQLite: history, releases, tokens, sealed secrets
+internal/secrets/    encryption of secrets at rest and the master key file
 internal/app/        app definition: loading and validation
 internal/deploy/     the steps of a deploy and how each is undone
 internal/pipeline/   runs steps: dry run, confirmation, rollback
