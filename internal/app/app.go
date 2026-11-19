@@ -33,6 +33,11 @@ type App struct {
 	// Env holds environment variables passed to the container.
 	Env map[string]string `yaml:"env"`
 
+	// Secrets names values that are not written in this file. The daemon
+	// keeps them encrypted and adds them to the container's environment at
+	// deploy time, under the same name. Set them with "liman secret set".
+	Secrets []string `yaml:"secrets"`
+
 	// Resources limits what the container may consume. Zero values mean
 	// "no limit".
 	Resources Resources `yaml:"resources"`

@@ -96,6 +96,24 @@ func (a *App) Validate() error {
 		}
 	}
 
+	if len(a.Secrets) > maxEnvVars {
+		errs = append(errs, fmt.Errorf("secrets: at most %d secrets are allowed, got %d", maxEnvVars, len(a.Secrets)))
+	}
+	seen := map[string]bool{}
+	for _, name := range a.Secrets {
+		switch {
+		case !envKeyRe.MatchString(name):
+			errs = append(errs, fmt.Errorf("secrets: invalid name %q", name))
+		case seen[name]:
+			errs = append(errs, fmt.Errorf("secrets: %s is listed twice", name))
+		}
+		seen[name] = true
+		// A name in both places would leave it unclear which value wins.
+		if _, clash := a.Env[name]; clash {
+			errs = append(errs, fmt.Errorf("secrets: %s is also set under env; keep it in one place", name))
+		}
+	}
+
 	if a.Resources.Memory != "" {
 		if _, err := a.Resources.MemoryBytes(); err != nil {
 			errs = append(errs, fmt.Errorf("resources.memory: %w", err))
