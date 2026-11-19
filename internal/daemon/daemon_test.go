@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -226,6 +227,10 @@ func TestServeAndShutDown(t *testing.T) {
 			t.Errorf("log does not contain %q:\n%s", want, td.stderr.String())
 		}
 	}
+	// Successful health checks are deliberately absent from the log.
+	if strings.Contains(td.stderr.String(), "path=/v1/health") {
+		t.Errorf("the log contains health checks:\n%s", td.stderr.String())
+	}
 	// The token travels in a header; it must never appear in the log.
 	if strings.Contains(td.stderr.String(), cfg.Token) {
 		t.Error("the log contains the API token")
@@ -313,5 +318,45 @@ func TestServeWarnsWithoutTokens(t *testing.T) {
 
 	if !strings.Contains(td.stderr.String(), "no API tokens exist yet") {
 		t.Errorf("log does not warn about missing tokens:\n%s", td.stderr.String())
+	}
+}
+
+func TestConnectOnceSharesOneConnection(t *testing.T) {
+	calls := 0
+	failures := 2
+	fake := enginetest.New()
+
+	connect := connectOnce(func(context.Context) (engine.Engine, error) {
+		calls++
+		if failures > 0 {
+			failures--
+			return nil, errors.New("docker is down")
+		}
+		return fake, nil
+	})
+
+	// While the engine is unavailable every call tries again...
+	for range 2 {
+		if _, err := connect(context.Background()); err == nil {
+			t.Fatal("connect succeeded while the engine was down")
+		}
+	}
+
+	// ...and once it works, the connection is kept and shared.
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			eng, err := connect(context.Background())
+			if err != nil || eng != engine.Engine(fake) {
+				t.Errorf("connect() = %v, %v; want the shared engine", eng, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if calls != 3 {
+		t.Errorf("the engine was connected to %d times, want 2 failures and 1 success", calls)
 	}
 }

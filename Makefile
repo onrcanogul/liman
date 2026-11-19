@@ -8,7 +8,7 @@ LDFLAGS := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
            -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
            -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: build test test-integration lint fmt check clean dev-nginx dev-nginx-stop dev-cert
+.PHONY: build test test-integration load-test lint fmt check clean dev-nginx dev-nginx-stop dev-cert
 
 build: ## Build the CLI (bin/liman) and the daemon (bin/limand)
 	go build -ldflags "$(LDFLAGS)" -o bin/liman ./cmd/liman
@@ -19,6 +19,9 @@ test: ## Run all tests with the race detector
 
 test-integration: ## Run tests that need a running Docker daemon
 	go test -race -count=1 -tags integration ./internal/docker
+
+load-test: ## Measure throughput and latency of the daemon (about a minute)
+	go test -count=1 -tags load -run 'TestLoad' -v ./internal/server
 
 lint: ## Run golangci-lint
 	golangci-lint run

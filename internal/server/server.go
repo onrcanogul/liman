@@ -75,6 +75,10 @@ type Server struct {
 	// requests arrive at the same time.
 	limiter     *authLimiter
 	initLimiter sync.Once
+
+	// rejected summarises requests that were turned away wholesale. Its
+	// zero value is ready to use.
+	rejected rejections
 }
 
 // authFailures returns the failed-authentication limiter.
@@ -104,18 +108,19 @@ func (s *Server) Handler() http.Handler {
 	// through the list below from top to bottom. The order is deliberate:
 	//
 	//   recoverPanics     outermost, so it also covers the other middleware
-	//   logRequests       before any rejection, so rejected requests are
-	//                     logged too: they are the interesting ones
 	//   secureHeaders     so even error responses carry the headers
-	//   limitConcurrency  cheap, and before anything that does real work
+	//   limitConcurrency  before logging: requests shed under load are
+	//                     counted and summarised, not logged one by one
+	//   logRequests       before authentication, so rejected requests are
+	//                     logged too: they are the interesting ones
 	//   rejectBrowsers    cheap, and before authentication
 	//   authenticate      last: everything behind it is trusted
 	var h http.Handler = mux
 	h = s.authenticate(h)
 	h = s.rejectBrowsers(h)
+	h = s.logRequests(h)
 	h = s.limitConcurrency(h)
 	h = s.secureHeaders(h)
-	h = s.logRequests(h)
 	h = s.recoverPanics(h)
 	return h
 }
@@ -152,14 +157,22 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var eng engine.Engine
+	// unlock releases the app; it does nothing for a dry run, which takes
+	// no lock.
+	unlock := func() {}
 	if !dryRun {
 		// One deploy per app at a time. Two concurrent deploys would each
 		// treat the other's container as "previous" and remove it.
-		unlock, ok := s.lock(a.Name)
+		release, ok := s.lock(a.Name)
 		if !ok {
 			writeError(w, http.StatusConflict, fmt.Errorf("another operation on %s is in progress", a.Name))
 			return
 		}
+		// sync.OnceFunc returns a function that runs release the first
+		// time it is called and does nothing afterwards. The lock is
+		// released explicitly below, before the result is sent; the defer
+		// covers every early return and a panic.
+		unlock = sync.OnceFunc(release)
 		defer unlock()
 
 		if eng, err = s.Connect(ctx); err != nil {
@@ -204,6 +217,14 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	if !dryRun {
 		s.recordRelease(a, res.Release, started, err)
 	}
+
+	// Release the app before telling the client that the deploy is over.
+	// The other way round, a client that reacts to the result at once (a
+	// script deploying twice in a row) could be back with its next request
+	// while this handler still holds the lock, and be refused with a 409
+	// for a deploy that had, as far as it could tell, finished. (Found by
+	// the load test: about one sequential deploy in five thousand.)
+	unlock()
 	stream.send(api.DeployEvent{Type: api.EventResult, Result: result})
 }
 
@@ -309,11 +330,13 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	unlock, ok := s.lock(name)
+	release, ok := s.lock(name)
 	if !ok {
 		writeError(w, http.StatusConflict, fmt.Errorf("another operation on %s is in progress", name))
 		return
 	}
+	// As in handleDeploy: released before the success answer is sent.
+	unlock := sync.OnceFunc(release)
 	defer unlock()
 
 	eng, containers, status, err := s.containersOf(ctx, name)
@@ -345,6 +368,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		}
 		result.Removed = append(result.Removed, c.Name)
 	}
+	unlock()
 	writeJSON(w, http.StatusOK, result)
 }
 

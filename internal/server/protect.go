@@ -116,6 +116,55 @@ func clientAddress(r *http.Request) string {
 	return host
 }
 
+// --- logging of rejected requests ---------------------------------------------
+
+// rejections counts requests that were turned away wholesale (shed under
+// load, or from a locked-out address) and reports them as a summary, at
+// most once per interval.
+//
+// Logging each of them individually hands an attacker a second weapon: the
+// load test wrote 192 MB of log in 36 seconds. A flood of rejected requests
+// must cost one log line per second, not one per request.
+type rejections struct {
+	mu        sync.Mutex
+	shed      int
+	lockedOut int
+	lastLog   time.Time
+}
+
+const rejectionLogInterval = time.Second
+
+// note counts one rejected request and returns the totals to log, if it is
+// time to log them.
+func (r *rejections) note(shed bool, now time.Time) (shedCount, lockedOutCount int, logNow bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if shed {
+		r.shed++
+	} else {
+		r.lockedOut++
+	}
+	if now.Sub(r.lastLog) < rejectionLogInterval {
+		return 0, 0, false
+	}
+
+	shedCount, lockedOutCount = r.shed, r.lockedOut
+	r.shed, r.lockedOut, r.lastLog = 0, 0, now
+	return shedCount, lockedOutCount, true
+}
+
+// noteRejection records a rejected request and writes the summary line when
+// one is due.
+func (s *Server) noteRejection(shed bool) {
+	if shedCount, lockedOut, logNow := s.rejected.note(shed, time.Now()); logNow {
+		s.logger().Warn("requests rejected",
+			"shed_under_load", shedCount,
+			"from_locked_out_addresses", lockedOut,
+		)
+	}
+}
+
 // --- middleware -----------------------------------------------------------
 
 // limitConcurrency rejects requests while too many are already being
@@ -137,6 +186,7 @@ func (s *Server) limitConcurrency(next http.Handler) http.Handler {
 			defer func() { <-slots }()
 			next.ServeHTTP(w, r)
 		default:
+			s.noteRejection(true)
 			w.Header().Set("Retry-After", "1")
 			writeError(w, http.StatusServiceUnavailable, errors.New("the daemon is handling too many requests; try again shortly"))
 		}

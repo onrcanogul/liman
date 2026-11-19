@@ -28,6 +28,7 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		// Checked before the token is even looked at: during a lockout the
 		// client learns nothing, not even whether a guess was right.
 		if wait, locked := limiter.blocked(client); locked {
+			s.noteRejection(false)
 			w.Header().Set("Retry-After", retryAfter(wait))
 			writeError(w, http.StatusTooManyRequests, tooManyAttempts(wait))
 			return
@@ -67,6 +68,20 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 
 		next.ServeHTTP(rec, r)
+
+		// Requests from a locked-out address are summarised elsewhere
+		// (see rejections): a client hammering the API while locked out
+		// must not be able to fill the disk with log lines.
+		if rec.status == http.StatusTooManyRequests {
+			return
+		}
+		// Successful health checks are not logged either. They carry no
+		// information, monitoring sends them constantly, and because the
+		// endpoint needs no token they are the one request anybody who can
+		// reach the daemon could use to flood the log.
+		if r.URL.Path == "/v1/health" && rec.status == http.StatusOK {
+			return
+		}
 
 		// The path is logged, the query string and headers are not: the
 		// Authorization header is a secret and must never reach a log.

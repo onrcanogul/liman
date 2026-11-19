@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -113,7 +114,7 @@ func (d *Daemon) serve(ctx context.Context) int {
 	// Under systemd they go to the journal; nothing else is needed.
 	log := slog.New(slog.NewTextHandler(d.Stderr, nil))
 
-	srv := &server.Server{Store: st, Connect: d.Connect, Log: log}
+	srv := &server.Server{Store: st, Connect: connectOnce(d.Connect), Log: log}
 	// Only assign the proxy when it is enabled. Assigning a nil
 	// *nginx.Manager to the interface field would make the field non-nil.
 	if cfg.Nginx.Enabled() {
@@ -198,6 +199,42 @@ func (d *Daemon) serve(ctx context.Context) int {
 
 	log.Info("limand stopped")
 	return exitOK
+}
+
+// connectOnce wraps connect so that the engine is connected to once and the
+// connection is then shared by every request.
+//
+// Connecting per request, as the first version did, created a new client
+// (with its own connection pool) for every request and never closed it. The
+// load test showed the result: the daemon's memory grew from 22 to 253 MiB
+// and each listing paid for a new connection and a ping.
+//
+// A failed attempt is not remembered: while Docker is down every request
+// tries again, and the first success is kept. The client itself survives a
+// Docker restart, because it dials the socket anew whenever it needs to.
+func connectOnce(connect func(ctx context.Context) (engine.Engine, error)) func(ctx context.Context) (engine.Engine, error) {
+	var (
+		mu     sync.Mutex
+		shared engine.Engine
+	)
+
+	return func(ctx context.Context) (engine.Engine, error) {
+		// The lock is held while connecting. Requests that arrive together
+		// at start-up therefore wait for one connection instead of each
+		// opening their own.
+		mu.Lock()
+		defer mu.Unlock()
+
+		if shared != nil {
+			return shared, nil
+		}
+		eng, err := connect(ctx)
+		if err != nil {
+			return nil, err
+		}
+		shared = eng
+		return shared, nil
+	}
 }
 
 func (d *Daemon) runToken(ctx context.Context, args []string) int {

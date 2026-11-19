@@ -115,3 +115,33 @@ func TestRetryAfterRoundsUp(t *testing.T) {
 		}
 	}
 }
+
+func TestRejectionsAreSummarisedNotLoggedIndividually(t *testing.T) {
+	var r rejections
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
+	// A flood within one second produces exactly one log line (the first),
+	// and the rest are counted.
+	logged := 0
+	for i := range 10_000 {
+		if _, _, logNow := r.note(i%2 == 0, now.Add(time.Duration(i)*50*time.Microsecond)); logNow {
+			logged++
+		}
+	}
+	if logged != 1 {
+		t.Fatalf("10000 rejections within half a second produced %d log lines, want 1", logged)
+	}
+
+	// The next line, a second later, reports everything counted since the
+	// first one: of the 9999 that followed it, 4999 were shed and 5000
+	// locked out, plus the shed request that triggers this summary.
+	shed, lockedOut, logNow := r.note(true, now.Add(2*time.Second))
+	if !logNow || shed != 5000 || lockedOut != 5000 {
+		t.Errorf("summary = %d shed, %d locked out, logNow %v; want 5000, 5000, true", shed, lockedOut, logNow)
+	}
+
+	// After a summary the counts start over.
+	if shed, lockedOut, _ := r.note(false, now.Add(4*time.Second)); shed != 0 || lockedOut != 1 {
+		t.Errorf("after a summary the counts are %d and %d, want 0 and 1", shed, lockedOut)
+	}
+}

@@ -1001,3 +1001,28 @@ func TestOversizedHeadersAreRefused(t *testing.T) {
 		t.Errorf("status = %d, want 431", resp.StatusCode)
 	}
 }
+
+func TestAppIsUnlockedBeforeTheResultIsSent(t *testing.T) {
+	h := servertest.New(t)
+
+	// Deploy the same app back to back, each request sent the moment the
+	// previous one reported its result. If the daemon announced the result
+	// while still holding the app's lock, some of these would be refused.
+	// (The load test found this at a rate of about 1 in 5000.)
+	for i := range 3000 {
+		_, err := h.Client.Deploy(ctx(), []byte(definition), api.DeployOptions{}, io.Discard)
+		if err != nil {
+			t.Fatalf("deploy %d directly after the previous one: %v", i+1, err)
+		}
+	}
+
+	// The same holds for stop followed by a deploy.
+	for i := range 300 {
+		if _, err := h.Client.Stop(ctx(), "orders-api"); err != nil {
+			t.Fatalf("stop %d: %v", i+1, err)
+		}
+		if _, err := h.Client.Deploy(ctx(), []byte(definition), api.DeployOptions{}, io.Discard); err != nil {
+			t.Fatalf("deploy %d directly after a stop: %v", i+1, err)
+		}
+	}
+}

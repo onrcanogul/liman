@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/onrcanogul/liman/internal/engine"
@@ -13,7 +14,18 @@ import (
 
 // Fake is an engine that keeps containers in a map and records every call.
 // Set the Err fields to make the corresponding method fail.
+//
+// Its methods may be called from several goroutines at once, as a server
+// handling concurrent requests does. Tests that read or change the fields
+// directly must do so while no request is in flight.
 type Fake struct {
+	// mu guards every field below while a method runs.
+	mu sync.Mutex
+
+	// RecordCalls can be switched off for load tests, where an ever-growing
+	// call list would be measured as a memory leak. New turns it on.
+	RecordCalls bool
+
 	// Calls lists the operations in the order they happened, for example
 	// "pull nginx:1.27" or "start web-r1".
 	Calls []string
@@ -48,14 +60,29 @@ var _ engine.Engine = (*Fake)(nil)
 // New returns an empty fake engine.
 func New() *Fake {
 	return &Fake{
-		Containers: map[string]engine.Container{},
-		clock:      time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		RecordCalls: true,
+		Containers:  map[string]engine.Container{},
+		clock:       time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 	}
 }
 
 // Add puts an existing container into the fake, as if it had been started
 // earlier. Name and App are required; State defaults to "running".
 func (f *Fake) Add(c engine.Container) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.add(c)
+}
+
+// record notes a call. The caller holds mu.
+func (f *Fake) record(call string) {
+	if f.RecordCalls {
+		f.Calls = append(f.Calls, call)
+	}
+}
+
+// add is Add for callers that already hold mu.
+func (f *Fake) add(c engine.Container) {
 	if c.State == "" {
 		c.State = "running"
 	}
@@ -69,7 +96,10 @@ func (f *Fake) Add(c engine.Container) {
 
 // Pull implements engine.Engine.
 func (f *Fake) Pull(_ context.Context, image string, progress io.Writer) error {
-	f.Calls = append(f.Calls, "pull "+image)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.record("pull " + image)
 	if f.PullErr != nil {
 		return f.PullErr
 	}
@@ -79,7 +109,10 @@ func (f *Fake) Pull(_ context.Context, image string, progress io.Writer) error {
 
 // Start implements engine.Engine.
 func (f *Fake) Start(_ context.Context, spec engine.Spec) (string, error) {
-	f.Calls = append(f.Calls, "start "+spec.Name)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.record("start " + spec.Name)
 	if f.StartErr != nil {
 		return "", f.StartErr
 	}
@@ -91,8 +124,10 @@ func (f *Fake) Start(_ context.Context, spec engine.Spec) (string, error) {
 	if state == "" {
 		state = "running"
 	}
-	f.Specs = append(f.Specs, spec)
-	f.Add(engine.Container{
+	if f.RecordCalls {
+		f.Specs = append(f.Specs, spec)
+	}
+	f.add(engine.Container{
 		Name:      spec.Name,
 		App:       spec.App,
 		Image:     spec.Image,
@@ -107,6 +142,9 @@ func (f *Fake) Start(_ context.Context, spec engine.Spec) (string, error) {
 
 // Inspect implements engine.Engine.
 func (f *Fake) Inspect(_ context.Context, ref string) (engine.Container, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	ctr, ok := f.Containers[ref]
 	if !ok {
 		return engine.Container{}, fmt.Errorf("%s: %w", ref, engine.ErrNotFound)
@@ -116,10 +154,13 @@ func (f *Fake) Inspect(_ context.Context, ref string) (engine.Container, error) 
 
 // Remove implements engine.Engine.
 func (f *Fake) Remove(_ context.Context, ref string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if _, ok := f.Containers[ref]; !ok {
 		return fmt.Errorf("%s: %w", ref, engine.ErrNotFound)
 	}
-	f.Calls = append(f.Calls, "remove "+ref)
+	f.record("remove " + ref)
 	if f.RemoveErr != nil {
 		return f.RemoveErr
 	}
@@ -129,6 +170,9 @@ func (f *Fake) Remove(_ context.Context, ref string) error {
 
 // List implements engine.Engine.
 func (f *Fake) List(_ context.Context) ([]engine.Container, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	out := make([]engine.Container, 0, len(f.Containers))
 	for _, ctr := range f.Containers {
 		out = append(out, ctr)
@@ -144,10 +188,13 @@ func (f *Fake) List(_ context.Context) ([]engine.Container, error) {
 
 // Logs implements engine.Engine.
 func (f *Fake) Logs(_ context.Context, ref string, _ bool, stdout, _ io.Writer) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if _, ok := f.Containers[ref]; !ok {
 		return fmt.Errorf("%s: %w", ref, engine.ErrNotFound)
 	}
-	f.Calls = append(f.Calls, "logs "+ref)
+	f.record("logs " + ref)
 	_, err := io.WriteString(stdout, f.LogOutput)
 	return err
 }

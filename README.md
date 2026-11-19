@@ -295,7 +295,30 @@ make test               # unit tests
 make lint               # linters
 make check              # lint + test
 make test-integration   # tests that need a running Docker daemon
+make load-test          # throughput, latency and leak checks (about a minute)
 ```
+
+### Load tests
+
+`make load-test` starts a complete daemon inside the test process (real HTTP
+server and SQLite database, Docker replaced by an in-memory engine) and
+measures it: the read endpoints at rising concurrency, concurrent deploys,
+many clients fighting over one app, and a mixed run that checks afterwards
+that no goroutines or memory were left behind.
+
+To aim the read scenarios at a running daemon with real Docker behind it:
+
+```
+LIMAN_LOAD_URL=http://127.0.0.1:7070 LIMAN_LOAD_TOKEN=liman_... \
+  go test -count=1 -tags load -run TestLoadReads -v ./internal/server
+```
+
+The numbers depend on the machine; compare runs on one machine, not against
+anything absolute. On the development laptop the daemon answers about
+100,000 health checks, 10,000 history queries and 1,000 container listings
+per second (the last one limited by Docker itself), and runs about 2,500
+deploys per second against the in-memory engine. Beyond 64 concurrent
+requests it sheds load with 503.
 
 ## Layout
 
@@ -315,6 +338,7 @@ internal/docker/     Docker implementation of the engine interface
 internal/nginx/      renders, writes, tests and reloads proxy config
 internal/config/     config.yaml and client.yaml
 internal/textdiff/   line diff used to preview config changes
+internal/loadtest/   small load generator used by the load tests
 internal/buildinfo/  version metadata injected at build time
 scripts/             local development helpers
 ```
