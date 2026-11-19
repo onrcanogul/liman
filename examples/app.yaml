@@ -1,0 +1,28 @@
+# Example app definition. Try it with: liman plan examples/app.yaml
+
+# Required. Becomes the container name; lowercase letters, digits, hyphens.
+name: orders-api
+
+# Required. Must include a fixed tag or digest; "latest" is rejected.
+image: ghcr.io/user/orders-api:1.4
+
+# Required. Public host name routed to this app.
+domain: api.example.com
+
+# Required. Port the app listens on inside the container.
+port: 3000
+
+# Optional. Quote the values so YAML does not turn them into numbers or
+# booleans. Do not commit real secrets here.
+env:
+  NODE_ENV: "production"
+  LOG_LEVEL: "info"
+
+# Optional. Omit a limit to leave it unlimited.
+resources:
+  memory: 512m # k, m or g
+  cpus: 0.5
+
+# Optional. Without it liman only waits for the container to be running.
+healthcheck:
+  path: /health

@@ -27,10 +27,25 @@ $ ./bin/liman version
 liman 3f2a1c9 (commit 3f2a1c9, built 2026-11-19T17:00:00Z)
 ```
 
+```
+$ ./bin/liman plan examples/app.yaml
+Plan for orders-api (examples/app.yaml):
+  1. Pull image ghcr.io/user/orders-api:1.4
+  2. Allocate a free host port
+  3. Start container orders-api on port 3000 (memory 512m, cpus 0.5, 2 env vars)
+  4. Health check: GET /health on port 3000
+  5. Write Nginx config for api.example.com
+  6. Reload Nginx
+```
+
+See [examples/app.yaml](examples/app.yaml) for the app definition format.
+
 ## Layout
 
 ```
 cmd/liman/           CLI entry point (wiring only)
 internal/cli/        command dispatch
+internal/app/        app definition: loading and validation
+internal/plan/       turns an app definition into deploy steps
 internal/buildinfo/  version metadata injected at build time
 ```

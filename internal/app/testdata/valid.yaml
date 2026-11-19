@@ -1,0 +1,12 @@
+name: orders-api
+image: ghcr.io/user/orders-api:1.4
+domain: api.example.com
+port: 3000
+env:
+  NODE_ENV: "production"
+  LOG_LEVEL: "info"
+resources:
+  memory: 512m
+  cpus: 0.5
+healthcheck:
+  path: /health
