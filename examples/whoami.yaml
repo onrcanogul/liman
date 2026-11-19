@@ -1,0 +1,19 @@
+# A tiny public image that answers every request with details about itself.
+# Useful for trying liman without an app of your own:
+#
+#   liman deploy examples/whoami.yaml
+#   liman ps
+#   liman logs whoami
+#   liman stop whoami
+
+name: whoami
+image: traefik/whoami:v1.10
+domain: whoami.example.com
+port: 80
+env:
+  WHOAMI_NAME: "liman-demo"
+resources:
+  memory: 64m
+  cpus: 0.5
+healthcheck:
+  path: /health

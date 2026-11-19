@@ -8,13 +8,16 @@ LDFLAGS := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
            -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
            -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: build test lint fmt check clean
+.PHONY: build test test-integration lint fmt check clean
 
 build: ## Build the CLI into bin/liman
 	go build -ldflags "$(LDFLAGS)" -o bin/liman ./cmd/liman
 
 test: ## Run all tests with the race detector
 	go test -race ./...
+
+test-integration: ## Run tests that need a running Docker daemon
+	go test -race -count=1 -tags integration ./internal/docker
 
 lint: ## Run golangci-lint
 	golangci-lint run

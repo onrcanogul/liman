@@ -90,7 +90,7 @@ collection.
 
 - [x] Stage 0
 - [x] Stage 1
-- [ ] Stage 2
+- [x] Stage 2
 - [ ] Stage 3
 - [ ] Stage 4
 - [ ] Stage 5
