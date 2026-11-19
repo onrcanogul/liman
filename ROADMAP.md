@@ -98,5 +98,5 @@ collection.
   - [ ] 5b: install on the server (systemd, WireGuard, host Nginx)
   - [ ] 5c: certificates from Let's Encrypt
 - [x] Stage 6
-- [ ] Stage 7
+- [x] Stage 7
 - [ ] Stage 8

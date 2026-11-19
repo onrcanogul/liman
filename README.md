@@ -63,16 +63,16 @@ Dry run for whoami: nothing will be changed.
     $ docker run -d --name whoami-20261119-181805-123 --label liman.app=whoami -p 127.0.0.1:<free port>:80 --memory 64m --cpus 0.5 -e WHOAMI_NAME=*** traefik/whoami:v1.10
 ==> [4/5] Health check
     $ curl --fail http://127.0.0.1:<free port>/health
-==> [5/5] Remove previous containers of whoami
-    $ docker rm -f $(docker ps -aq --filter label=liman.app=whoami)   # except whoami-20261119-181805-123
+==> [5/5] Retire previous containers of whoami
+    $ docker stop <current container of whoami>   # kept for rollback; older ones are removed
 ```
 
 `liman plan <file>` is a shorthand for the same thing.
 
 A real deploy runs the steps on the server. The new release starts next to the
-previous one, which is only removed once the new one is healthy. If a step
-fails, or you press Ctrl+C, the daemon undoes the completed steps in reverse
-order and the previous release keeps running:
+previous one, which is only retired once the new one is healthy and receiving
+the traffic. If a step fails, or you press Ctrl+C, the daemon undoes the
+completed steps in reverse order and the previous release keeps running:
 
 ```
 $ liman deploy broken.yaml
@@ -93,12 +93,58 @@ Other commands:
 
 ```
 liman deploy --step <file>   # ask before every step; "n" undoes what was done
+liman rollback <app>         # put the previous release back into service
 liman ps                     # containers managed by liman
 liman logs -f <app>          # follow the logs of the newest release
 liman stop <app>             # stop and remove all containers of an app
 liman history [-n N] [app]   # every executed step, with result and duration
 liman status                 # is the daemon reachable, is the token accepted
 ```
+
+## Zero-downtime deploys and rollback
+
+With Nginx configured, a deploy never leaves a moment in which nothing
+answers:
+
+1. the new release starts next to the current one and must pass its health
+   check;
+2. Nginx is switched to it, and liman waits until Nginx reports the new
+   release;
+3. the previous release keeps running for a drain period (5 seconds by
+   default), so requests it had already accepted can finish;
+4. the previous release is stopped, not deleted.
+
+```yaml
+# config.yaml
+deploy:
+  drain: 5s   # the default; 0s disables the wait
+```
+
+Because the previous container is kept, going back needs no app definition
+and no image pull:
+
+```
+$ liman rollback whoami
+==> [1/6] Start previous container whoami-20261119-221645-519
+==> [2/6] Health check
+    GET http://127.0.0.1:62586/health
+==> [3/6] Write Nginx config for whoami.localhost
+==> [4/6] Reload Nginx
+==> [5/6] Drain connections to the previous release
+    waiting 5s
+==> [6/6] Remove container whoami-20261119-221650-883
+
+whoami is back on release 20261119-221645-519, running on the server at 127.0.0.1:62586
+```
+
+`liman rollback` accepts `--dry-run` and `--step` like a deploy, and a
+rollback that fails leaves the current release in service. `liman ps` shows
+which container is `current` and which is the `previous` one being kept.
+
+Limits: exactly one previous release is kept, so only one step back is
+possible, and the release rolled back from is removed. Database migrations
+are not liman's business: a rollback runs the old code against whatever
+schema the new code left behind.
 
 ## Health monitoring
 
@@ -201,6 +247,7 @@ The environment variables `LIMAN_URL` and `LIMAN_TOKEN` take precedence.
 | `POST /v1/confirmations/{id}` | Answers a question asked by a step-by-step deploy |
 | `GET /v1/apps` | Managed containers |
 | `GET /v1/apps/{name}/logs[?follow=true]` | Logs as plain text |
+| `POST /v1/apps/{name}/rollback[?dry_run=true][&step=true]` | Put the previous release back into service; streams like a deploy |
 | `DELETE /v1/apps/{name}` | Stop and remove an app |
 | `GET /v1/history[?app=][&limit=]` | Executed steps |
 
@@ -271,19 +318,20 @@ and include that directory once from the `http` block of your Nginx config:
 include /etc/nginx/liman/*.conf;
 ```
 
-liman never reads or edits any other Nginx file. A deploy then gains two
-steps between the health check and the removal of the previous release:
+liman never reads or edits any other Nginx file. A deploy then gains three
+steps between the health check and the retiring of the previous release:
 
 ```
-==> [5/7] Write Nginx config for whoami.localhost
+==> [5/8] Write Nginx config for whoami.localhost
       ...
       upstream liman-whoami {
     -     server 127.0.0.1:58276;
     +     server 127.0.0.1:58352;
       }
       ...
-==> [6/7] Reload Nginx
-==> [7/7] Remove previous containers of whoami
+==> [6/8] Reload Nginx
+==> [7/8] Drain connections to the previous release
+==> [8/8] Retire previous containers of whoami
 ```
 
 The reload step runs `nginx -t` first, reloads, and then waits until Nginx
