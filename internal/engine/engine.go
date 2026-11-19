@@ -27,6 +27,9 @@ const (
 	// LabelHealthPath is the HTTP path to probe, or absent when the app
 	// defines no health check.
 	LabelHealthPath = "liman.healthcheck"
+	// LabelDomain is the domain the app is served on. A rollback needs it
+	// to point the proxy back at an older container.
+	LabelDomain = "liman.domain"
 )
 
 // Sentinel errors. Callers compare against them with errors.Is.
@@ -61,9 +64,10 @@ type Spec struct {
 	MemoryBytes int64
 	CPUs        float64
 
-	// Release and HealthPath are stored as labels on the container.
+	// Release, HealthPath and Domain are stored as labels on the container.
 	Release    string
 	HealthPath string
+	Domain     string
 }
 
 // Container is the observed state of a container.
@@ -92,9 +96,10 @@ type Container struct {
 	ExitCode  int
 	OOMKilled bool
 
-	// Release and HealthPath come from the container's labels.
+	// Release, HealthPath and Domain come from the container's labels.
 	Release    string
 	HealthPath string
+	Domain     string
 }
 
 // Running reports whether the container is currently running.
@@ -123,6 +128,10 @@ type Engine interface {
 	// Restart stops a managed container if it is running and starts it
 	// again. It also brings back a container that has exited.
 	Restart(ctx context.Context, ref string) error
+
+	// Stop stops a managed container without deleting it, so it can be
+	// started again later. Stopping a stopped container is not an error.
+	Stop(ctx context.Context, ref string) error
 
 	// List returns all managed containers, running or not, ordered by app
 	// and then by creation time, oldest first.

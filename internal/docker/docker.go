@@ -216,6 +216,7 @@ func (c *Client) Inspect(ctx context.Context, ref string) (engine.Container, err
 
 		Release:    info.Config.Labels[engine.LabelRelease],
 		HealthPath: info.Config.Labels[engine.LabelHealthPath],
+		Domain:     info.Config.Labels[engine.LabelDomain],
 	}
 	if info.State != nil {
 		out.State = string(info.State.Status)
@@ -265,6 +266,22 @@ func (c *Client) Restart(ctx context.Context, ref string) error {
 	return nil
 }
 
+// Stop implements engine.Engine. POST /containers/{id}/stop.
+func (c *Client) Stop(ctx context.Context, ref string) error {
+	// Inspect first: it verifies that the container is ours.
+	info, err := c.Inspect(ctx, ref)
+	if err != nil {
+		return err
+	}
+
+	// SIGTERM first, so the app can finish what it is doing; the daemon
+	// falls back to SIGKILL after the container's stop timeout.
+	if _, err := c.api.ContainerStop(ctx, info.ID, client.ContainerStopOptions{}); err != nil {
+		return fmt.Errorf("stop container %s: %w", info.Name, err)
+	}
+	return nil
+}
+
 // List implements engine.Engine. GET /containers/json?all=true&filters=...
 func (c *Client) List(ctx context.Context) ([]engine.Container, error) {
 	res, err := c.api.ContainerList(ctx, client.ContainerListOptions{
@@ -287,6 +304,7 @@ func (c *Client) List(ctx context.Context) ([]engine.Container, error) {
 
 			Release:    item.Labels[engine.LabelRelease],
 			HealthPath: item.Labels[engine.LabelHealthPath],
+			Domain:     item.Labels[engine.LabelDomain],
 		}
 		if len(item.Names) > 0 {
 			ctr.Name = strings.TrimPrefix(item.Names[0], "/")
@@ -354,6 +372,9 @@ func labels(spec engine.Spec) map[string]string {
 	}
 	if spec.HealthPath != "" {
 		out[engine.LabelHealthPath] = spec.HealthPath
+	}
+	if spec.Domain != "" {
+		out[engine.LabelDomain] = spec.Domain
 	}
 	return out
 }

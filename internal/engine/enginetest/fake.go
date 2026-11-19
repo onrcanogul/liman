@@ -40,6 +40,7 @@ type Fake struct {
 	StartErr   error
 	RemoveErr  error
 	RestartErr error
+	StopErr    error
 
 	// AfterRestart is the state a container gets when restarted. It
 	// defaults to "running"; "exited" simulates an app that crashes again
@@ -148,6 +149,7 @@ func (f *Fake) Start(_ context.Context, spec engine.Spec) (string, error) {
 
 		Release:    spec.Release,
 		HealthPath: spec.HealthPath,
+		Domain:     spec.Domain,
 	})
 	return f.Containers[spec.Name].ID, nil
 }
@@ -201,6 +203,46 @@ func (f *Fake) Restart(_ context.Context, ref string) error {
 	f.Containers[ref] = ctr
 	f.RestartCount[ref]++
 	return nil
+}
+
+// Stop implements engine.Engine.
+func (f *Fake) Stop(_ context.Context, ref string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	ctr, ok := f.Containers[ref]
+	if !ok {
+		return fmt.Errorf("%s: %w", ref, engine.ErrNotFound)
+	}
+	f.record("stop " + ref)
+	if f.StopErr != nil {
+		return f.StopErr
+	}
+	ctr.State, ctr.Status = "exited", "exited"
+	f.Containers[ref] = ctr
+	return nil
+}
+
+// Running returns the names of the containers that are running, sorted.
+func (f *Fake) Running() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var names []string
+	for name, ctr := range f.Containers {
+		if ctr.Running() {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// State returns the state of a container, or "" if it does not exist.
+func (f *Fake) State(name string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Containers[name].State
 }
 
 // SetState changes the state of a container, as a crash would.

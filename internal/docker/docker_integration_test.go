@@ -59,6 +59,7 @@ func TestContainerLifecycle(t *testing.T) {
 		CPUs:          0.5,
 		Release:       "r1",
 		HealthPath:    "/health",
+		Domain:        "integration.example.com",
 	}
 	id, err := c.Start(ctx, spec)
 	if err != nil {
@@ -104,6 +105,24 @@ func TestContainerLifecycle(t *testing.T) {
 	}
 	if info, err := c.Inspect(ctx, name); err != nil || !info.Running() || info.HostPort != 39999 {
 		t.Errorf("after Restart() = %+v, %v; want it running on the same port", info, err)
+	}
+
+	// Stop keeps the container, and Restart brings it back on its port:
+	// together they are what a rollback relies on.
+	if err := c.Stop(ctx, name); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if info, err := c.Inspect(ctx, name); err != nil || info.Running() || info.HostPort != 39999 || info.Domain != "integration.example.com" {
+		t.Errorf("after Stop() = %+v, %v; want it kept, stopped, with its port and domain known", info, err)
+	}
+	if err := c.Stop(ctx, name); err != nil {
+		t.Errorf("Stop() of a stopped container error = %v, want none", err)
+	}
+	if err := c.Restart(ctx, name); err != nil {
+		t.Fatalf("Restart() after Stop() error = %v", err)
+	}
+	if info, _ := c.Inspect(ctx, name); !info.Running() {
+		t.Error("the container is not running after being started again")
 	}
 
 	// A second container with the same name must be rejected.
