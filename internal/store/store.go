@@ -61,6 +61,18 @@ var migrations = []string{
 		created_at TEXT NOT NULL
 	);
 	`,
+
+	// 2: secrets. The value column holds ciphertext only; the store never
+	// sees a plaintext secret and has no key to make one.
+	`
+	CREATE TABLE secrets (
+		app        TEXT NOT NULL,
+		name       TEXT NOT NULL,
+		value      BLOB NOT NULL,
+		updated_at TEXT NOT NULL,
+		PRIMARY KEY (app, name)
+	);
+	`,
 }
 
 // Open opens the database at path, creating it and its directory if

@@ -328,3 +328,97 @@ func TestDatabaseFilesArePrivate(t *testing.T) {
 		}
 	}
 }
+
+func TestSecretsStorage(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+
+	if _, found, err := s.GetSecret(ctx, "web", "KEY"); err != nil || found {
+		t.Errorf("GetSecret() of a missing secret = found %v, %v", found, err)
+	}
+
+	sealed := []byte{1, 2, 3, 0, 255} // opaque bytes, including a zero
+	if err := s.PutSecret(ctx, "web", "KEY", sealed); err != nil {
+		t.Fatalf("PutSecret() error = %v", err)
+	}
+	if err := s.PutSecret(ctx, "web", "ANOTHER", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutSecret(ctx, "api", "KEY", []byte("y")); err != nil {
+		t.Fatal(err)
+	}
+
+	got, found, err := s.GetSecret(ctx, "web", "KEY")
+	if err != nil || !found || string(got) != string(sealed) {
+		t.Errorf("GetSecret() = %v, %v, %v; want the stored bytes", got, found, err)
+	}
+
+	// Putting again replaces, it does not add a second row.
+	if err := s.PutSecret(ctx, "web", "KEY", []byte("replaced")); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, _ := s.GetSecret(ctx, "web", "KEY"); string(got) != "replaced" {
+		t.Errorf("GetSecret() after replacing = %q", got)
+	}
+
+	infos, err := s.ListSecrets(ctx, "web")
+	if err != nil || len(infos) != 2 || infos[0].Name != "ANOTHER" || infos[1].Name != "KEY" || infos[1].UpdatedAt.IsZero() {
+		t.Errorf("ListSecrets() = %+v, %v; want ANOTHER and KEY with timestamps", infos, err)
+	}
+	if n, err := s.CountSecrets(ctx); err != nil || n != 3 {
+		t.Errorf("CountSecrets() = %d, %v; want 3", n, err)
+	}
+
+	if found, err := s.DeleteSecret(ctx, "web", "KEY"); err != nil || !found {
+		t.Errorf("DeleteSecret() = %v, %v; want found", found, err)
+	}
+	if found, _ := s.DeleteSecret(ctx, "web", "KEY"); found {
+		t.Error("DeleteSecret() twice reported the secret as found")
+	}
+	// The other app's secret of the same name is untouched.
+	if _, found, _ := s.GetSecret(ctx, "api", "KEY"); !found {
+		t.Error("deleting a secret of one app removed another app's")
+	}
+}
+
+func TestExistingDatabaseIsMigratedForward(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "liman.db")
+	ctx := context.Background()
+
+	// Build a database as the first schema version left it: run only the
+	// first migration by hand.
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, migrations[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA user_version = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO tokens (name, hash, created_at) VALUES ('old', 'h', '2026-01-01T00:00:00.000000000Z')`); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	// Opening it with the current code must add what is missing and keep
+	// what is there.
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open() of a version 1 database error = %v", err)
+	}
+	defer func() { _ = s.Close() }()
+
+	if err := s.PutSecret(ctx, "web", "KEY", []byte("sealed")); err != nil {
+		t.Errorf("the secrets table is missing after migration: %v", err)
+	}
+	if tokens, err := s.Tokens(ctx); err != nil || len(tokens) != 1 || tokens[0].Name != "old" {
+		t.Errorf("existing data after migration = %+v, %v", tokens, err)
+	}
+
+	var version int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != len(migrations) {
+		t.Errorf("schema version = %d, %v; want %d", version, err, len(migrations))
+	}
+}
