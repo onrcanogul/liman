@@ -25,6 +25,7 @@ import (
 	"github.com/onrcanogul/liman/internal/deploy"
 	"github.com/onrcanogul/liman/internal/engine"
 	"github.com/onrcanogul/liman/internal/pipeline"
+	"github.com/onrcanogul/liman/internal/secrets"
 	"github.com/onrcanogul/liman/internal/store"
 )
 
@@ -50,6 +51,11 @@ type Server struct {
 	// HealthOf, when set, returns the health monitor's verdict on an app.
 	// The last result is false if the monitor knows nothing about it.
 	HealthOf func(app string) (health, detail string, restarts int, ok bool)
+
+	// Secrets holds the apps' secret values, encrypted. Nil means the
+	// daemon has no secret storage; apps that refer to secrets cannot be
+	// deployed then.
+	Secrets *secrets.Vault
 
 	// Log receives one line per request. Nil discards them.
 	Log *slog.Logger
@@ -118,6 +124,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/apps/{name}/logs", s.handleLogs)
 	mux.HandleFunc("POST /v1/apps/{name}/rollback", s.handleRollback)
 	mux.HandleFunc("DELETE /v1/apps/{name}", s.handleStop)
+	mux.HandleFunc("GET /v1/apps/{name}/secrets", s.handleSecretList)
+	mux.HandleFunc("PUT /v1/apps/{name}/secrets/{key}", s.handleSecretSet)
+	mux.HandleFunc("DELETE /v1/apps/{name}/secrets/{key}", s.handleSecretDelete)
 	mux.HandleFunc("GET /v1/history", s.handleHistory)
 
 	// Middleware wraps the handler from the inside out; a request passes
@@ -169,6 +178,14 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	stepMode := query.Get("step") == "true"
 	if dryRun && stepMode {
 		writeError(w, http.StatusBadRequest, errors.New("dry_run and step cannot be combined"))
+		return
+	}
+
+	// Add the app's secrets to its environment. This comes before anything
+	// is locked, connected or started: a deploy that cannot have its
+	// configuration must fail without having touched anything.
+	if status, err := s.addSecrets(ctx, a, dryRun); err != nil {
+		writeError(w, status, err)
 		return
 	}
 
@@ -516,6 +533,156 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		events = append(events, api.Event(ev))
 	}
 	writeJSON(w, http.StatusOK, events)
+}
+
+// --- secrets -----------------------------------------------------------------
+
+func (s *Server) handleSecretList(w http.ResponseWriter, r *http.Request) {
+	name, ok := appName(w, r)
+	if !ok {
+		return
+	}
+	if !s.haveSecrets(w) {
+		return
+	}
+
+	infos, err := s.Secrets.List(r.Context(), name)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	// Names and dates only. No endpoint returns a value: a secret can be
+	// replaced or removed through the API, but not read back.
+	out := make([]api.Secret, 0, len(infos))
+	for _, info := range infos {
+		out = append(out, api.Secret{Name: info.Name, UpdatedAt: info.UpdatedAt})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleSecretSet(w http.ResponseWriter, r *http.Request) {
+	name, ok := appName(w, r)
+	if !ok {
+		return
+	}
+	key, ok := secretName(w, r)
+	if !ok || !s.haveSecrets(w) {
+		return
+	}
+
+	// One byte more than the limit is read, so that a value that is too
+	// large is recognised as such instead of being silently cut off.
+	value, err := s.readBody(w, r, secrets.MaxValueBytes+1)
+	if err != nil {
+		writeError(w, bodyErrorStatus(err), fmt.Errorf("read secret value: %w", err))
+		return
+	}
+
+	if err := s.Secrets.Set(r.Context(), name, key, value); err != nil {
+		// Everything Set rejects is about the input (empty, too large, a
+		// NUL byte); a storage failure is the exception.
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	// The value is never logged; that it changed is worth a line.
+	s.logger().Info("secret set", "app", name, "secret", key)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleSecretDelete(w http.ResponseWriter, r *http.Request) {
+	name, ok := appName(w, r)
+	if !ok {
+		return
+	}
+	key, ok := secretName(w, r)
+	if !ok || !s.haveSecrets(w) {
+		return
+	}
+
+	err := s.Secrets.Delete(r.Context(), name, key)
+	switch {
+	case errors.Is(err, secrets.ErrNotSet):
+		writeError(w, http.StatusNotFound, err)
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, err)
+	default:
+		s.logger().Info("secret deleted", "app", name, "secret", key)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// haveSecrets answers 503 and returns false if the daemon has no vault.
+func (s *Server) haveSecrets(w http.ResponseWriter) bool {
+	if s.Secrets == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("this daemon has no secret storage"))
+		return false
+	}
+	return true
+}
+
+// secretName returns the secret named in the request path, or answers 400.
+func secretName(w http.ResponseWriter, r *http.Request) (string, bool) {
+	key := r.PathValue("key")
+	if !secrets.ValidName(key) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid secret name %q", key))
+		return "", false
+	}
+	return key, true
+}
+
+// addSecrets puts the values of the secrets an app refers to into its
+// environment. On failure it returns the HTTP status that fits.
+//
+// In a dry run the values are not decrypted, only checked for existence:
+// the plan shows the names (masked like every other variable), and a dry
+// run that reads secrets would be a way to probe them.
+func (s *Server) addSecrets(ctx context.Context, a *app.App, dryRun bool) (int, error) {
+	if len(a.Secrets) == 0 {
+		return http.StatusOK, nil
+	}
+	if s.Secrets == nil {
+		return http.StatusServiceUnavailable, errors.New("the app refers to secrets, but this daemon has no secret storage")
+	}
+
+	values := map[string]string{}
+	if dryRun {
+		missing, err := s.Secrets.Missing(ctx, a.Name, a.Secrets)
+		if err != nil {
+			return http.StatusInternalServerError, err
+		}
+		if len(missing) > 0 {
+			return http.StatusBadRequest, &secrets.MissingError{App: a.Name, Names: missing}
+		}
+		for _, name := range a.Secrets {
+			values[name] = ""
+		}
+	} else {
+		resolved, err := s.Secrets.Resolve(ctx, a.Name, a.Secrets)
+		if errors.Is(err, secrets.ErrNotSet) {
+			return http.StatusBadRequest, err
+		}
+		if err != nil {
+			// A value that is stored but cannot be decrypted: the key was
+			// replaced or the data was changed. That is the daemon's
+			// problem, not the request's.
+			return http.StatusInternalServerError, err
+		}
+		values = resolved
+	}
+
+	// Build a new map instead of writing into a.Env: the definition may
+	// have had no env section at all, which leaves the map nil, and a nil
+	// map cannot be written to.
+	env := make(map[string]string, len(a.Env)+len(values))
+	for k, v := range a.Env {
+		env[k] = v
+	}
+	for k, v := range values {
+		env[k] = v
+	}
+	a.Env = env
+	return http.StatusOK, nil
 }
 
 // --- helpers used by handlers ---------------------------------------------

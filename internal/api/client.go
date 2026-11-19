@@ -195,6 +195,37 @@ func (c *Client) History(ctx context.Context, app string, limit int) ([]Event, e
 	return out, err
 }
 
+// SetSecret stores value as the secret name of app.
+func (c *Client) SetSecret(ctx context.Context, app, name string, value []byte) error {
+	// The value travels in the request body, never in the URL: URLs end up
+	// in logs and histories.
+	resp, err := c.do(ctx, http.MethodPut, secretPath(app, name), nil, "application/octet-stream", bytes.NewReader(value))
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
+// Secrets lists the names of the secrets of app.
+func (c *Client) Secrets(ctx context.Context, app string) ([]Secret, error) {
+	var out []Secret
+	err := c.getJSON(ctx, "/v1/apps/"+url.PathEscape(app)+"/secrets", nil, &out)
+	return out, err
+}
+
+// DeleteSecret removes the secret name of app.
+func (c *Client) DeleteSecret(ctx context.Context, app, name string) error {
+	resp, err := c.do(ctx, http.MethodDelete, secretPath(app, name), nil, "", nil)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
+func secretPath(app, name string) string {
+	return "/v1/apps/" + url.PathEscape(app) + "/secrets/" + url.PathEscape(name)
+}
+
 // Health asks the daemon whether it is up. It needs no token.
 func (c *Client) Health(ctx context.Context) (*Health, error) {
 	var out Health

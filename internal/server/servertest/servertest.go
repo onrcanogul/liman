@@ -5,6 +5,7 @@ package servertest
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ import (
 	"github.com/onrcanogul/liman/internal/engine"
 	"github.com/onrcanogul/liman/internal/engine/enginetest"
 	"github.com/onrcanogul/liman/internal/nginx"
+	"github.com/onrcanogul/liman/internal/secrets"
 	"github.com/onrcanogul/liman/internal/server"
 	"github.com/onrcanogul/liman/internal/store"
 )
@@ -66,10 +68,21 @@ func New(t *testing.T, options ...func(*server.Server)) *Harness {
 		t.Fatalf("create token: %v", err)
 	}
 
+	// A fresh random key per test server.
+	key := make([]byte, secrets.KeySize)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	vault, err := secrets.NewVault(key, st)
+	if err != nil {
+		t.Fatalf("create vault: %v", err)
+	}
+
 	h := &Harness{Engine: enginetest.New(), Store: st}
 
 	h.Server = &server.Server{
-		Store: st,
+		Store:   st,
+		Secrets: vault,
 		Connect: func(context.Context) (engine.Engine, error) {
 			if h.ConnectErr != nil {
 				return nil, h.ConnectErr

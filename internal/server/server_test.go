@@ -1180,3 +1180,255 @@ func TestRollbackAndDeployExcludeEachOther(t *testing.T) {
 		t.Error("the declined rollback reported success")
 	}
 }
+
+// --- secrets -----------------------------------------------------------------
+
+const definitionWithSecrets = definition + `env:
+  LOG_LEVEL: "info"
+secrets:
+  - DATABASE_URL
+  - API_KEY
+`
+
+func TestSecretsAreWriteOnly(t *testing.T) {
+	h := servertest.New(t)
+
+	if err := h.Client.SetSecret(ctx(), "orders-api", "DATABASE_URL", []byte("postgres://user:hunter2@db/app")); err != nil {
+		t.Fatalf("SetSecret() error = %v", err)
+	}
+	if err := h.Client.SetSecret(ctx(), "orders-api", "API_KEY", []byte("k-123")); err != nil {
+		t.Fatalf("SetSecret() error = %v", err)
+	}
+
+	list, err := h.Client.Secrets(ctx(), "orders-api")
+	if err != nil || len(list) != 2 || list[0].Name != "API_KEY" || list[1].Name != "DATABASE_URL" || list[0].UpdatedAt.IsZero() {
+		t.Fatalf("Secrets() = %+v, %v; want the two names with dates", list, err)
+	}
+
+	// No response of the API may ever contain a value. Read the raw
+	// bodies of every endpoint that mentions secrets.
+	for _, path := range []string{"/v1/apps/orders-api/secrets", "/v1/apps", "/v1/history"} {
+		resp := request(t, h, http.MethodGet, path, nil)
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		for _, value := range []string{"hunter2", "k-123"} {
+			if strings.Contains(string(body), value) {
+				t.Errorf("GET %s returned a secret value", path)
+			}
+		}
+	}
+	// And there is no way to ask for one.
+	resp := request(t, h, http.MethodGet, "/v1/apps/orders-api/secrets/API_KEY", nil)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("GET of a single secret = %d, want 405 (there is no read endpoint)", resp.StatusCode)
+	}
+
+	// Secrets of another app are not listed.
+	if list, _ := h.Client.Secrets(ctx(), "another"); len(list) != 0 {
+		t.Errorf("Secrets() of another app = %+v, want none", list)
+	}
+
+	if err := h.Client.DeleteSecret(ctx(), "orders-api", "API_KEY"); err != nil {
+		t.Fatalf("DeleteSecret() error = %v", err)
+	}
+	var apiErr *api.Error
+	if err := h.Client.DeleteSecret(ctx(), "orders-api", "API_KEY"); !errors.As(err, &apiErr) || apiErr.Status != http.StatusNotFound {
+		t.Errorf("DeleteSecret() twice error = %v, want a 404", err)
+	}
+}
+
+func TestSecretsAreEncryptedInTheDatabase(t *testing.T) {
+	h := servertest.New(t)
+	const value = "very-recognisable-plaintext-0123456789"
+
+	if err := h.Client.SetSecret(ctx(), "orders-api", "API_KEY", []byte(value)); err != nil {
+		t.Fatal(err)
+	}
+
+	// What the store holds is not the value...
+	sealed, found, err := h.Store.GetSecret(ctx(), "orders-api", "API_KEY")
+	if err != nil || !found {
+		t.Fatalf("GetSecret() = found %v, %v", found, err)
+	}
+	if strings.Contains(string(sealed), value) {
+		t.Error("the database row contains the plaintext")
+	}
+	// ...and it is longer than the value: format byte, nonce and tag.
+	if len(sealed) != len(value)+1+12+16 {
+		t.Errorf("sealed length = %d, want %d (value + 29 bytes of overhead)", len(sealed), len(value)+29)
+	}
+}
+
+func TestSecretInputIsValidated(t *testing.T) {
+	h := servertest.New(t)
+
+	tests := []struct {
+		name       string
+		app        string
+		key        string
+		value      string
+		wantStatus int
+	}{
+		{"invalid app name", "Orders_API", "KEY", "v", http.StatusBadRequest},
+		{"invalid secret name", "orders-api", "MY-KEY", "v", http.StatusBadRequest},
+		{"empty value", "orders-api", "KEY", "", http.StatusBadRequest},
+		{"value with NUL", "orders-api", "KEY", "a\x00b", http.StatusBadRequest},
+		{"value too large", "orders-api", "KEY", strings.Repeat("x", 64<<10+1), http.StatusBadRequest},
+		{"value far too large", "orders-api", "KEY", strings.Repeat("x", 1<<20), http.StatusRequestEntityTooLarge},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := h.Client.SetSecret(ctx(), tt.app, tt.key, []byte(tt.value))
+
+			var apiErr *api.Error
+			if !errors.As(err, &apiErr) || apiErr.Status != tt.wantStatus {
+				t.Errorf("SetSecret() error = %v, want status %d", err, tt.wantStatus)
+			}
+		})
+	}
+	if n, _ := h.Store.CountSecrets(ctx()); n != 0 {
+		t.Errorf("%d secrets were stored from rejected requests", n)
+	}
+
+	// A value of exactly the limit is accepted.
+	if err := h.Client.SetSecret(ctx(), "orders-api", "BIG", []byte(strings.Repeat("x", 64<<10))); err != nil {
+		t.Errorf("SetSecret() at the size limit error = %v", err)
+	}
+}
+
+func TestSecretsNeedAToken(t *testing.T) {
+	h := servertest.New(t)
+	anonymous := &api.Client{BaseURL: h.URL}
+
+	var apiErr *api.Error
+	if err := anonymous.SetSecret(ctx(), "orders-api", "KEY", []byte("v")); !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnauthorized {
+		t.Errorf("SetSecret() without a token error = %v, want a 401", err)
+	}
+	if _, err := anonymous.Secrets(ctx(), "orders-api"); !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnauthorized {
+		t.Errorf("Secrets() without a token error = %v, want a 401", err)
+	}
+}
+
+func TestDeployInjectsSecretsIntoTheEnvironment(t *testing.T) {
+	h := servertest.New(t)
+	if err := h.Client.SetSecret(ctx(), "orders-api", "DATABASE_URL", []byte("postgres://user:hunter2@db/app")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Client.SetSecret(ctx(), "orders-api", "API_KEY", []byte("k-123")); err != nil {
+		t.Fatal(err)
+	}
+	// A secret the definition does not refer to must not be passed on.
+	if err := h.Client.SetSecret(ctx(), "orders-api", "UNUSED", []byte("not-for-this-deploy")); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+
+	if _, err := h.Client.Deploy(ctx(), []byte(definitionWithSecrets), api.DeployOptions{}, &out); err != nil {
+		t.Fatalf("Deploy() error = %v\n%s", err, out.String())
+	}
+
+	env := h.Engine.Specs[0].Env
+	want := map[string]string{"LOG_LEVEL": "info", "DATABASE_URL": "postgres://user:hunter2@db/app", "API_KEY": "k-123"}
+	if len(env) != len(want) {
+		t.Errorf("container environment has %d variables, want %d: %v", len(env), len(want), keys(env))
+	}
+	for k, v := range want {
+		if env[k] != v {
+			t.Errorf("container environment %s is wrong", k)
+		}
+	}
+
+	// The values reach the container and nothing else: not the progress
+	// output, not the history, not the release record.
+	events, _ := h.Client.History(ctx(), "", 50)
+	releases, _ := h.Store.Releases(ctx(), "orders-api")
+	recorded := fmt.Sprint(out.String(), events, releases)
+	for _, value := range []string{"hunter2", "k-123"} {
+		if strings.Contains(recorded, value) {
+			t.Errorf("a secret value appears in the output, the history or the release record")
+		}
+	}
+}
+
+func keys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func TestDeployWithMissingSecretsIsRefusedBeforeAnythingHappens(t *testing.T) {
+	h := servertest.New(t)
+	// Only one of the two secrets the definition refers to is set.
+	if err := h.Client.SetSecret(ctx(), "orders-api", "API_KEY", []byte("k-123")); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, dryRun := range []bool{false, true} {
+		_, err := h.Client.Deploy(ctx(), []byte(definitionWithSecrets), api.DeployOptions{DryRun: dryRun}, io.Discard)
+
+		var apiErr *api.Error
+		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusBadRequest {
+			t.Fatalf("Deploy(dryRun=%v) error = %v, want a 400", dryRun, err)
+		}
+		for _, want := range []string{"secrets that are not set: DATABASE_URL", "liman secret set orders-api <NAME>"} {
+			if !strings.Contains(apiErr.Message, want) {
+				t.Errorf("error %q does not contain %q", apiErr.Message, want)
+			}
+		}
+	}
+
+	if len(h.Engine.Calls) != 0 {
+		t.Errorf("the engine was used although secrets were missing: %v", h.Engine.Calls)
+	}
+	// The refusal did not leave the app locked.
+	if err := h.Client.SetSecret(ctx(), "orders-api", "DATABASE_URL", []byte("postgres://x")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Client.Deploy(ctx(), []byte(definitionWithSecrets), api.DeployOptions{}, io.Discard); err != nil {
+		t.Errorf("Deploy() once the secret is set error = %v", err)
+	}
+}
+
+func TestDryRunShowsSecretNamesMaskedAndDecryptsNothing(t *testing.T) {
+	h := servertest.New(t)
+	_ = h.Client.SetSecret(ctx(), "orders-api", "DATABASE_URL", []byte("postgres://user:hunter2@db/app"))
+	_ = h.Client.SetSecret(ctx(), "orders-api", "API_KEY", []byte("k-123"))
+	var out bytes.Buffer
+
+	if _, err := h.Client.Deploy(ctx(), []byte(definitionWithSecrets), api.DeployOptions{DryRun: true}, &out); err != nil {
+		t.Fatalf("Deploy(dry run) error = %v", err)
+	}
+
+	if want := "-e API_KEY=*** -e DATABASE_URL=*** -e LOG_LEVEL=***"; !strings.Contains(out.String(), want) {
+		t.Errorf("dry run does not show the masked variables %q:\n%s", want, out.String())
+	}
+	if strings.Contains(out.String(), "hunter2") {
+		t.Error("the dry run output contains a secret value")
+	}
+}
+
+func TestChangedSecretAppliesOnNextDeployOnly(t *testing.T) {
+	h := servertest.New(t)
+	_ = h.Client.SetSecret(ctx(), "orders-api", "DATABASE_URL", []byte("old-url"))
+	_ = h.Client.SetSecret(ctx(), "orders-api", "API_KEY", []byte("k-1"))
+	if _, err := h.Client.Deploy(ctx(), []byte(definitionWithSecrets), api.DeployOptions{}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+
+	// Changing the secret does not touch the running container...
+	_ = h.Client.SetSecret(ctx(), "orders-api", "DATABASE_URL", []byte("new-url"))
+	if got := h.Engine.Specs[0].Env["DATABASE_URL"]; got != "old-url" {
+		t.Errorf("the running container's value changed to %q", got)
+	}
+
+	// ...the next deploy picks it up.
+	if _, err := h.Client.Deploy(ctx(), []byte(definitionWithSecrets), api.DeployOptions{}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.Engine.Specs[1].Env["DATABASE_URL"]; got != "new-url" {
+		t.Errorf("the new container has %q, want the new value", got)
+	}
+}

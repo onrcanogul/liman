@@ -113,3 +113,10 @@ type Event struct {
 	// DurationMS is how long the step took, in milliseconds.
 	DurationMS int64 `json:"duration_ms"`
 }
+
+// Secret describes a stored secret. There is deliberately no field for the
+// value: the API accepts secret values but never returns them.
+type Secret struct {
+	Name      string    `json:"name"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
