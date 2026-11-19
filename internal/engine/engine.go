@@ -16,6 +16,19 @@ import (
 // name. Containers without this label are never listed or touched.
 const LabelApp = "liman.app"
 
+// Further labels carry what liman needs to know about a container later,
+// when the app definition it was started from is no longer at hand. Labels
+// are the right place for this: they live and die with the container, and
+// they survive a restart of the daemon. Nothing secret may go into a label;
+// anyone who can inspect the container can read it.
+const (
+	// LabelRelease is the release the container belongs to.
+	LabelRelease = "liman.release"
+	// LabelHealthPath is the HTTP path to probe, or absent when the app
+	// defines no health check.
+	LabelHealthPath = "liman.healthcheck"
+)
+
 // Sentinel errors. Callers compare against them with errors.Is.
 var (
 	// ErrNotFound means no container with the given name exists.
@@ -47,6 +60,10 @@ type Spec struct {
 	// MemoryBytes and CPUs are limits; zero means unlimited.
 	MemoryBytes int64
 	CPUs        float64
+
+	// Release and HealthPath are stored as labels on the container.
+	Release    string
+	HealthPath string
 }
 
 // Container is the observed state of a container.
@@ -74,6 +91,10 @@ type Container struct {
 	// They are only filled in by Inspect.
 	ExitCode  int
 	OOMKilled bool
+
+	// Release and HealthPath come from the container's labels.
+	Release    string
+	HealthPath string
 }
 
 // Running reports whether the container is currently running.
@@ -98,6 +119,10 @@ type Engine interface {
 
 	// Remove stops and deletes a managed container.
 	Remove(ctx context.Context, ref string) error
+
+	// Restart stops a managed container if it is running and starts it
+	// again. It also brings back a container that has exited.
+	Restart(ctx context.Context, ref string) error
 
 	// List returns all managed containers, running or not, ordered by app
 	// and then by creation time, oldest first.

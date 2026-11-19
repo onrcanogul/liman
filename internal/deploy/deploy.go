@@ -13,13 +13,13 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/onrcanogul/liman/internal/app"
 	"github.com/onrcanogul/liman/internal/engine"
+	"github.com/onrcanogul/liman/internal/health"
 	"github.com/onrcanogul/liman/internal/pipeline"
 	"github.com/onrcanogul/liman/internal/textdiff"
 )
@@ -106,7 +106,7 @@ func New(e engine.Engine, out io.Writer) *Deployer {
 		engine:         e,
 		out:            out,
 		AllocatePort:   freePort,
-		Probe:          httpProbe,
+		Probe:          health.Probe,
 		NewRelease:     timeRelease,
 		HealthTimeout:  30 * time.Second,
 		HealthInterval: 500 * time.Millisecond,
@@ -223,6 +223,8 @@ func (d *Deployer) steps(st *state) []pipeline.Step {
 					Env:           a.Env,
 					MemoryBytes:   st.memory,
 					CPUs:          a.Resources.CPUs,
+					Release:       st.release,
+					HealthPath:    healthPath(a),
 				})
 				if err != nil {
 					return err
@@ -381,7 +383,7 @@ func (d *Deployer) waitHealthy(ctx context.Context, st *state) error {
 
 	url := ""
 	if st.app.Healthcheck != nil {
-		url = fmt.Sprintf("http://127.0.0.1:%d%s", st.hostPort, st.app.Healthcheck.Path)
+		url = health.URL(st.hostPort, st.app.Healthcheck.Path)
 		d.detail("GET %s", url)
 	} else {
 		d.detail("no healthcheck defined; checking that the container stays up")
@@ -527,24 +529,12 @@ func freePort() (int, error) {
 	return addr.Port, nil
 }
 
-// httpProbe treats any 2xx or 3xx response as healthy.
-func httpProbe(ctx context.Context, url string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
+// healthPath returns the app's health check path, or "" if it has none.
+func healthPath(a *app.App) string {
+	if a.Healthcheck == nil {
+		return ""
 	}
-
-	client := &http.Client{Timeout: 3 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return fmt.Errorf("unexpected status %s", resp.Status)
-	}
-	return nil
+	return a.Healthcheck.Path
 }
 
 func shortID(id string) string {

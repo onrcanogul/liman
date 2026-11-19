@@ -36,9 +36,17 @@ type Fake struct {
 	// LogOutput is what Logs writes to stdout.
 	LogOutput string
 
-	PullErr   error
-	StartErr  error
-	RemoveErr error
+	PullErr    error
+	StartErr   error
+	RemoveErr  error
+	RestartErr error
+
+	// AfterRestart is the state a container gets when restarted. It
+	// defaults to "running"; "exited" simulates an app that crashes again
+	// right away.
+	AfterRestart string
+	// RestartCount counts the restarts per container name.
+	RestartCount map[string]int
 
 	// StartState is the state a container gets when started. It defaults
 	// to "running"; set it to "exited" to simulate an app that crashes.
@@ -60,9 +68,10 @@ var _ engine.Engine = (*Fake)(nil)
 // New returns an empty fake engine.
 func New() *Fake {
 	return &Fake{
-		RecordCalls: true,
-		Containers:  map[string]engine.Container{},
-		clock:       time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		RecordCalls:  true,
+		RestartCount: map[string]int{},
+		Containers:   map[string]engine.Container{},
+		clock:        time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
 	}
 }
 
@@ -136,6 +145,9 @@ func (f *Fake) Start(_ context.Context, spec engine.Spec) (string, error) {
 		HostPort:  spec.HostPort,
 		ExitCode:  f.StartExitCode,
 		OOMKilled: f.StartOOMKilled,
+
+		Release:    spec.Release,
+		HealthPath: spec.HealthPath,
 	})
 	return f.Containers[spec.Name].ID, nil
 }
@@ -166,6 +178,46 @@ func (f *Fake) Remove(_ context.Context, ref string) error {
 	}
 	delete(f.Containers, ref)
 	return nil
+}
+
+// Restart implements engine.Engine.
+func (f *Fake) Restart(_ context.Context, ref string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	ctr, ok := f.Containers[ref]
+	if !ok {
+		return fmt.Errorf("%s: %w", ref, engine.ErrNotFound)
+	}
+	f.record("restart " + ref)
+	if f.RestartErr != nil {
+		return f.RestartErr
+	}
+
+	ctr.State = f.AfterRestart
+	if ctr.State == "" {
+		ctr.State = "running"
+	}
+	f.Containers[ref] = ctr
+	f.RestartCount[ref]++
+	return nil
+}
+
+// SetState changes the state of a container, as a crash would.
+func (f *Fake) SetState(name, state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	ctr := f.Containers[name]
+	ctr.State = state
+	f.Containers[name] = ctr
+}
+
+// Restarts returns how often a container has been restarted.
+func (f *Fake) Restarts(name string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.RestartCount[name]
 }
 
 // List implements engine.Engine.

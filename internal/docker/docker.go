@@ -153,7 +153,7 @@ func (c *Client) Start(ctx context.Context, spec engine.Spec) (string, error) {
 		Config: &container.Config{
 			Image:        spec.Image,
 			Env:          envList(spec.Env),
-			Labels:       map[string]string{engine.LabelApp: spec.App},
+			Labels:       labels(spec),
 			ExposedPorts: network.PortSet{port: struct{}{}},
 		},
 		// HostConfig describes how it is attached to the host: published
@@ -213,6 +213,9 @@ func (c *Client) Inspect(ctx context.Context, ref string) (engine.Container, err
 		Name:  strings.TrimPrefix(info.Name, "/"),
 		App:   info.Config.Labels[engine.LabelApp],
 		Image: info.Config.Image,
+
+		Release:    info.Config.Labels[engine.LabelRelease],
+		HealthPath: info.Config.Labels[engine.LabelHealthPath],
 	}
 	if info.State != nil {
 		out.State = string(info.State.Status)
@@ -246,6 +249,22 @@ func (c *Client) Remove(ctx context.Context, ref string) error {
 	return nil
 }
 
+// Restart implements engine.Engine. POST /containers/{id}/restart.
+func (c *Client) Restart(ctx context.Context, ref string) error {
+	// Inspect first: it verifies that the container is ours.
+	info, err := c.Inspect(ctx, ref)
+	if err != nil {
+		return err
+	}
+
+	// Restart is "stop, then start" in one call. On a container that has
+	// already exited the stop is a no-op, so the same call revives it.
+	if _, err := c.api.ContainerRestart(ctx, info.ID, client.ContainerRestartOptions{}); err != nil {
+		return fmt.Errorf("restart container %s: %w", info.Name, err)
+	}
+	return nil
+}
+
 // List implements engine.Engine. GET /containers/json?all=true&filters=...
 func (c *Client) List(ctx context.Context) ([]engine.Container, error) {
 	res, err := c.api.ContainerList(ctx, client.ContainerListOptions{
@@ -265,6 +284,9 @@ func (c *Client) List(ctx context.Context) ([]engine.Container, error) {
 			State:   string(item.State),
 			Status:  item.Status,
 			Created: time.Unix(item.Created, 0),
+
+			Release:    item.Labels[engine.LabelRelease],
+			HealthPath: item.Labels[engine.LabelHealthPath],
 		}
 		if len(item.Names) > 0 {
 			ctr.Name = strings.TrimPrefix(item.Names[0], "/")
@@ -322,6 +344,18 @@ func (c *Client) Logs(ctx context.Context, ref string, follow bool, stdout, stde
 		return fmt.Errorf("read logs of %s: %w", info.Name, err)
 	}
 	return nil
+}
+
+// labels returns the labels a container of spec carries.
+func labels(spec engine.Spec) map[string]string {
+	out := map[string]string{engine.LabelApp: spec.App}
+	if spec.Release != "" {
+		out[engine.LabelRelease] = spec.Release
+	}
+	if spec.HealthPath != "" {
+		out[engine.LabelHealthPath] = spec.HealthPath
+	}
+	return out
 }
 
 // envList converts a map to the KEY=value list the API expects, sorted so

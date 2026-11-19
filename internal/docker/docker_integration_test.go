@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/moby/moby/client"
+
 	"github.com/onrcanogul/liman/internal/engine"
 )
 
@@ -55,6 +57,8 @@ func TestContainerLifecycle(t *testing.T) {
 		Env:           map[string]string{"WHOAMI_NAME": "integration"},
 		MemoryBytes:   64 << 20,
 		CPUs:          0.5,
+		Release:       "r1",
+		HealthPath:    "/health",
 	}
 	id, err := c.Start(ctx, spec)
 	if err != nil {
@@ -82,6 +86,24 @@ func TestContainerLifecycle(t *testing.T) {
 	}
 	if mine[0].Name != name || mine[0].HostPort != 39999 || mine[0].Created.IsZero() {
 		t.Errorf("List() entry = %+v, want %s on port 39999 with a creation time", mine[0], name)
+	}
+
+	if mine[0].Release != "r1" || mine[0].HealthPath != "/health" {
+		t.Errorf("List() labels = release %q, health path %q; want r1 and /health", mine[0].Release, mine[0].HealthPath)
+	}
+
+	// Restart must revive a container that was killed from outside.
+	if _, err := c.api.ContainerKill(ctx, id, client.ContainerKillOptions{}); err != nil {
+		t.Fatalf("kill the container: %v", err)
+	}
+	if info, _ := c.Inspect(ctx, name); info.Running() {
+		t.Fatal("the container is still running after being killed")
+	}
+	if err := c.Restart(ctx, name); err != nil {
+		t.Fatalf("Restart() error = %v", err)
+	}
+	if info, err := c.Inspect(ctx, name); err != nil || !info.Running() || info.HostPort != 39999 {
+		t.Errorf("after Restart() = %+v, %v; want it running on the same port", info, err)
 	}
 
 	// A second container with the same name must be rejected.
