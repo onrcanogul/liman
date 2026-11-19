@@ -88,7 +88,7 @@ collection.
 
 ## Status
 
-- [ ] Stage 0
+- [x] Stage 0
 - [ ] Stage 1
 - [ ] Stage 2
 - [ ] Stage 3
