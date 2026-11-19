@@ -71,6 +71,15 @@ type Container struct {
 	State     string `json:"state"`
 	Status    string `json:"status"`
 	HostPort  int    `json:"host_port,omitempty"`
+
+	// Health is the health monitor's verdict: "healthy", "unhealthy",
+	// "restarting" or "down". It is empty when the monitor has not looked
+	// at the app yet, or is not running.
+	Health string `json:"health,omitempty"`
+	// HealthDetail explains a verdict other than "healthy".
+	HealthDetail string `json:"health_detail,omitempty"`
+	// Restarts counts the automatic restarts since the app was last stable.
+	Restarts int `json:"restarts,omitempty"`
 }
 
 // StopResult is the answer to DELETE /v1/apps/{name}.

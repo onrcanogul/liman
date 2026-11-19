@@ -10,14 +10,45 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 )
 
 // Config is the content of config.yaml in liman's home directory.
 type Config struct {
-	Daemon Daemon `yaml:"daemon"`
-	Nginx  Nginx  `yaml:"nginx"`
+	Daemon  Daemon  `yaml:"daemon"`
+	Monitor Monitor `yaml:"monitor"`
+	Nginx   Nginx   `yaml:"nginx"`
+}
+
+// Monitor configures the health monitor, which restarts apps that have
+// stopped working.
+type Monitor struct {
+	// Disabled turns the monitor off.
+	Disabled bool `yaml:"disabled"`
+	// Interval is the pause between checks, written like "10s" or "1m".
+	Interval Duration `yaml:"interval"`
+	// FailureThreshold is how many health checks in a row must fail before
+	// a running app is restarted.
+	FailureThreshold int `yaml:"failure_threshold"`
+}
+
+// Duration is a time.Duration that can be written in YAML as "10s".
+//
+// YAML has no duration type, and a bare number would leave the unit to
+// guesswork. Defining a named type lets it carry its own decoding.
+type Duration time.Duration
+
+// UnmarshalYAML implements yaml.Unmarshaler. The YAML decoder calls it
+// whenever it has to fill a Duration.
+func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
+	parsed, err := time.ParseDuration(node.Value)
+	if err != nil {
+		return fmt.Errorf("line %d: %q is not a duration; write it like 10s, 2m or 1m30s", node.Line, node.Value)
+	}
+	*d = Duration(parsed)
+	return nil
 }
 
 // Daemon configures limand itself.
@@ -130,6 +161,15 @@ func (c *Config) validate() error {
 
 	if err := CheckListenAddress(c.Daemon.Listen); err != nil {
 		errs = append(errs, fmt.Errorf("daemon.listen: %w", err))
+	}
+
+	// Zero means "use the default" for both; anything else must make sense.
+	// A very short interval would hammer the apps and Docker for nothing.
+	if iv := time.Duration(c.Monitor.Interval); iv != 0 && iv < time.Second {
+		errs = append(errs, fmt.Errorf("monitor.interval: must be at least 1s, got %s", iv))
+	}
+	if c.Monitor.FailureThreshold < 0 {
+		errs = append(errs, fmt.Errorf("monitor.failure_threshold: must not be negative, got %d", c.Monitor.FailureThreshold))
 	}
 
 	n := c.Nginx

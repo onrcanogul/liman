@@ -360,3 +360,85 @@ func TestConnectOnceSharesOneConnection(t *testing.T) {
 		t.Errorf("the engine was connected to %d times, want 2 failures and 1 success", calls)
 	}
 }
+
+func TestDaemonRestartsCrashedAppAndRecordsIt(t *testing.T) {
+	td := newTestDaemon(t)
+	writeConfig(t, td.Home, "daemon:\n  listen: 127.0.0.1:0\nmonitor:\n  interval: 1s\n")
+	clientFile := filepath.Join(t.TempDir(), "client.yaml")
+	td.Run(context.Background(), []string{"token", "create", "dev", "--write-client", clientFile})
+	cfg, _ := config.LoadClient(clientFile)
+
+	// An app that has crashed before the daemon even starts, as after a
+	// reboot of the server.
+	td.engine.Add(engine.Container{Name: "web-r1", App: "web", State: "exited", Release: "r1"})
+
+	addr, stop, exit := startServing(t, td)
+	client := &api.Client{BaseURL: "http://" + addr, Token: cfg.Token}
+
+	// Nobody asks for it: the monitor must bring the app back by itself.
+	deadline := time.Now().Add(10 * time.Second)
+	for td.engine.Restarts("web-r1") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the daemon did not restart the crashed app")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// The restart shows up in the history...
+	var restart *api.Event
+	for restart == nil {
+		events, err := client.History(context.Background(), "web", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range events {
+			if events[i].Action == "restart" {
+				restart = &events[i]
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the restart was not recorded in the history")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !restart.OK || restart.Release != "r1" || restart.Step != "Restart container web-r1: container is exited (exit code 0)" {
+		t.Errorf("history entry = %+v", *restart)
+	}
+
+	// ...and in the listing.
+	apps, err := client.Apps(context.Background())
+	if err != nil || len(apps) != 1 {
+		t.Fatalf("Apps() = %v, %v", apps, err)
+	}
+	if apps[0].Health == "" || apps[0].Restarts != 1 {
+		t.Errorf("listing = %+v, want a health verdict and one restart", apps[0])
+	}
+
+	stop()
+	if code := <-exit; code != exitOK {
+		t.Errorf("exit code = %d, stderr: %s", code, td.stderr.String())
+	}
+	for _, want := range []string{"health monitor started", "restarting app", "health monitor stopped"} {
+		if !strings.Contains(td.stderr.String(), want) {
+			t.Errorf("log does not contain %q:\n%s", want, td.stderr.String())
+		}
+	}
+}
+
+func TestMonitorCanBeDisabled(t *testing.T) {
+	td := newTestDaemon(t)
+	writeConfig(t, td.Home, "daemon:\n  listen: 127.0.0.1:0\nmonitor:\n  disabled: true\n  interval: 1s\n")
+	td.engine.Add(engine.Container{Name: "web-r1", App: "web", State: "exited"})
+
+	_, stop, exit := startServing(t, td)
+	time.Sleep(1500 * time.Millisecond) // longer than the interval
+	stop()
+	<-exit
+
+	if got := td.engine.Restarts("web-r1"); got != 0 {
+		t.Errorf("the app was restarted %d times although the monitor is disabled", got)
+	}
+	if strings.Contains(td.stderr.String(), "health monitor started") {
+		t.Error("the monitor started although it is disabled")
+	}
+}

@@ -132,7 +132,7 @@ func TestRun(t *testing.T) {
 			args:       []string{"ps"},
 			setup:      func(h *harness) { h.Engine.Add(web) },
 			wantCode:   exitOK,
-			wantStdout: "web  web-r1     web:1.0  running  127.0.0.1:40123  Up 2 minutes",
+			wantStdout: "web  web-r1     web:1.0  running  -       127.0.0.1:40123  Up 2 minutes",
 		},
 		{name: "ps with arguments", args: []string{"ps", "extra"}, wantCode: exitUsage, wantStderr: "usage: liman ps"},
 
@@ -398,4 +398,42 @@ func writeFile(t *testing.T, content string) string {
 		t.Fatalf("write %s: %v", path, err)
 	}
 	return path
+}
+
+func TestPsShowsHealth(t *testing.T) {
+	h := newHarness(t, "")
+	h.Engine.Add(engine.Container{Name: "web-r1", App: "web", Image: "web:1.0", Status: "Up 2 minutes", HostPort: 40123})
+	h.Engine.Add(engine.Container{Name: "api-r3", App: "api", Image: "api:2.0", Status: "Up 5 seconds", HostPort: 40124})
+
+	// Stand in for the health monitor.
+	h.Server.HealthOf = func(app string) (string, string, int, bool) {
+		switch app {
+		case "web":
+			return "healthy", "", 0, true
+		case "api":
+			return "restarting", "health check failed: unexpected status 503; restarted, next check in 20s", 2, true
+		}
+		return "", "", 0, false
+	}
+
+	if code := h.run("ps"); code != exitOK {
+		t.Fatalf("exit code = %d, stderr: %s", code, h.stderr.String())
+	}
+
+	out := h.stdout.String()
+	for _, want := range []string{
+		"HEALTH",
+		"healthy ",
+		"restarting (2 restarts)",
+		// The explanation follows the table.
+		"\napi: health check failed: unexpected status 503; restarted, next check in 20s\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output does not contain %q:\n%s", want, out)
+		}
+	}
+	// A healthy app gets no note.
+	if strings.Contains(out, "\nweb: ") {
+		t.Errorf("a healthy app has a note:\n%s", out)
+	}
 }

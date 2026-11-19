@@ -19,9 +19,11 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/onrcanogul/liman/internal/applock"
 	"github.com/onrcanogul/liman/internal/buildinfo"
 	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/engine"
+	"github.com/onrcanogul/liman/internal/monitor"
 	"github.com/onrcanogul/liman/internal/nginx"
 	"github.com/onrcanogul/liman/internal/server"
 	"github.com/onrcanogul/liman/internal/store"
@@ -114,11 +116,44 @@ func (d *Daemon) serve(ctx context.Context) int {
 	// Under systemd they go to the journal; nothing else is needed.
 	log := slog.New(slog.NewTextHandler(d.Stderr, nil))
 
-	srv := &server.Server{Store: st, Connect: connectOnce(d.Connect), Log: log}
+	connect := connectOnce(d.Connect)
+	// One set of locks for everything that changes an app: the API handlers
+	// and the health monitor.
+	locks := &applock.Locks{}
+
+	srv := &server.Server{Store: st, Connect: connect, Log: log, Locks: locks}
 	// Only assign the proxy when it is enabled. Assigning a nil
 	// *nginx.Manager to the interface field would make the field non-nil.
 	if cfg.Nginx.Enabled() {
 		srv.Proxy = nginx.New(cfg.Nginx)
+	}
+
+	// The monitor runs for as long as the daemon does, in a goroutine of
+	// its own. monitorDone is closed when that goroutine has ended, which
+	// the shutdown below waits for.
+	monitorCtx, stopMonitor := context.WithCancel(context.Background())
+	defer stopMonitor()
+	monitorDone := make(chan struct{})
+
+	if cfg.Monitor.Disabled {
+		close(monitorDone)
+	} else {
+		mon := &monitor.Monitor{
+			Connect:          connect,
+			Locks:            locks,
+			Interval:         time.Duration(cfg.Monitor.Interval),
+			FailureThreshold: cfg.Monitor.FailureThreshold,
+			Log:              log,
+			OnRestart:        recordRestart(st, log),
+		}
+		srv.HealthOf = func(app string) (string, string, int, bool) {
+			status, ok := mon.Status(app)
+			return status.Health, status.Detail, status.Restarts, ok
+		}
+		go func() {
+			defer close(monitorDone)
+			mon.Run(monitorCtx)
+		}()
 	}
 
 	// Listening and serving are separate steps on purpose: if the address
@@ -156,6 +191,7 @@ func (d *Daemon) serve(ctx context.Context) int {
 		"listen", listener.Addr().String(),
 		"version", buildinfo.Version,
 		"nginx", cfg.Nginx.Enabled(),
+		"monitor", !cfg.Monitor.Disabled,
 	)
 	if d.Ready != nil {
 		d.Ready(listener.Addr().String())
@@ -181,6 +217,12 @@ func (d *Daemon) serve(ctx context.Context) int {
 	}
 	log.Info("shutting down; waiting for running requests", "timeout", timeout.String())
 
+	// Stop the monitor first and wait until it has really stopped. A
+	// restart it started is finished; no new one begins while the daemon is
+	// on its way out.
+	stopMonitor()
+	<-monitorDone
+
 	// ctx is already cancelled, so the shutdown needs a context of its own.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -199,6 +241,31 @@ func (d *Daemon) serve(ctx context.Context) int {
 
 	log.Info("limand stopped")
 	return exitOK
+}
+
+// recordRestart returns the callback that writes the monitor's restarts
+// into the history, next to the steps of deploys.
+func recordRestart(st *store.Store, log *slog.Logger) func(monitor.Event) {
+	return func(ev monitor.Event) {
+		rec := store.Event{
+			Time:       ev.Started,
+			App:        ev.App,
+			Release:    ev.Release,
+			Step:       fmt.Sprintf("Restart container %s: %s", ev.Container, ev.Reason),
+			Action:     "restart",
+			OK:         ev.Err == nil,
+			DurationMS: ev.Duration.Milliseconds(),
+		}
+		if ev.Err != nil {
+			rec.Error = ev.Err.Error()
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := st.AppendEvent(ctx, rec); err != nil {
+			log.Error("restart not recorded", "app", ev.App, "error", err)
+		}
+	}
 }
 
 // connectOnce wraps connect so that the engine is connected to once and the

@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func write(t *testing.T, content string) string {
@@ -269,5 +270,41 @@ func TestLoadClientRejectsClearTextToPublicAddress(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "liman_secret") {
 		t.Error("the error message contains the token")
+	}
+}
+
+func TestLoadMonitorSettings(t *testing.T) {
+	cfg, err := Load(write(t, "monitor:\n  interval: 1m30s\n  failure_threshold: 5\n"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if got := time.Duration(cfg.Monitor.Interval); got != 90*time.Second {
+		t.Errorf("Interval = %s, want 1m30s", got)
+	}
+	if cfg.Monitor.FailureThreshold != 5 || cfg.Monitor.Disabled {
+		t.Errorf("Monitor = %+v", cfg.Monitor)
+	}
+}
+
+func TestLoadRejectsBadMonitorSettings(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		wantErr string
+	}{
+		{"number without unit", "monitor:\n  interval: 10\n", "is not a duration"},
+		{"not a duration", "monitor:\n  interval: soon\n", "is not a duration"},
+		{"too short", "monitor:\n  interval: 100ms\n", "at least 1s"},
+		{"negative threshold", "monitor:\n  failure_threshold: -1\n", "must not be negative"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Load(write(t, tt.content))
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("Load() error = %v, want it to contain %q", err, tt.wantErr)
+			}
+		})
 	}
 }

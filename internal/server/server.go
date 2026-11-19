@@ -20,6 +20,7 @@ import (
 
 	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/app"
+	"github.com/onrcanogul/liman/internal/applock"
 	"github.com/onrcanogul/liman/internal/buildinfo"
 	"github.com/onrcanogul/liman/internal/deploy"
 	"github.com/onrcanogul/liman/internal/engine"
@@ -42,6 +43,14 @@ type Server struct {
 
 	Store *store.Store
 
+	// Locks is the set of apps being changed. The daemon shares one with
+	// the health monitor; when nil the server uses its own.
+	Locks *applock.Locks
+
+	// HealthOf, when set, returns the health monitor's verdict on an app.
+	// The last result is false if the monitor knows nothing about it.
+	HealthOf func(app string) (health, detail string, restarts int, ok bool)
+
 	// Log receives one line per request. Nil discards them.
 	Log *slog.Logger
 
@@ -61,14 +70,15 @@ type Server struct {
 	// tests replace it to control ports, timing and release names.
 	NewDeployer func(e engine.Engine, out io.Writer) *deploy.Deployer
 
-	// mu guards the two maps below. HTTP handlers run concurrently, one
+	// mu guards the map below. HTTP handlers run concurrently, one
 	// goroutine per request, and a map must never be read and written at
 	// the same time.
 	mu sync.Mutex
-	// busy holds the apps that have a deploy or stop in progress.
-	busy map[string]bool
 	// confirms holds the questions that are waiting for an answer.
 	confirms map[string]chan bool
+
+	// ownLocks is used when Locks is nil.
+	ownLocks applock.Locks
 
 	// limiter locks out clients that keep failing to authenticate. It is
 	// created on first use; initLimiter makes that safe when the first
@@ -281,14 +291,20 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 	// is encoded as [] and not as null.
 	out := make([]api.Container, 0, len(containers))
 	for _, c := range containers {
-		out = append(out, api.Container{
+		entry := api.Container{
 			App:       c.App,
 			Container: c.Name,
 			Image:     c.Image,
 			State:     c.State,
 			Status:    c.Status,
 			HostPort:  c.HostPort,
-		})
+		}
+		if s.HealthOf != nil {
+			if health, detail, restarts, ok := s.HealthOf(c.App); ok {
+				entry.Health, entry.HealthDetail, entry.Restarts = health, detail, restarts
+			}
+		}
+		out = append(out, entry)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -438,23 +454,10 @@ func (s *Server) newDeployer(e engine.Engine, out io.Writer) *deploy.Deployer {
 // lock marks app as busy. It returns false if it already is; otherwise it
 // returns the function that releases the app again.
 func (s *Server) lock(app string) (unlock func(), ok bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.busy[app] {
-		return nil, false
+	if s.Locks != nil {
+		return s.Locks.TryLock(app)
 	}
-	// A nil map can be read but not written, so create it on first use.
-	if s.busy == nil {
-		s.busy = map[string]bool{}
-	}
-	s.busy[app] = true
-
-	return func() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		delete(s.busy, app)
-	}, true
+	return s.ownLocks.TryLock(app)
 }
 
 // confirmer returns the pipeline callback that asks the client before each

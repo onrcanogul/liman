@@ -218,16 +218,41 @@ func (c *CLI) runPs(ctx context.Context, args []string) int {
 	// tabwriter aligns tab-separated cells into columns once Flush is
 	// called, so the widths adapt to the longest value.
 	w := tabwriter.NewWriter(c.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "APP\tCONTAINER\tIMAGE\tSTATE\tADDRESS\tSTATUS")
+	fmt.Fprintln(w, "APP\tCONTAINER\tIMAGE\tSTATE\tHEALTH\tADDRESS\tSTATUS")
+	// Explanations of anything that is not healthy are printed below the
+	// table: they are sentences, and would wreck the columns.
+	var notes []string
 	for _, ctr := range containers {
 		address := "-"
 		if ctr.HostPort != 0 {
 			address = fmt.Sprintf("127.0.0.1:%d", ctr.HostPort)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", ctr.App, ctr.Container, ctr.Image, ctr.State, address, ctr.Status)
+
+		health := ctr.Health
+		switch {
+		case health == "":
+			// The monitor has not looked yet, or is switched off.
+			health = "-"
+		case ctr.Restarts == 1:
+			health += " (1 restart)"
+		case ctr.Restarts > 1:
+			health = fmt.Sprintf("%s (%d restarts)", health, ctr.Restarts)
+		}
+		if ctr.HealthDetail != "" {
+			notes = append(notes, fmt.Sprintf("%s: %s", ctr.App, ctr.HealthDetail))
+		}
+
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ctr.App, ctr.Container, ctr.Image, ctr.State, health, address, ctr.Status)
 	}
 	if err := w.Flush(); err != nil {
 		return c.fail(err)
+	}
+
+	if len(notes) > 0 {
+		fmt.Fprintln(c.Stdout)
+		for _, note := range notes {
+			fmt.Fprintln(c.Stdout, note)
+		}
 	}
 	return exitOK
 }
