@@ -1,0 +1,11 @@
+# Build output
+/bin/
+
+# Test and coverage output
+*.test
+*.out
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
