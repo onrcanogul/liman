@@ -7,6 +7,7 @@ package cli
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -17,6 +18,8 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+
+	"golang.org/x/term"
 
 	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/app"
@@ -47,6 +50,12 @@ Commands:
   logs [-f] <app>      Show the logs of an app (-f keeps following)
   stop <app>           Stop and remove an app
   history [-n N] [app] Show the last N executed steps (default 20)
+  secret set <app> <NAME>
+                       Store a secret; the value is read from standard input
+                       (or typed at a prompt that does not show it)
+  secret list <app>    List the names of an app's secrets
+  secret rm <app> <NAME>
+                       Remove a secret
   status               Check that the daemon is reachable
   version              Print version information
   help                 Show this help
@@ -94,6 +103,8 @@ func (c *CLI) Run(ctx context.Context, args []string) int {
 		return c.runStop(ctx, rest)
 	case "history":
 		return c.runHistory(ctx, rest)
+	case "secret":
+		return c.runSecret(ctx, rest)
 	case "status":
 		return c.runStatus(ctx, rest)
 	case "version":
@@ -386,6 +397,119 @@ func (c *CLI) runHistory(ctx context.Context, args []string) int {
 			ev.App, ev.Release, ev.Action, result,
 			(time.Duration(ev.DurationMS) * time.Millisecond).String(),
 			ev.Step)
+	}
+	if err := w.Flush(); err != nil {
+		return c.fail(err)
+	}
+	return exitOK
+}
+
+func (c *CLI) runSecret(ctx context.Context, args []string) int {
+	const synopsis = "liman secret set <app> <NAME> | list <app> | rm <app> <NAME>"
+	if len(args) == 0 {
+		return c.usageError(synopsis)
+	}
+
+	switch args[0] {
+	case "set":
+		// The value is deliberately not an argument. Command lines are
+		// saved in the shell history and are visible to every user of the
+		// machine in the process list while the command runs.
+		if len(args) != 3 {
+			return c.usageError("liman secret set <app> <NAME>   (the value is read from standard input)")
+		}
+		return c.secretSet(ctx, args[1], args[2])
+
+	case "list":
+		if len(args) != 2 {
+			return c.usageError("liman secret list <app>")
+		}
+		return c.secretList(ctx, args[1])
+
+	case "rm":
+		if len(args) != 3 {
+			return c.usageError("liman secret rm <app> <NAME>")
+		}
+		if err := c.API.DeleteSecret(ctx, args[1], args[2]); err != nil {
+			return c.fail(err)
+		}
+		fmt.Fprintf(c.Stdout, "Removed secret %s of %s; running containers keep it until the next deploy\n", args[2], args[1])
+		return exitOK
+
+	default:
+		return c.usageError(synopsis)
+	}
+}
+
+func (c *CLI) secretSet(ctx context.Context, appName, name string) int {
+	// Checked before anything is read, so a mistyped name does not cost
+	// the user typing the value.
+	if !app.ValidName(appName) {
+		return c.fail(fmt.Errorf("invalid app name %q", appName))
+	}
+
+	value, err := c.readSecret(name)
+	if err != nil {
+		return c.fail(err)
+	}
+	if len(value) == 0 {
+		return c.fail(errors.New("the secret value is empty"))
+	}
+
+	if err := c.API.SetSecret(ctx, appName, name, value); err != nil {
+		return c.fail(err)
+	}
+	// The length is the only thing about the value that is ever shown; it
+	// helps to notice a stray newline or a truncated paste.
+	fmt.Fprintf(c.Stdout, "Stored secret %s of %s (%d bytes); it takes effect on the next deploy\n", name, appName, len(value))
+	return exitOK
+}
+
+// readSecret gets a secret value from the user: typed at a prompt that
+// does not echo when standard input is a terminal, read to the end
+// otherwise (a pipe or a file).
+func (c *CLI) readSecret(name string) ([]byte, error) {
+	// A type assertion with two results does not panic when the type does
+	// not match; ok is simply false. In tests Stdin is a strings.Reader.
+	if f, ok := c.Stdin.(*os.File); ok && term.IsTerminal(int(f.Fd())) {
+		fmt.Fprintf(c.Stdout, "Value for %s (not shown): ", name)
+		// ReadPassword switches the terminal's echo off for one line.
+		value, err := term.ReadPassword(int(f.Fd()))
+		fmt.Fprintln(c.Stdout)
+		if err != nil {
+			return nil, fmt.Errorf("read secret value: %w", err)
+		}
+		return value, nil
+	}
+
+	// One byte beyond the limit, so an oversized value is rejected by the
+	// daemon rather than silently cut off here.
+	value, err := io.ReadAll(io.LimitReader(c.Stdin, 64<<10+1))
+	if err != nil {
+		return nil, fmt.Errorf("read secret value: %w", err)
+	}
+	// "echo value | liman secret set" and files saved by editors end in a
+	// newline that is not part of the secret. Exactly one is removed, so a
+	// value that really ends in blank lines can still be stored.
+	value = bytes.TrimSuffix(value, []byte("\n"))
+	value = bytes.TrimSuffix(value, []byte("\r"))
+	return value, nil
+}
+
+func (c *CLI) secretList(ctx context.Context, appName string) int {
+	list, err := c.API.Secrets(ctx, appName)
+	if err != nil {
+		return c.fail(err)
+	}
+	if len(list) == 0 {
+		fmt.Fprintf(c.Stdout, "No secrets for %s. Add one with: liman secret set %s <NAME>\n", appName, appName)
+		return exitOK
+	}
+
+	w := tabwriter.NewWriter(c.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tUPDATED")
+	for _, sec := range list {
+		fmt.Fprintf(w, "%s\t%s\n", sec.Name, sec.UpdatedAt.Local().Format("2006-01-02 15:04:05"))
 	}
 	if err := w.Flush(); err != nil {
 		return c.fail(err)

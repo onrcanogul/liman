@@ -187,6 +187,13 @@ func TestRun(t *testing.T) {
 			wantStderr: "cannot be combined",
 		},
 
+		{name: "secret without subcommand", args: []string{"secret"}, wantCode: exitUsage, wantStderr: "usage: liman secret"},
+		{name: "secret set with value as argument", args: []string{"secret", "set", "web", "KEY", "the-value"}, wantCode: exitUsage, wantStderr: "the value is read from standard input"},
+		{name: "secret set with invalid app", args: []string{"secret", "set", "../x", "KEY"}, wantCode: exitError, wantStderr: `invalid app name "../x"`},
+		{name: "secret list when empty", args: []string{"secret", "list", "web"}, wantCode: exitOK, wantStdout: "No secrets for web."},
+		{name: "secret rm of unknown secret", args: []string{"secret", "rm", "web", "KEY"}, wantCode: exitError, wantStderr: "KEY: secret is not set"},
+		{name: "secret set with nothing on stdin", args: []string{"secret", "set", "web", "KEY"}, wantCode: exitError, wantStderr: "the secret value is empty"},
+
 		{name: "history when empty", args: []string{"history"}, wantCode: exitOK, wantStdout: "No history yet."},
 		{name: "history with bad limit", args: []string{"history", "-n", "0"}, wantCode: exitUsage, wantStderr: "usage: liman history"},
 		{name: "history with too many arguments", args: []string{"history", "a", "b"}, wantCode: exitUsage, wantStderr: "usage: liman history"},
@@ -538,5 +545,104 @@ func TestRollbackStepModeDeclineKeepsCurrentRelease(t *testing.T) {
 	}
 	if got := h.Engine.State("orders-api-r1"); got != "exited" {
 		t.Errorf("state of the previous release = %q, want it stopped again and kept", got)
+	}
+}
+
+func TestSecretCommands(t *testing.T) {
+	// The value arrives on standard input with the trailing newline that
+	// "echo" and editors add.
+	h := newHarness(t, "postgres://user:hunter2@db/app\n")
+
+	if code := h.run("secret", "set", "orders-api", "DATABASE_URL"); code != exitOK {
+		t.Fatalf("secret set exit code = %d, stderr: %s", code, h.stderr.String())
+	}
+	// The confirmation states the length, never the value.
+	if want := "Stored secret DATABASE_URL of orders-api (30 bytes)"; !strings.Contains(h.stdout.String(), want) {
+		t.Errorf("output = %q, want it to contain %q", h.stdout.String(), want)
+	}
+	if strings.Contains(h.stdout.String()+h.stderr.String(), "hunter2") {
+		t.Error("the CLI printed the secret value")
+	}
+
+	// Exactly the value, without the newline, reached the daemon.
+	env := deployAndGetEnv(t, h, "DATABASE_URL")
+	if got := env["DATABASE_URL"]; got != "postgres://user:hunter2@db/app" {
+		t.Errorf("the container received a value of %d bytes, want the 30-byte original", len(got))
+	}
+
+	h.stdout.Reset()
+	if code := h.run("secret", "list", "orders-api"); code != exitOK {
+		t.Fatalf("secret list exit code = %d", code)
+	}
+	if out := h.stdout.String(); !strings.Contains(out, "DATABASE_URL") || strings.Contains(out, "hunter2") {
+		t.Errorf("secret list output:\n%s", out)
+	}
+
+	h.stdout.Reset()
+	if code := h.run("secret", "rm", "orders-api", "DATABASE_URL"); code != exitOK {
+		t.Fatalf("secret rm exit code = %d, stderr: %s", code, h.stderr.String())
+	}
+	h.stdout.Reset()
+	h.run("secret", "list", "orders-api")
+	if !strings.Contains(h.stdout.String(), "No secrets for orders-api.") {
+		t.Errorf("secret list after rm:\n%s", h.stdout.String())
+	}
+}
+
+// deployAndGetEnv deploys an app that refers to the named secrets and
+// returns the environment its container was started with.
+func deployAndGetEnv(t *testing.T, h *harness, secretNames ...string) map[string]string {
+	t.Helper()
+
+	def := validDefinition + "secrets:\n"
+	for _, name := range secretNames {
+		def += "  - " + name + "\n"
+	}
+	if code := h.run("deploy", writeFile(t, def)); code != exitOK {
+		t.Fatalf("deploy exit code = %d, stderr: %s", code, h.stderr.String())
+	}
+	specs := h.Engine.Specs
+	return specs[len(specs)-1].Env
+}
+
+func TestSecretValueHandlingOfNewlines(t *testing.T) {
+	tests := []struct {
+		name  string
+		stdin string
+		want  string
+	}{
+		{"no newline", "value", "value"},
+		{"one trailing newline is removed", "value\n", "value"},
+		{"windows line ending is removed", "value\r\n", "value"},
+		{"only one newline is removed", "value\n\n", "value\n"},
+		{"inner newlines are kept", "line1\nline2\n", "line1\nline2"},
+		{"leading and inner spaces are kept", "  two  words \n", "  two  words "},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, tt.stdin)
+
+			if code := h.run("secret", "set", "orders-api", "KEY"); code != exitOK {
+				t.Fatalf("exit code = %d, stderr: %s", code, h.stderr.String())
+			}
+			if got := deployAndGetEnv(t, h, "KEY")["KEY"]; got != tt.want {
+				t.Errorf("stored value = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDeployWithMissingSecretSaysHowToFixIt(t *testing.T) {
+	h := newHarness(t, "")
+	file := writeFile(t, validDefinition+"secrets:\n  - API_KEY\n")
+
+	code := h.run("deploy", file)
+
+	if code != exitError {
+		t.Fatalf("exit code = %d, want %d", code, exitError)
+	}
+	if want := "liman secret set orders-api <NAME>"; !strings.Contains(h.stderr.String(), want) {
+		t.Errorf("stderr = %q, want it to contain %q", h.stderr.String(), want)
 	}
 }
