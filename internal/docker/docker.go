@@ -12,6 +12,8 @@ import (
 	"net/netip"
 	"sort"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/containerd/errdefs"
 	"github.com/moby/moby/api/pkg/stdcopy"
@@ -97,7 +99,7 @@ func (c *Client) Start(ctx context.Context, spec engine.Spec) (string, error) {
 		Config: &container.Config{
 			Image:        spec.Image,
 			Env:          envList(spec.Env),
-			Labels:       map[string]string{engine.LabelApp: spec.Name},
+			Labels:       map[string]string{engine.LabelApp: spec.App},
 			ExposedPorts: network.PortSet{port: struct{}{}},
 		},
 		// HostConfig describes how it is attached to the host: published
@@ -132,26 +134,30 @@ func (c *Client) Start(ctx context.Context, spec engine.Spec) (string, error) {
 	return created.ID, nil
 }
 
-// Inspect implements engine.Engine. GET /containers/{name}/json.
-func (c *Client) Inspect(ctx context.Context, name string) (engine.Container, error) {
-	res, err := c.api.ContainerInspect(ctx, name, client.ContainerInspectOptions{})
+// Inspect implements engine.Engine. GET /containers/{ref}/json.
+func (c *Client) Inspect(ctx context.Context, ref string) (engine.Container, error) {
+	res, err := c.api.ContainerInspect(ctx, ref, client.ContainerInspectOptions{})
 	if errdefs.IsNotFound(err) {
 		// Translate the SDK's error into ours so callers do not need to
 		// import anything Docker-specific.
-		return engine.Container{}, fmt.Errorf("%s: %w", name, engine.ErrNotFound)
+		return engine.Container{}, fmt.Errorf("%s: %w", ref, engine.ErrNotFound)
 	}
 	if err != nil {
-		return engine.Container{}, fmt.Errorf("inspect container %s: %w", name, err)
+		return engine.Container{}, fmt.Errorf("inspect container %s: %w", ref, err)
 	}
 
 	info := res.Container
-	if info.Config == nil || info.Config.Labels[engine.LabelApp] != name {
-		return engine.Container{}, fmt.Errorf("%s: %w", name, engine.ErrNotManaged)
+	// A container without our label was started by someone else. Refusing
+	// it here protects every method that inspects first (Remove, Logs).
+	if info.Config == nil || info.Config.Labels[engine.LabelApp] == "" {
+		return engine.Container{}, fmt.Errorf("%s: %w", ref, engine.ErrNotManaged)
 	}
 
 	out := engine.Container{
-		ID:    info.ID,
-		Name:  name,
+		ID: info.ID,
+		// The API reports names with a leading slash.
+		Name:  strings.TrimPrefix(info.Name, "/"),
+		App:   info.Config.Labels[engine.LabelApp],
 		Image: info.Config.Image,
 	}
 	if info.State != nil {
@@ -167,9 +173,9 @@ func (c *Client) Inspect(ctx context.Context, name string) (engine.Container, er
 
 // Remove implements engine.Engine. POST /containers/{id}/stop, then
 // DELETE /containers/{id}.
-func (c *Client) Remove(ctx context.Context, name string) error {
+func (c *Client) Remove(ctx context.Context, ref string) error {
 	// Inspect first: it verifies that the container is ours.
-	info, err := c.Inspect(ctx, name)
+	info, err := c.Inspect(ctx, ref)
 	if err != nil {
 		return err
 	}
@@ -178,10 +184,10 @@ func (c *Client) Remove(ctx context.Context, name string) error {
 	// the daemon falls back to SIGKILL. Stopping an already stopped
 	// container is not an error.
 	if _, err := c.api.ContainerStop(ctx, info.ID, client.ContainerStopOptions{}); err != nil {
-		return fmt.Errorf("stop container %s: %w", name, err)
+		return fmt.Errorf("stop container %s: %w", info.Name, err)
 	}
 	if _, err := c.api.ContainerRemove(ctx, info.ID, client.ContainerRemoveOptions{}); err != nil {
-		return fmt.Errorf("remove container %s: %w", name, err)
+		return fmt.Errorf("remove container %s: %w", info.Name, err)
 	}
 	return nil
 }
@@ -199,11 +205,15 @@ func (c *Client) List(ctx context.Context) ([]engine.Container, error) {
 	out := make([]engine.Container, 0, len(res.Items))
 	for _, item := range res.Items {
 		ctr := engine.Container{
-			ID:     item.ID,
-			Name:   item.Labels[engine.LabelApp],
-			Image:  item.Image,
-			State:  string(item.State),
-			Status: item.Status,
+			ID:      item.ID,
+			App:     item.Labels[engine.LabelApp],
+			Image:   item.Image,
+			State:   string(item.State),
+			Status:  item.Status,
+			Created: time.Unix(item.Created, 0),
+		}
+		if len(item.Names) > 0 {
+			ctr.Name = strings.TrimPrefix(item.Names[0], "/")
 		}
 		// The list endpoint only reports ports of running containers.
 		for _, p := range item.Ports {
@@ -215,13 +225,25 @@ func (c *Client) List(ctx context.Context) ([]engine.Container, error) {
 		out = append(out, ctr)
 	}
 
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	// The comparison function says whether element i sorts before j: first
+	// by app, then oldest first, with the name as a stable tie-breaker for
+	// containers created within the same second.
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.App != b.App {
+			return a.App < b.App
+		}
+		if !a.Created.Equal(b.Created) {
+			return a.Created.Before(b.Created)
+		}
+		return a.Name < b.Name
+	})
 	return out, nil
 }
 
 // Logs implements engine.Engine. GET /containers/{id}/logs.
-func (c *Client) Logs(ctx context.Context, name string, follow bool, stdout, stderr io.Writer) error {
-	info, err := c.Inspect(ctx, name)
+func (c *Client) Logs(ctx context.Context, ref string, follow bool, stdout, stderr io.Writer) error {
+	info, err := c.Inspect(ctx, ref)
 	if err != nil {
 		return err
 	}
@@ -233,7 +255,7 @@ func (c *Client) Logs(ctx context.Context, name string, follow bool, stdout, std
 		Tail:       "200",
 	})
 	if err != nil {
-		return fmt.Errorf("read logs of %s: %w", name, err)
+		return fmt.Errorf("read logs of %s: %w", info.Name, err)
 	}
 	// defer runs when the function returns, on every path. It is Go's way
 	// of making sure a resource is released.
@@ -243,7 +265,7 @@ func (c *Client) Logs(ctx context.Context, name string, follow bool, stdout, std
 	// each chunk prefixed with a small header. StdCopy splits them again.
 	// With follow it blocks here until the stream ends.
 	if _, err := stdcopy.StdCopy(stdout, stderr, stream); err != nil {
-		return fmt.Errorf("read logs of %s: %w", name, err)
+		return fmt.Errorf("read logs of %s: %w", info.Name, err)
 	}
 	return nil
 }

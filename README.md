@@ -28,42 +28,59 @@ $ ./bin/liman version
 liman 3f2a1c9 (commit 3f2a1c9, built 2026-11-19T17:00:00Z)
 ```
 
-```
-$ ./bin/liman plan examples/app.yaml
-Plan for orders-api (examples/app.yaml):
-  1. Pull image ghcr.io/user/orders-api:1.4
-  2. Allocate a free host port
-  3. Start container orders-api on port 3000 (memory 512m, cpus 0.5, 2 env vars)
-  4. Health check: GET /health on port 3000
-  5. Write Nginx config for api.example.com
-  6. Reload Nginx
-```
-
-See [examples/app.yaml](examples/app.yaml) for the app definition format.
-
-Deploying runs the app on the local Docker daemon, published on 127.0.0.1
-only:
+Every deploy is a list of named steps. A dry run shows them, together with
+the command you would have typed by hand, without touching anything:
 
 ```
-$ ./bin/liman deploy examples/whoami.yaml
-==> Pull image traefik/whoami:v1.10
-    Status: Image is up to date for traefik/whoami:v1.10
-==> Allocate a free host port
-    127.0.0.1:57582
-==> Start container whoami
-    d741a4c962b1
-==> Health check
-    GET http://127.0.0.1:57582/health
+$ ./bin/liman deploy --dry-run examples/whoami.yaml
+Dry run for whoami: nothing will be changed.
 
-whoami is running at http://127.0.0.1:57582
-
-$ ./bin/liman ps
-NAME    IMAGE                 STATE    ADDRESS          STATUS
-whoami  traefik/whoami:v1.10  running  127.0.0.1:57582  Up 5 seconds
-
-$ ./bin/liman logs -f whoami
-$ ./bin/liman stop whoami
+==> [1/5] Pull image traefik/whoami:v1.10
+    $ docker pull traefik/whoami:v1.10
+==> [2/5] Allocate a free host port
+==> [3/5] Start container whoami-20261119-181805
+    $ docker run -d --name whoami-20261119-181805 --label liman.app=whoami -p 127.0.0.1:<free port>:80 --memory 64m --cpus 0.5 -e WHOAMI_NAME=*** traefik/whoami:v1.10
+==> [4/5] Health check
+    $ curl --fail http://127.0.0.1:<free port>/health
+==> [5/5] Remove previous containers of whoami
+    $ docker rm -f $(docker ps -aq --filter label=liman.app=whoami)   # except whoami-20261119-181805
 ```
+
+`liman plan <file>` is a shorthand for the same thing. See
+[examples/app.yaml](examples/app.yaml) for the app definition format.
+
+A real deploy runs the steps against the local Docker daemon. The new release
+starts next to the previous one and the previous one is only removed once the
+new one is healthy. If a step fails, or you press Ctrl+C, the completed steps
+are undone in reverse order and the previous release keeps running:
+
+```
+$ ./bin/liman deploy broken.yaml
+==> [1/5] Pull image ...
+==> [2/5] Allocate a free host port
+    127.0.0.1:57840
+==> [3/5] Start container web-20261119-181848
+    c0fcb3eb3a90
+==> [4/5] Health check
+    GET http://127.0.0.1:57840/nope
+    container output:
+        ...
+<== Undo: Start container web-20261119-181848
+liman: Health check: not healthy after 30s: unexpected status 404 Not Found
+```
+
+Other commands:
+
+```
+liman deploy --step <file>   # ask before every step; "n" undoes what was done
+liman ps                     # containers managed by liman
+liman logs -f <app>          # follow the logs of the newest release
+liman stop <app>             # stop and remove all containers of an app
+liman history [-n N] [app]   # every executed step, with result and duration
+```
+
+History is kept in `~/.liman/history.jsonl` (override the directory with
+`LIMAN_HOME`). Environment variable values are never printed.
 
 liman only lists and touches containers it started itself (label
 `liman.app`). Private registries are not supported yet.
@@ -74,8 +91,9 @@ liman only lists and touches containers it started itself (label
 cmd/liman/           CLI entry point (wiring only)
 internal/cli/        command dispatch
 internal/app/        app definition: loading and validation
-internal/plan/       turns an app definition into deploy steps
-internal/deploy/     deploy sequence and health checking
+internal/deploy/     the steps of a deploy and how each is undone
+internal/pipeline/   runs steps: dry run, confirmation, rollback
+internal/history/    append-only record of executed steps
 internal/engine/     container engine interface and shared types
 internal/docker/     Docker implementation of the engine interface
 internal/buildinfo/  version metadata injected at build time

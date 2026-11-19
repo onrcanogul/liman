@@ -11,6 +11,7 @@ import (
 
 	"github.com/onrcanogul/liman/internal/engine"
 	"github.com/onrcanogul/liman/internal/engine/enginetest"
+	"github.com/onrcanogul/liman/internal/history"
 )
 
 const validDefinition = `
@@ -27,16 +28,46 @@ domain: api.example.com
 port: 3000
 `
 
+// harness bundles a CLI with the fakes behind it.
+type harness struct {
+	cli    *CLI
+	fake   *enginetest.Fake
+	stdout bytes.Buffer
+	stderr bytes.Buffer
+	// connectErr makes Connect fail, simulating Docker being down.
+	connectErr error
+}
+
+func newHarness(t *testing.T, stdin string) *harness {
+	t.Helper()
+
+	h := &harness{fake: enginetest.New()}
+	h.cli = &CLI{
+		Stdin:  strings.NewReader(stdin),
+		Stdout: &h.stdout,
+		Stderr: &h.stderr,
+		Connect: func(context.Context) (engine.Engine, error) {
+			if h.connectErr != nil {
+				return nil, h.connectErr
+			}
+			return h.fake, nil
+		},
+		History: history.Store{Path: filepath.Join(t.TempDir(), "history.jsonl")},
+	}
+	return h
+}
+
 func TestRun(t *testing.T) {
 	validFile := writeFile(t, validDefinition)
 	invalidFile := writeFile(t, invalidDefinition)
 
+	web := engine.Container{Name: "web-r1", App: "web", Image: "web:1.0", Status: "Up 2 minutes", HostPort: 40123}
+
 	tests := []struct {
 		name string
 		args []string
-		// setup prepares the fake engine; nil leaves it empty.
-		setup      func(f *enginetest.Fake)
-		connectErr error
+		// setup prepares the harness; nil leaves it empty.
+		setup      func(h *harness)
 		wantCode   int
 		wantStdout string
 		wantStderr string
@@ -47,47 +78,67 @@ func TestRun(t *testing.T) {
 		{name: "no arguments", args: nil, wantCode: exitUsage, wantStderr: "Usage:"},
 		{name: "unknown command", args: []string{"nope"}, wantCode: exitUsage, wantStderr: `unknown command "nope"`},
 
-		{name: "plan", args: []string{"plan", validFile}, wantCode: exitOK, wantStdout: "1. Pull image ghcr.io/user/orders-api:1.4"},
+		{name: "plan", args: []string{"plan", validFile}, wantCode: exitOK, wantStdout: "$ docker pull ghcr.io/user/orders-api:1.4"},
 		{name: "plan without file", args: []string{"plan"}, wantCode: exitUsage, wantStderr: "usage: liman plan <file>"},
+		{name: "plan rejects flags", args: []string{"plan", "--step", validFile}, wantCode: exitUsage, wantStderr: "usage: liman plan <file>"},
 		{name: "plan with missing file", args: []string{"plan", "missing.yaml"}, wantCode: exitError, wantStderr: "no such file"},
 		{name: "plan with invalid file", args: []string{"plan", invalidFile}, wantCode: exitError, wantStderr: "must include a tag"},
 		{
 			name:       "plan works without docker",
 			args:       []string{"plan", validFile},
-			connectErr: errors.New("docker is down"),
+			setup:      func(h *harness) { h.connectErr = errors.New("docker is down") },
 			wantCode:   exitOK,
-			wantStdout: "Plan for orders-api",
+			wantStdout: "Dry run for orders-api: nothing will be changed.",
 		},
 
 		{name: "deploy", args: []string{"deploy", validFile}, wantCode: exitOK, wantStdout: "orders-api is running at http://127.0.0.1:"},
-		{name: "deploy without file", args: []string{"deploy"}, wantCode: exitUsage, wantStderr: "usage: liman deploy <file>"},
+		{name: "deploy without file", args: []string{"deploy"}, wantCode: exitUsage, wantStderr: "usage: liman deploy"},
+		{name: "deploy with unknown flag", args: []string{"deploy", "--force", validFile}, wantCode: exitUsage, wantStderr: "usage: liman deploy"},
 		{name: "deploy with invalid file", args: []string{"deploy", invalidFile}, wantCode: exitError, wantStderr: "must include a tag"},
 		{
 			name:       "deploy without docker",
 			args:       []string{"deploy", validFile},
-			connectErr: errors.New("docker is down"),
+			setup:      func(h *harness) { h.connectErr = errors.New("docker is down") },
 			wantCode:   exitError,
 			wantStderr: "docker is down",
+		},
+		{
+			name:       "deploy dry run works without docker",
+			args:       []string{"deploy", "--dry-run", validFile},
+			setup:      func(h *harness) { h.connectErr = errors.New("docker is down") },
+			wantCode:   exitOK,
+			wantStdout: "==> [5/5] Remove previous containers of orders-api",
+		},
+		{
+			name:       "deploy rejects dry run with step",
+			args:       []string{"deploy", "--dry-run", "--step", validFile},
+			wantCode:   exitUsage,
+			wantStderr: "cannot be combined",
+		},
+		{
+			name:       "deploy reports failure",
+			args:       []string{"deploy", validFile},
+			setup:      func(h *harness) { h.fake.PullErr = errors.New("manifest unknown") },
+			wantCode:   exitError,
+			wantStderr: "liman: Pull image ghcr.io/user/orders-api:1.4: manifest unknown",
 		},
 
 		{name: "ps with no apps", args: []string{"ps"}, wantCode: exitOK, wantStdout: "No apps."},
 		{
-			name: "ps",
-			args: []string{"ps"},
-			setup: func(f *enginetest.Fake) {
-				f.Containers["web"] = engine.Container{Name: "web", Image: "web:1.0", State: "running", Status: "Up 2 minutes", HostPort: 40123}
-			},
+			name:       "ps",
+			args:       []string{"ps"},
+			setup:      func(h *harness) { h.fake.Add(web) },
 			wantCode:   exitOK,
-			wantStdout: "web   web:1.0  running  127.0.0.1:40123  Up 2 minutes",
+			wantStdout: "web  web-r1     web:1.0  running  127.0.0.1:40123  Up 2 minutes",
 		},
 		{name: "ps with arguments", args: []string{"ps", "extra"}, wantCode: exitUsage, wantStderr: "usage: liman ps"},
 
 		{
 			name: "logs",
 			args: []string{"logs", "web"},
-			setup: func(f *enginetest.Fake) {
-				f.Containers["web"] = engine.Container{Name: "web"}
-				f.LogOutput = "listening on :3000\n"
+			setup: func(h *harness) {
+				h.fake.Add(web)
+				h.fake.LogOutput = "listening on :3000\n"
 			},
 			wantCode:   exitOK,
 			wantStdout: "listening on :3000",
@@ -95,9 +146,9 @@ func TestRun(t *testing.T) {
 		{
 			name: "logs with follow flag",
 			args: []string{"logs", "-f", "web"},
-			setup: func(f *enginetest.Fake) {
-				f.Containers["web"] = engine.Container{Name: "web"}
-				f.LogOutput = "listening on :3000\n"
+			setup: func(h *harness) {
+				h.fake.Add(web)
+				h.fake.LogOutput = "listening on :3000\n"
 			},
 			wantCode:   exitOK,
 			wantStdout: "listening on :3000",
@@ -107,77 +158,236 @@ func TestRun(t *testing.T) {
 		{name: "logs with unknown flag", args: []string{"logs", "-x", "web"}, wantCode: exitUsage, wantStderr: "usage: liman logs [-f] <app>"},
 
 		{
-			name: "stop",
-			args: []string{"stop", "web"},
-			setup: func(f *enginetest.Fake) {
-				f.Containers["web"] = engine.Container{Name: "web", State: "running"}
-			},
+			name:       "stop",
+			args:       []string{"stop", "web"},
+			setup:      func(h *harness) { h.fake.Add(web) },
 			wantCode:   exitOK,
-			wantStdout: "Stopped and removed web",
+			wantStdout: "Stopped and removed web-r1",
 		},
 		{name: "stop unknown app", args: []string{"stop", "web"}, wantCode: exitError, wantStderr: "web: container not found"},
 		{name: "stop without app", args: []string{"stop"}, wantCode: exitUsage, wantStderr: "usage: liman stop <app>"},
+
+		{name: "history when empty", args: []string{"history"}, wantCode: exitOK, wantStdout: "No history yet."},
+		{name: "history with bad limit", args: []string{"history", "-n", "0"}, wantCode: exitUsage, wantStderr: "usage: liman history"},
+		{name: "history with too many arguments", args: []string{"history", "a", "b"}, wantCode: exitUsage, wantStderr: "usage: liman history"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fake := enginetest.New()
+			h := newHarness(t, "")
 			if tt.setup != nil {
-				tt.setup(fake)
+				tt.setup(h)
 			}
 
-			var stdout, stderr bytes.Buffer
-			c := &CLI{
-				Stdout: &stdout,
-				Stderr: &stderr,
-				Connect: func(context.Context) (engine.Engine, error) {
-					if tt.connectErr != nil {
-						return nil, tt.connectErr
-					}
-					return fake, nil
-				},
-			}
-
-			code := c.Run(context.Background(), tt.args)
+			code := h.cli.Run(context.Background(), tt.args)
 
 			if code != tt.wantCode {
 				t.Errorf("exit code = %d, want %d", code, tt.wantCode)
 			}
-			if !strings.Contains(stdout.String(), tt.wantStdout) {
-				t.Errorf("stdout = %q, want it to contain %q", stdout.String(), tt.wantStdout)
+			if !strings.Contains(h.stdout.String(), tt.wantStdout) {
+				t.Errorf("stdout = %q, want it to contain %q", h.stdout.String(), tt.wantStdout)
 			}
-			if !strings.Contains(stderr.String(), tt.wantStderr) {
-				t.Errorf("stderr = %q, want it to contain %q", stderr.String(), tt.wantStderr)
+			if !strings.Contains(h.stderr.String(), tt.wantStderr) {
+				t.Errorf("stderr = %q, want it to contain %q", h.stderr.String(), tt.wantStderr)
 			}
 			// Errors must not leak into stdout, and a failing command must
 			// say something on stderr.
-			if tt.wantStderr == "" && stderr.Len() != 0 {
-				t.Errorf("unexpected stderr: %q", stderr.String())
+			if tt.wantStderr == "" && h.stderr.Len() != 0 {
+				t.Errorf("unexpected stderr: %q", h.stderr.String())
 			}
-			if tt.wantCode != exitOK && stderr.Len() == 0 {
+			if tt.wantCode != exitOK && h.stderr.Len() == 0 {
 				t.Error("command failed without writing to stderr")
 			}
 		})
 	}
 }
 
-func TestStopRemovesContainer(t *testing.T) {
-	fake := enginetest.New()
-	fake.Containers["web"] = engine.Container{Name: "web", State: "running"}
+func TestLogsShowsNewestContainer(t *testing.T) {
+	h := newHarness(t, "")
+	h.fake.Add(engine.Container{Name: "web-r1", App: "web"})
+	h.fake.Add(engine.Container{Name: "web-r2", App: "web"})
+	h.fake.Add(engine.Container{Name: "other-r9", App: "other"})
 
-	var out bytes.Buffer
-	c := &CLI{
-		Stdout:  &out,
-		Stderr:  &out,
-		Connect: func(context.Context) (engine.Engine, error) { return fake, nil },
+	if code := h.cli.Run(context.Background(), []string{"logs", "web"}); code != exitOK {
+		t.Fatalf("exit code = %d, stderr: %s", code, h.stderr.String())
 	}
 
-	if code := c.Run(context.Background(), []string{"stop", "web"}); code != exitOK {
-		t.Fatalf("exit code = %d, output: %s", code, out.String())
+	if want := []string{"logs web-r2"}; !equal(h.fake.Calls, want) {
+		t.Errorf("calls = %v, want %v", h.fake.Calls, want)
 	}
-	if _, exists := fake.Containers["web"]; exists {
-		t.Error("container still exists after stop")
+}
+
+func TestStopRemovesAllContainersOfApp(t *testing.T) {
+	h := newHarness(t, "")
+	h.fake.Add(engine.Container{Name: "web-r1", App: "web"})
+	h.fake.Add(engine.Container{Name: "web-r2", App: "web"})
+	h.fake.Add(engine.Container{Name: "other-r9", App: "other"})
+
+	if code := h.cli.Run(context.Background(), []string{"stop", "web"}); code != exitOK {
+		t.Fatalf("exit code = %d, stderr: %s", code, h.stderr.String())
 	}
+
+	if _, ok := h.fake.Containers["other-r9"]; !ok || len(h.fake.Containers) != 1 {
+		t.Errorf("containers = %v, want only other-r9", h.fake.Containers)
+	}
+}
+
+func TestDeployRecordsHistory(t *testing.T) {
+	h := newHarness(t, "")
+	file := writeFile(t, validDefinition)
+
+	if code := h.cli.Run(context.Background(), []string{"deploy", file}); code != exitOK {
+		t.Fatalf("deploy exit code = %d, stderr: %s", code, h.stderr.String())
+	}
+
+	events, err := h.cli.History.Read()
+	if err != nil {
+		t.Fatalf("History.Read() error = %v", err)
+	}
+	if len(events) != 5 {
+		t.Fatalf("history has %d events, want 5", len(events))
+	}
+	first := events[0]
+	if first.App != "orders-api" || first.Action != "run" || !first.OK || first.Release == "" {
+		t.Errorf("first event = %+v, want a successful run for orders-api with a release", first)
+	}
+
+	// The same events must be visible through the history command.
+	h.stdout.Reset()
+	if code := h.cli.Run(context.Background(), []string{"history", "orders-api"}); code != exitOK {
+		t.Fatalf("history exit code = %d, stderr: %s", code, h.stderr.String())
+	}
+	out := h.stdout.String()
+	if !strings.Contains(out, "Pull image ghcr.io/user/orders-api:1.4") || strings.Count(out, "\n") != 6 {
+		t.Errorf("history output should have a header and 5 rows:\n%s", out)
+	}
+
+	h.stdout.Reset()
+	h.cli.Run(context.Background(), []string{"history", "-n", "2"})
+	if got := strings.Count(h.stdout.String(), "\n"); got != 3 {
+		t.Errorf("history -n 2 printed %d lines, want header and 2 rows", got)
+	}
+
+	h.stdout.Reset()
+	h.cli.Run(context.Background(), []string{"history", "another-app"})
+	if !strings.Contains(h.stdout.String(), "No history yet.") {
+		t.Errorf("history of another app = %q, want it to be empty", h.stdout.String())
+	}
+}
+
+func TestFailedDeployRecordsFailureAndUndo(t *testing.T) {
+	h := newHarness(t, "")
+	h.fake.StartState = "exited"
+	file := writeFile(t, validDefinition)
+
+	if code := h.cli.Run(context.Background(), []string{"deploy", file}); code != exitError {
+		t.Fatalf("deploy exit code = %d, want %d", code, exitError)
+	}
+
+	events, err := h.cli.History.Read()
+	if err != nil {
+		t.Fatalf("History.Read() error = %v", err)
+	}
+
+	var summary []string
+	for _, ev := range events {
+		result := "ok"
+		if !ev.OK {
+			result = "failed"
+		}
+		summary = append(summary, ev.Action+" "+result)
+	}
+	// pull, port, start succeed; health fails; start is undone.
+	want := []string{"run ok", "run ok", "run ok", "run failed", "undo ok"}
+	if !equal(summary, want) {
+		t.Errorf("history = %v, want %v", summary, want)
+	}
+	if last := events[3]; last.Error == "" {
+		t.Error("the failed event has no error message")
+	}
+}
+
+func TestDryRunRecordsNoHistory(t *testing.T) {
+	h := newHarness(t, "")
+	file := writeFile(t, validDefinition)
+
+	h.cli.Run(context.Background(), []string{"deploy", "--dry-run", file})
+
+	events, err := h.cli.History.Read()
+	if err != nil || len(events) != 0 {
+		t.Errorf("history after dry run = %v, %v; want empty", events, err)
+	}
+	if len(h.fake.Calls) != 0 {
+		t.Errorf("engine calls during dry run = %v, want none", h.fake.Calls)
+	}
+}
+
+func TestStepMode(t *testing.T) {
+	tests := []struct {
+		name  string
+		stdin string
+		// wantCode and the containers left afterwards.
+		wantCode       int
+		wantContainers int
+		wantStderr     string
+	}{
+		{name: "approve all", stdin: "y\ny\nyes\nY\ny\n", wantCode: exitOK, wantContainers: 1},
+		{name: "decline first", stdin: "n\n", wantCode: exitError, wantContainers: 0, wantStderr: "aborted before"},
+		{name: "empty answer means no", stdin: "\n", wantCode: exitError, wantContainers: 0, wantStderr: "aborted before"},
+		{name: "decline after start undoes it", stdin: "y\ny\ny\nn\n", wantCode: exitError, wantContainers: 0, wantStderr: `aborted before "Health check"`},
+		{name: "input ends early", stdin: "y\n", wantCode: exitError, wantContainers: 0, wantStderr: "read answer"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, tt.stdin)
+			file := writeFile(t, validDefinition)
+
+			code := h.cli.Run(context.Background(), []string{"deploy", "--step", file})
+
+			if code != tt.wantCode {
+				t.Errorf("exit code = %d, want %d (stderr: %s)", code, tt.wantCode, h.stderr.String())
+			}
+			if len(h.fake.Containers) != tt.wantContainers {
+				t.Errorf("%d containers left, want %d", len(h.fake.Containers), tt.wantContainers)
+			}
+			if !strings.Contains(h.stderr.String(), tt.wantStderr) {
+				t.Errorf("stderr = %q, want it to contain %q", h.stderr.String(), tt.wantStderr)
+			}
+			if !strings.Contains(h.stdout.String(), "Run this step? [y/N]") {
+				t.Errorf("stdout does not contain the prompt:\n%s", h.stdout.String())
+			}
+		})
+	}
+}
+
+func TestHistoryWriteFailureWarnsOnce(t *testing.T) {
+	h := newHarness(t, "")
+	// A path below a regular file cannot be created.
+	blocker := writeFile(t, "not a directory")
+	h.cli.History = history.Store{Path: filepath.Join(blocker, "history.jsonl")}
+	file := writeFile(t, validDefinition)
+
+	code := h.cli.Run(context.Background(), []string{"deploy", file})
+
+	if code != exitOK {
+		t.Errorf("exit code = %d, want the deploy to succeed despite the history failure", code)
+	}
+	if got := strings.Count(h.stderr.String(), "warning: history is not being recorded"); got != 1 {
+		t.Errorf("warning printed %d times, want once:\n%s", got, h.stderr.String())
+	}
+}
+
+func equal(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // writeFile creates an app.yaml in a temporary directory that the testing

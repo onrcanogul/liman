@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 )
 
 // LabelApp is set on every container liman starts. Its value is the app
@@ -28,6 +29,11 @@ var (
 // Spec describes a container to start. It is deliberately smaller than the
 // app definition: it carries only what an engine needs to know.
 type Spec struct {
+	// App is the app this container belongs to; it becomes the LabelApp
+	// label. Several containers can belong to one app while a new release
+	// is replacing an old one.
+	App string
+	// Name is the container name. It must be unique on the host.
 	Name  string
 	Image string
 
@@ -45,8 +51,10 @@ type Spec struct {
 
 // Container is the observed state of a container.
 type Container struct {
-	ID    string
+	ID string
+	// Name is the container name, App the app it belongs to.
 	Name  string
+	App   string
 	Image string
 
 	// State is a machine-readable state such as "running" or "exited".
@@ -57,6 +65,10 @@ type Container struct {
 
 	// HostPort is 0 when no port is published.
 	HostPort int
+
+	// Created is when the container was created. It is only filled in by
+	// List.
+	Created time.Time
 
 	// ExitCode and OOMKilled are only meaningful when State is "exited".
 	// They are only filled in by Inspect.
@@ -80,17 +92,32 @@ type Engine interface {
 	// Start creates and starts a container and returns its ID.
 	Start(ctx context.Context, spec Spec) (string, error)
 
-	// Inspect returns the state of the managed container called name.
-	Inspect(ctx context.Context, name string) (Container, error)
+	// Inspect returns the state of a managed container. ref is a container
+	// name or ID.
+	Inspect(ctx context.Context, ref string) (Container, error)
 
-	// Remove stops and deletes the managed container called name.
-	Remove(ctx context.Context, name string) error
+	// Remove stops and deletes a managed container.
+	Remove(ctx context.Context, ref string) error
 
-	// List returns all managed containers, running or not.
+	// List returns all managed containers, running or not, ordered by app
+	// and then by creation time, oldest first.
 	List(ctx context.Context) ([]Container, error)
 
 	// Logs copies the container's output to stdout and stderr. With follow
 	// it keeps streaming until the context is cancelled or the container
 	// stops.
-	Logs(ctx context.Context, name string, follow bool, stdout, stderr io.Writer) error
+	Logs(ctx context.Context, ref string, follow bool, stdout, stderr io.Writer) error
+}
+
+// ForApp returns the containers in list that belong to app, keeping their
+// order. Because List orders by creation time, the last element is the
+// newest container of the app.
+func ForApp(list []Container, app string) []Container {
+	var out []Container
+	for _, c := range list {
+		if c.App == app {
+			out = append(out, c)
+		}
+	}
+	return out
 }

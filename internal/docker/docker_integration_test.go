@@ -47,6 +47,7 @@ func TestContainerLifecycle(t *testing.T) {
 	}
 
 	spec := engine.Spec{
+		App:           "liman-integration",
 		Name:          name,
 		Image:         testImage,
 		ContainerPort: 80,
@@ -67,22 +68,20 @@ func TestContainerLifecycle(t *testing.T) {
 	if info.ID != id || !info.Running() || info.HostPort != 39999 {
 		t.Errorf("Inspect() = %+v, want running container %s on port 39999", info, id)
 	}
+	if info.Name != name || info.App != "liman-integration" {
+		t.Errorf("Inspect() name = %q app = %q, want %q and liman-integration", info.Name, info.App, name)
+	}
 
 	list, err := c.List(ctx)
 	if err != nil {
 		t.Fatalf("List() error = %v", err)
 	}
-	found := false
-	for _, ctr := range list {
-		if ctr.Name == name {
-			found = true
-			if ctr.HostPort != 39999 {
-				t.Errorf("List() host port = %d, want 39999", ctr.HostPort)
-			}
-		}
+	mine := engine.ForApp(list, "liman-integration")
+	if len(mine) != 1 {
+		t.Fatalf("List() has %d containers for the app, want 1", len(mine))
 	}
-	if !found {
-		t.Errorf("List() does not contain %s", name)
+	if mine[0].Name != name || mine[0].HostPort != 39999 || mine[0].Created.IsZero() {
+		t.Errorf("List() entry = %+v, want %s on port 39999 with a creation time", mine[0], name)
 	}
 
 	// A second container with the same name must be rejected.

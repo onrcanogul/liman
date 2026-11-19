@@ -5,11 +5,13 @@ import (
 	"context"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/onrcanogul/liman/internal/cli"
 	"github.com/onrcanogul/liman/internal/docker"
 	"github.com/onrcanogul/liman/internal/engine"
+	"github.com/onrcanogul/liman/internal/history"
 )
 
 func main() {
@@ -26,8 +28,10 @@ func run() int {
 	defer stop()
 
 	c := &cli.CLI{
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
+		Stdin:   os.Stdin,
+		Stdout:  os.Stdout,
+		Stderr:  os.Stderr,
+		History: history.Store{Path: filepath.Join(stateDir(), "history.jsonl")},
 		// This is the only place that names the concrete engine. Everything
 		// below it works with the engine.Engine interface.
 		Connect: func(ctx context.Context) (engine.Engine, error) {
@@ -35,4 +39,19 @@ func run() int {
 		},
 	}
 	return c.Run(ctx, os.Args[1:])
+}
+
+// stateDir returns the directory liman keeps its own files in: $LIMAN_HOME
+// if set, otherwise ~/.liman.
+func stateDir() string {
+	if dir := os.Getenv("LIMAN_HOME"); dir != "" {
+		return dir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		// No home directory (unusual, but possible in minimal containers):
+		// fall back to the current directory rather than refusing to run.
+		return ".liman"
+	}
+	return filepath.Join(home, ".liman")
 }
