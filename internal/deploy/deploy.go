@@ -21,12 +21,47 @@ import (
 	"github.com/onrcanogul/liman/internal/app"
 	"github.com/onrcanogul/liman/internal/engine"
 	"github.com/onrcanogul/liman/internal/pipeline"
+	"github.com/onrcanogul/liman/internal/textdiff"
 )
+
+// Proxy is what a deploy needs from the reverse proxy. It is declared here,
+// by the package that uses it, and lists only the operations a deploy
+// performs; *nginx.Manager happens to satisfy it.
+type Proxy interface {
+	// Path returns the config file of an app, for display.
+	Path(app string) string
+	// Render returns the config that routes domain to hostPort and reports
+	// release. A hostPort of 0 renders a placeholder.
+	Render(app, domain string, hostPort int, release string) ([]byte, error)
+	// Current returns the config on disk, or nil if there is none.
+	Current(app string) ([]byte, error)
+	// Write installs a new config.
+	Write(app string, content []byte) error
+	// Restore puts back an earlier config; nil content removes the file.
+	Restore(app string, content []byte) error
+	// Test validates the configuration on disk without applying it.
+	Test(ctx context.Context) error
+	// Reload asks the proxy to apply the configuration on disk. It may
+	// return before the proxy has actually switched.
+	Reload(ctx context.Context) error
+	// WaitRelease blocks until the proxy answers for domain with release.
+	// An empty release means no config of ours serves the domain.
+	WaitRelease(ctx context.Context, domain, release string) error
+	// ReleaseOf returns the release recorded in a config, or "".
+	ReleaseOf(content []byte) string
+	// TestCommand and ReloadCommand describe the commands for display.
+	TestCommand() string
+	ReloadCommand() string
+}
 
 // Deployer deploys apps. The zero value is not usable; create one with New.
 type Deployer struct {
 	engine engine.Engine
 	out    io.Writer
+
+	// Proxy routes the app's domain to its container. Nil means no proxy
+	// is managed: the proxy steps are left out of the pipeline.
+	Proxy Proxy
 
 	// The fields below are the deployer's dependencies on the outside
 	// world. They are fields rather than direct calls so tests can replace
@@ -96,7 +131,7 @@ func (d *Deployer) Deploy(ctx context.Context, a *app.App, opts Options) (Result
 
 	// state is shared by the step closures below: one step fills a field
 	// in, a later step reads it.
-	st := &state{app: a, memory: memory, container: res.Container}
+	st := &state{app: a, memory: memory, container: res.Container, release: release}
 
 	popts := pipeline.Options{
 		Out:     d.out,
@@ -118,12 +153,17 @@ type state struct {
 	app       *app.App
 	memory    int64
 	container string
+	release   string
 
 	// hostPort is set by the port step.
 	hostPort int
 	// previous is set by the start step: the app's containers that existed
 	// before this deploy.
 	previous []engine.Container
+
+	// previousConf is set by the proxy config step: the config that was on
+	// disk before this deploy, or nil if there was none.
+	previousConf []byte
 }
 
 // steps builds the pipeline. Each Run, Undo and Manual is a closure over d
@@ -131,7 +171,7 @@ type state struct {
 func (d *Deployer) steps(st *state) []pipeline.Step {
 	a := st.app
 
-	return []pipeline.Step{
+	steps := []pipeline.Step{
 		{
 			Name:   "Pull image " + a.Image,
 			Manual: func() string { return "docker pull " + a.Image },
@@ -199,26 +239,128 @@ func (d *Deployer) steps(st *state) []pipeline.Step {
 				return err
 			},
 		},
-		{
-			Name:   "Remove previous containers of " + a.Name,
-			Manual: func() string { return removeCommand(st) },
-			Run: func(ctx context.Context) error {
-				if len(st.previous) == 0 {
-					d.detail("none (first deploy)")
-					return nil
-				}
-				for _, prev := range st.previous {
-					if err := d.engine.Remove(ctx, prev.Name); err != nil && !errors.Is(err, engine.ErrNotFound) {
-						return err
-					}
-					d.detail("removed %s", prev.Name)
-				}
+	}
+
+	// With a proxy, traffic is switched to the new container after it has
+	// proven healthy and before the old containers are removed.
+	if d.Proxy != nil {
+		steps = append(steps, d.proxySteps(st)...)
+	}
+
+	// The removal is appended last on purpose: it is the one step that
+	// cannot be undone.
+	return append(steps, pipeline.Step{
+		Name:   "Remove previous containers of " + a.Name,
+		Manual: func() string { return removeCommand(st) },
+		Run: func(ctx context.Context) error {
+			if len(st.previous) == 0 {
+				d.detail("none (first deploy)")
 				return nil
+			}
+			for _, prev := range st.previous {
+				if err := d.engine.Remove(ctx, prev.Name); err != nil && !errors.Is(err, engine.ErrNotFound) {
+					return err
+				}
+				d.detail("removed %s", prev.Name)
+			}
+			return nil
+		},
+		// No Undo: a removed container cannot be brought back. This is
+		// the point of no return, which is why it is the last step.
+	})
+}
+
+// proxySteps returns the two steps that point the domain at the new
+// container.
+func (d *Deployer) proxySteps(st *state) []pipeline.Step {
+	a := st.app
+
+	return []pipeline.Step{
+		{
+			Name:   "Write Nginx config for " + a.Domain,
+			Manual: func() string { return "$EDITOR " + d.Proxy.Path(a.Name) },
+			// The preview is computed when the step is about to run, so in
+			// a real deploy it shows the allocated port and in a dry run a
+			// placeholder.
+			Preview: func() string { return d.previewConf(st) },
+			Run: func(context.Context) error {
+				// Keep the old content before overwriting it: it is what
+				// Undo puts back.
+				old, err := d.Proxy.Current(a.Name)
+				if err != nil {
+					return err
+				}
+				st.previousConf = old
+
+				content, err := d.Proxy.Render(a.Name, a.Domain, st.hostPort, st.release)
+				if err != nil {
+					return err
+				}
+				return d.Proxy.Write(a.Name, content)
 			},
-			// No Undo: a removed container cannot be brought back. This is
-			// the point of no return, which is why it is the last step.
+			Undo: func(context.Context) error {
+				return d.Proxy.Restore(a.Name, st.previousConf)
+			},
+		},
+		{
+			Name:   "Reload Nginx",
+			Manual: func() string { return d.Proxy.TestCommand() + " && " + d.Proxy.ReloadCommand() },
+			Run: func(ctx context.Context) error {
+				// Test first. A reload with a broken config is refused by
+				// Nginx anyway, but testing separately gives a clear error
+				// and never touches the running process.
+				if err := d.Proxy.Test(ctx); err != nil {
+					return err
+				}
+				if err := d.Proxy.Reload(ctx); err != nil {
+					return err
+				}
+				// The reload command returns before Nginx has switched.
+				// The next step removes the old container, so wait until
+				// Nginx itself reports the new release.
+				return d.Proxy.WaitRelease(ctx, a.Domain, st.release)
+			},
+			// Undo runs before the undo of the previous step (reverse
+			// order), so it cannot rely on the old file being back yet. It
+			// restores the file itself and then reloads; the later restore
+			// by the previous step is then a harmless repeat.
+			Undo: func(ctx context.Context) error {
+				if err := d.Proxy.Restore(a.Name, st.previousConf); err != nil {
+					return err
+				}
+				if err := d.Proxy.Test(ctx); err != nil {
+					return err
+				}
+				if err := d.Proxy.Reload(ctx); err != nil {
+					return err
+				}
+				// The new container is removed right after this, by the
+				// undo of the start step. Wait until Nginx is back on the
+				// release it served before.
+				return d.Proxy.WaitRelease(ctx, a.Domain, d.Proxy.ReleaseOf(st.previousConf))
+			},
 		},
 	}
+}
+
+// previewConf returns the diff between the config on disk and the one that
+// is about to be written.
+func (d *Deployer) previewConf(st *state) string {
+	old, err := d.Proxy.Current(st.app.Name)
+	if err != nil {
+		return fmt.Sprintf("(cannot read the current config: %v)", err)
+	}
+	updated, err := d.Proxy.Render(st.app.Name, st.app.Domain, st.hostPort, st.release)
+	if err != nil {
+		return fmt.Sprintf("(cannot render the new config: %v)", err)
+	}
+
+	// Two lines of context are enough to see where in the file a change is.
+	diff := textdiff.Lines(old, updated, 2)
+	if diff == "" {
+		return "(no changes)"
+	}
+	return diff
 }
 
 // waitHealthy blocks until the app is healthy, the container dies, the

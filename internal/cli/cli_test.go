@@ -4,14 +4,18 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/engine"
 	"github.com/onrcanogul/liman/internal/engine/enginetest"
 	"github.com/onrcanogul/liman/internal/history"
+	"github.com/onrcanogul/liman/internal/nginx"
 )
 
 const validDefinition = `
@@ -375,6 +379,138 @@ func TestHistoryWriteFailureWarnsOnce(t *testing.T) {
 	}
 	if got := strings.Count(h.stderr.String(), "warning: history is not being recorded"); got != 1 {
 		t.Errorf("warning printed %d times, want once:\n%s", got, h.stderr.String())
+	}
+}
+
+// withProxy gives the harness a real nginx.Manager that writes into a
+// temporary directory. Nginx itself is replaced by two stand-ins:
+//
+//   - the test and reload commands are the standard Unix programs true and
+//     false, which do nothing and exit with success or failure;
+//   - a local HTTP server answers the release probe by looking at the files
+//     in the config directory, as an Nginx that reloads instantly would.
+func (h *harness) withProxy(t *testing.T, reloadCommand string) *nginx.Manager {
+	t.Helper()
+
+	confDir := t.TempDir()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		files, _ := filepath.Glob(filepath.Join(confDir, "*.conf"))
+		for _, file := range files {
+			content, err := os.ReadFile(file)
+			if err == nil && strings.Contains(string(content), "server_name "+r.Host+";") {
+				w.Header().Set(nginx.ReleaseHeader, nginx.ReleaseOf(content))
+				return
+			}
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	m := nginx.New(config.Nginx{
+		ConfDir:       confDir,
+		UpstreamHost:  "127.0.0.1",
+		ProbeAddr:     strings.TrimPrefix(srv.URL, "http://"),
+		TestCommand:   []string{"true"},
+		ReloadCommand: []string{reloadCommand},
+	})
+	h.cli.Proxy = m
+	return m
+}
+
+func TestDeployWithProxyWritesConfig(t *testing.T) {
+	h := newHarness(t, "")
+	proxy := h.withProxy(t, "true")
+	file := writeFile(t, validDefinition)
+
+	if code := h.cli.Run(context.Background(), []string{"deploy", file}); code != exitOK {
+		t.Fatalf("exit code = %d, stderr: %s", code, h.stderr.String())
+	}
+
+	conf, err := os.ReadFile(proxy.Path("orders-api"))
+	if err != nil {
+		t.Fatalf("config file was not written: %v", err)
+	}
+	if !strings.Contains(string(conf), "server_name api.example.com;") {
+		t.Errorf("config does not route the domain:\n%s", conf)
+	}
+	for _, want := range []string{"==> [6/7] Reload Nginx", "Nginx routes api.example.com to it"} {
+		if !strings.Contains(h.stdout.String(), want) {
+			t.Errorf("stdout does not contain %q:\n%s", want, h.stdout.String())
+		}
+	}
+}
+
+func TestDeployWithProxyReloadFailureLeavesNothingBehind(t *testing.T) {
+	h := newHarness(t, "")
+	proxy := h.withProxy(t, "false")
+	file := writeFile(t, validDefinition)
+
+	if code := h.cli.Run(context.Background(), []string{"deploy", file}); code != exitError {
+		t.Fatalf("exit code = %d, want %d", code, exitError)
+	}
+
+	if _, err := os.Stat(proxy.Path("orders-api")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("config file still exists after a failed first deploy (stat error: %v)", err)
+	}
+	if len(h.fake.Containers) != 0 {
+		t.Errorf("%d containers left, want none", len(h.fake.Containers))
+	}
+	if !strings.Contains(h.stderr.String(), "nginx reload failed") {
+		t.Errorf("stderr = %q, want it to explain the reload failure", h.stderr.String())
+	}
+}
+
+func TestDeployWithoutProxySaysSo(t *testing.T) {
+	h := newHarness(t, "")
+	file := writeFile(t, validDefinition)
+
+	h.cli.Run(context.Background(), []string{"deploy", file})
+
+	if !strings.Contains(h.stdout.String(), "No Nginx is configured") {
+		t.Errorf("stdout does not mention the missing proxy:\n%s", h.stdout.String())
+	}
+}
+
+func TestStopRemovesProxyConfig(t *testing.T) {
+	h := newHarness(t, "")
+	proxy := h.withProxy(t, "true")
+	h.fake.Add(engine.Container{Name: "web-r1", App: "web"})
+	if err := proxy.Write("web", []byte("server {}\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := h.cli.Run(context.Background(), []string{"stop", "web"}); code != exitOK {
+		t.Fatalf("exit code = %d, stderr: %s", code, h.stderr.String())
+	}
+
+	if _, err := os.Stat(proxy.Path("web")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("config file still exists after stop (stat error: %v)", err)
+	}
+	if len(h.fake.Containers) != 0 {
+		t.Error("container still exists after stop")
+	}
+}
+
+func TestStopKeepsEverythingWhenReloadFails(t *testing.T) {
+	h := newHarness(t, "")
+	proxy := h.withProxy(t, "false")
+	h.fake.Add(engine.Container{Name: "web-r1", App: "web"})
+	if err := proxy.Write("web", []byte("server {}\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := h.cli.Run(context.Background(), []string{"stop", "web"}); code != exitError {
+		t.Fatalf("exit code = %d, want %d", code, exitError)
+	}
+
+	// Nginx is still serving the old config, so the file must be back and
+	// the container it points at must still be running.
+	if conf, _ := os.ReadFile(proxy.Path("web")); string(conf) != "server {}\n" {
+		t.Errorf("config after failed stop = %q, want the original restored", conf)
+	}
+	if len(h.fake.Containers) != 1 {
+		t.Error("container was removed although the proxy still routes to it")
 	}
 }
 

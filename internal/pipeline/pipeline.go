@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 )
 
@@ -32,6 +33,11 @@ type Step struct {
 	// depend on values produced by earlier steps. Nil means there is no
 	// meaningful manual equivalent.
 	Manual func() string
+
+	// Preview returns a description of what Run is about to change, for
+	// example a diff. Unlike Manual it is shown in every mode, right before
+	// the step runs. Nil or an empty result shows nothing.
+	Preview func() string
 
 	// Run performs the step. If it fails it must clean up after itself:
 	// only steps that completed are undone.
@@ -101,6 +107,9 @@ func Run(ctx context.Context, steps []Step, opts Options) error {
 		if step.Manual != nil && (opts.DryRun || opts.Confirm != nil) {
 			fmt.Fprintf(out, "    $ %s\n", step.Manual())
 		}
+		if step.Preview != nil {
+			printIndented(out, step.Preview())
+		}
 		if opts.DryRun {
 			continue
 		}
@@ -168,6 +177,17 @@ func rollback(ctx context.Context, completed []Step, opts Options, out io.Writer
 	// With a single element Join returns an error that prints exactly like
 	// cause, and errors.Is still finds everything inside.
 	return errors.Join(errs...)
+}
+
+// printIndented writes text with every line indented to sit under a step
+// heading.
+func printIndented(out io.Writer, text string) {
+	if text == "" {
+		return
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
+		fmt.Fprintf(out, "    %s\n", line)
+	}
 }
 
 func emit(opts Options, ev Event) {

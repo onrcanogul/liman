@@ -4,6 +4,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -60,6 +61,9 @@ type CLI struct {
 
 	// History is where executed steps are recorded.
 	History history.Store
+
+	// Proxy manages the reverse proxy. Nil means none is configured.
+	Proxy deploy.Proxy
 }
 
 // Run executes the CLI with the given arguments (without the program name)
@@ -152,13 +156,23 @@ func (c *CLI) runDeploy(ctx context.Context, args []string, planOnly bool) int {
 		}
 	}
 
-	res, err := deploy.New(eng, c.Stdout).Deploy(ctx, a, opts)
+	deployer := deploy.New(eng, c.Stdout)
+	deployer.Proxy = c.Proxy
+
+	res, err := deployer.Deploy(ctx, a, opts)
 	if err != nil {
 		return c.fail(err)
 	}
 
-	if !*dryRun {
-		fmt.Fprintf(c.Stdout, "\n%s is running at http://127.0.0.1:%d (release %s)\n", a.Name, res.HostPort, res.Release)
+	if *dryRun {
+		return exitOK
+	}
+
+	fmt.Fprintf(c.Stdout, "\n%s is running at http://127.0.0.1:%d (release %s)\n", a.Name, res.HostPort, res.Release)
+	if c.Proxy != nil {
+		fmt.Fprintf(c.Stdout, "Nginx routes %s to it\n", a.Domain)
+	} else {
+		fmt.Fprintln(c.Stdout, "No Nginx is configured, so it is only reachable on that address")
 	}
 	return exitOK
 }
@@ -290,6 +304,15 @@ func (c *CLI) runStop(ctx context.Context, args []string) int {
 		return c.fail(err)
 	}
 
+	// Take the app out of the proxy first. The other way round there would
+	// be a moment in which Nginx forwards requests to a container that is
+	// already gone.
+	if c.Proxy != nil {
+		if err := c.unroute(ctx, appName); err != nil {
+			return c.fail(err)
+		}
+	}
+
 	for _, ctr := range containers {
 		if err := eng.Remove(ctx, ctr.Name); err != nil {
 			return c.fail(err)
@@ -297,6 +320,36 @@ func (c *CLI) runStop(ctx context.Context, args []string) int {
 		fmt.Fprintf(c.Stdout, "Stopped and removed %s\n", ctr.Name)
 	}
 	return exitOK
+}
+
+// unroute removes the app's proxy config and reloads Nginx. If the reload
+// cannot be done the config is put back, so the file on disk keeps matching
+// what Nginx is actually serving.
+func (c *CLI) unroute(ctx context.Context, appName string) error {
+	old, err := c.Proxy.Current(appName)
+	if err != nil {
+		return err
+	}
+	if old == nil {
+		return nil // never routed, nothing to do
+	}
+
+	if err := c.Proxy.Restore(appName, nil); err != nil {
+		return err
+	}
+
+	err = c.Proxy.Test(ctx)
+	if err == nil {
+		err = c.Proxy.Reload(ctx)
+	}
+	if err != nil {
+		// errors.Join keeps both: why the reload failed and, if it also
+		// happened, why the file could not be put back.
+		return errors.Join(err, c.Proxy.Restore(appName, old))
+	}
+
+	fmt.Fprintf(c.Stdout, "Removed Nginx config %s\n", c.Proxy.Path(appName))
+	return nil
 }
 
 // containersOf connects to the engine and returns the containers of an app.

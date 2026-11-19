@@ -60,8 +60,8 @@ much again to each stage.
 | 1 | Declarative definitions: "what" versus "how" | Designing an `app.yaml` | App definition file (`app.yaml`: name, image, domain, port, env, limits), parsing and validation | `liman plan app.yaml` lists the steps | Structs, error handling, writing tests | 4-6 h |
 | 2 | Images, layers, registries; namespaces and cgroups; port mapping, limits | `docker pull/run/inspect/stats/logs` | Pulling images, starting containers with limits and stopping them via the Docker SDK | `liman deploy`, `liman ps`, `liman logs` locally | Interfaces, `context`, reading streams | 6-8 h |
 | 3 | Step-by-step workflows, undo, idempotency | Breaking a deploy halfway by hand and recovering | Step pipeline, `--dry-run`, `--step`, history, undo on failure | A deploy where every step can be watched and confirmed | Interface design, closures, error wrapping | 5-7 h |
-| 4 | Reverse proxy, server blocks, upstreams, TLS, Let's Encrypt | Writing an Nginx config by hand, `nginx -t`, reload | Nginx config generation, diff, `nginx -t`, reload, certificates | An app reachable over HTTPS on its domain | `text/template`, `os/exec`, file handling | 6-8 h |
-| 5 | Daemons, systemd, HTTP APIs, tokens, WireGuard, SQLite | Writing a systemd unit by hand, calling the API with `curl` | Server daemon and HTTP API, CLI becomes a client, token auth, SQLite, systemd | Command from the Mac, deploy on the server | `net/http`, JSON, middleware, `database/sql` | 8-10 h |
+| 4 | Reverse proxy, server blocks, upstreams, TLS, Let's Encrypt | Writing an Nginx config by hand, `nginx -t`, reload | Nginx config generation, diff, `nginx -t`, reload, HTTPS with certificates that are already on disk | An app reachable on its domain through Nginx | `text/template`, `os/exec`, file handling | 6-8 h |
+| 5 | Daemons, systemd, HTTP APIs, tokens, WireGuard, SQLite | Writing a systemd unit by hand, calling the API with `curl` | Server daemon and HTTP API, CLI becomes a client, token auth, SQLite, systemd, obtaining certificates from Let's Encrypt | Command from the Mac, deploy on the server, real HTTPS | `net/http`, JSON, middleware, `database/sql` | 8-10 h |
 | 6 | Health checks, restart policies | Killing a container and watching what happens | Health monitor and automatic restart | A crashed app comes back by itself | Goroutines, channels, `select`, tickers | 4-6 h |
 | 7 | Blue-green deploys, switching traffic | Switching an upstream between two containers by hand | Zero-downtime deploy and `liman rollback` | Traffic moves if the new version is healthy, otherwise the old one stays | State machines, concurrency, testing | 6-8 h |
 | 8 | Secret encryption, key management | Encrypting and decrypting a value by hand | Encrypted secret storage, read-only status panel | Status of every app in the browser | `crypto`, `html/template` | 5-7 h |
@@ -92,7 +92,7 @@ collection.
 - [x] Stage 1
 - [x] Stage 2
 - [x] Stage 3
-- [ ] Stage 4
+- [x] Stage 4
 - [ ] Stage 5
 - [ ] Stage 6
 - [ ] Stage 7

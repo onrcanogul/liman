@@ -195,3 +195,31 @@ func TestOnEventReceivesRunsAndUndos(t *testing.T) {
 		t.Errorf("events = %v, want %v", got, want)
 	}
 }
+
+func TestPreviewIsShownInEveryMode(t *testing.T) {
+	newSteps := func(ran *bool) []Step {
+		return []Step{{
+			Name:    "write file",
+			Preview: func() string { return "- old\n+ new\n" },
+			Run:     func(context.Context) error { *ran = true; return nil },
+		}}
+	}
+
+	want := "==> [1/1] write file\n    - old\n    + new\n"
+
+	for _, dryRun := range []bool{false, true} {
+		var out bytes.Buffer
+		ran := false
+
+		if err := Run(context.Background(), newSteps(&ran), Options{Out: &out, DryRun: dryRun}); err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+
+		if out.String() != want {
+			t.Errorf("dryRun=%v output = %q, want %q", dryRun, out.String(), want)
+		}
+		if ran == dryRun {
+			t.Errorf("dryRun=%v but ran=%v", dryRun, ran)
+		}
+	}
+}

@@ -21,6 +21,7 @@ make test    # run tests
 make lint    # run linters
 make check   # lint + test
 make test-integration   # tests that need a running Docker daemon
+make dev-nginx          # local Nginx in Docker, see below
 ```
 
 ```
@@ -82,6 +83,72 @@ liman history [-n N] [app]   # every executed step, with result and duration
 History is kept in `~/.liman/history.jsonl` (override the directory with
 `LIMAN_HOME`). Environment variable values are never printed.
 
+## Routing with Nginx
+
+Without further configuration an app is only reachable on its loopback port.
+To route the app's `domain` to it, tell liman where it may write Nginx
+config. On a server with Nginx installed, create `~/.liman/config.yaml`:
+
+```yaml
+nginx:
+  conf_dir: /etc/nginx/liman      # liman writes one <app>.conf here
+  cert_dir: /etc/liman/certs      # optional: <domain>/fullchain.pem + privkey.pem
+  acme_root: /var/lib/liman/acme  # optional: served for ACME HTTP-01 challenges
+```
+
+and include that directory once from the `http` block of your Nginx config:
+
+```
+include /etc/nginx/liman/*.conf;
+```
+
+liman never reads or edits any other Nginx file. A deploy then gains two
+steps between the health check and the removal of the previous release:
+
+```
+==> [5/7] Write Nginx config for whoami.localhost
+      ...
+      upstream liman-whoami {
+    -     server 127.0.0.1:58276;
+    +     server 127.0.0.1:58352;
+      }
+      ...
+==> [6/7] Reload Nginx
+==> [7/7] Remove previous containers of whoami
+```
+
+The reload step runs `nginx -t` first, reloads, and then waits until Nginx
+itself reports the new release (through an `X-Liman-Release` response header)
+before the old container is removed. If anything fails the previous config is
+restored and reloaded.
+
+A domain is served over HTTPS when `cert_dir/<domain>/fullchain.pem` and
+`privkey.pem` exist. liman does not obtain certificates yet.
+
+Defaults assume Nginx runs on the host: `test_command: [nginx, -t]`,
+`reload_command: [nginx, -s, reload]`, `upstream_host: 127.0.0.1`,
+`probe_addr: 127.0.0.1:80`. All four can be overridden.
+
+### Trying it locally
+
+No Nginx needs to be installed; a script runs one in Docker and writes a
+matching configuration under `.dev/` (git-ignored):
+
+```
+make build
+make dev-nginx                      # prints an export LIMAN_HOME=... line
+export LIMAN_HOME=$PWD/.dev
+./bin/liman deploy examples/whoami.yaml
+curl http://whoami.localhost:18080
+
+make dev-cert DOMAIN=whoami.localhost   # self-signed certificate
+./bin/liman deploy examples/whoami.yaml
+curl -k https://whoami.localhost:18443
+
+./bin/liman stop whoami
+make dev-nginx-stop
+```
+
 liman only lists and touches containers it started itself (label
 `liman.app`). Private registries are not supported yet.
 
@@ -94,6 +161,10 @@ internal/app/        app definition: loading and validation
 internal/deploy/     the steps of a deploy and how each is undone
 internal/pipeline/   runs steps: dry run, confirmation, rollback
 internal/history/    append-only record of executed steps
+internal/config/     liman's own configuration (config.yaml)
+internal/nginx/      renders, writes, tests and reloads proxy config
+internal/textdiff/   line diff used to preview config changes
+scripts/             local development helpers
 internal/engine/     container engine interface and shared types
 internal/docker/     Docker implementation of the engine interface
 internal/buildinfo/  version metadata injected at build time

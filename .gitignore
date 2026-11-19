@@ -1,6 +1,9 @@
 # Build output
 /bin/
 
+# Local development state (see scripts/dev-nginx.sh)
+/.dev/
+
 # Test and coverage output
 *.test
 *.out
