@@ -100,6 +100,45 @@ liman history [-n N] [app]   # every executed step, with result and duration
 liman status                 # is the daemon reachable, is the token accepted
 ```
 
+## Health monitoring
+
+The daemon checks every app at a fixed interval and restarts the ones that
+have stopped working, without being asked:
+
+- a container that is not running is restarted on the next check;
+- a running container whose health check fails three times in a row is
+  restarted too. This catches apps that are up but no longer answering,
+  which Docker on its own does not notice.
+
+An app that keeps failing is restarted with growing pauses in between (the
+interval, then twice that, and so on up to five minutes) instead of in a
+tight loop. After five healthy checks in a row its record is cleared, and a
+new deploy always starts with a clean one. The monitor never touches an app
+that is being deployed or stopped.
+
+`liman ps` shows the verdict, and `liman history` records every restart:
+
+```
+$ liman ps
+APP  CONTAINER                IMAGE              STATE    HEALTH                   ADDRESS          STATUS
+web  web-20261119-220029-592  nginx:1.27-alpine  running  restarting (2 restarts)  127.0.0.1:64150  Up 2 seconds
+
+web: health check failed: unexpected status 403 Forbidden; restarted, next check in 40s
+```
+
+```yaml
+# config.yaml
+monitor:
+  interval: 10s          # the default
+  failure_threshold: 3   # the default
+  disabled: false
+```
+
+Nothing is restarted while the daemon itself is not running, so the daemon
+should be kept alive by a service manager such as systemd.
+
+## More on deploys
+
 Only one deploy or stop per app runs at a time; a second one is refused.
 Environment variable values are never printed. liman only lists and touches
 containers it started itself (label `liman.app`).
@@ -111,7 +150,7 @@ containers it started itself (label `liman.app`).
 | File | Content |
 |---|---|
 | `config.yaml` | Optional settings, see below |
-| `liman.db` | SQLite database: step history, releases, token hashes |
+| `liman.db` | SQLite database: step and restart history, releases, token hashes |
 
 ```yaml
 # config.yaml
@@ -337,6 +376,9 @@ internal/engine/     container engine interface and shared types
 internal/docker/     Docker implementation of the engine interface
 internal/nginx/      renders, writes, tests and reloads proxy config
 internal/config/     config.yaml and client.yaml
+internal/monitor/    health monitor: periodic checks, restarts, backoff
+internal/health/     the HTTP health probe shared by deploys and the monitor
+internal/applock/    per-app lock shared by the API and the monitor
 internal/textdiff/   line diff used to preview config changes
 internal/loadtest/   small load generator used by the load tests
 internal/buildinfo/  version metadata injected at build time
