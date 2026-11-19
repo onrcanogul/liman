@@ -21,6 +21,16 @@ type Config struct {
 	Deploy  Deploy  `yaml:"deploy"`
 	Monitor Monitor `yaml:"monitor"`
 	Nginx   Nginx   `yaml:"nginx"`
+	Secrets Secrets `yaml:"secrets"`
+}
+
+// Secrets configures where the key that encrypts app secrets is kept.
+type Secrets struct {
+	// KeyFile is the path of the master key. It defaults to master.key in
+	// liman's home directory. Keeping it somewhere else (another disk, a
+	// mount that is not part of the backups) means that a copy of the
+	// database alone reveals nothing.
+	KeyFile string `yaml:"key_file"`
 }
 
 // Deploy configures how releases are switched.
@@ -171,6 +181,10 @@ func (c *Config) validate() error {
 
 	if err := CheckListenAddress(c.Daemon.Listen); err != nil {
 		errs = append(errs, fmt.Errorf("daemon.listen: %w", err))
+	}
+
+	if c.Secrets.KeyFile != "" && !filepath.IsAbs(c.Secrets.KeyFile) {
+		errs = append(errs, fmt.Errorf("secrets.key_file: must be an absolute path, got %q", c.Secrets.KeyFile))
 	}
 
 	if d := c.Deploy.Drain; d != nil && (time.Duration(*d) < 0 || time.Duration(*d) > 10*time.Minute) {

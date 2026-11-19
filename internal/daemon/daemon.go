@@ -25,6 +25,7 @@ import (
 	"github.com/onrcanogul/liman/internal/engine"
 	"github.com/onrcanogul/liman/internal/monitor"
 	"github.com/onrcanogul/liman/internal/nginx"
+	"github.com/onrcanogul/liman/internal/secrets"
 	"github.com/onrcanogul/liman/internal/server"
 	"github.com/onrcanogul/liman/internal/store"
 )
@@ -121,7 +122,12 @@ func (d *Daemon) serve(ctx context.Context) int {
 	// and the health monitor.
 	locks := &applock.Locks{}
 
-	srv := &server.Server{Store: st, Connect: connect, Log: log, Locks: locks}
+	vault, err := d.openVault(ctx, cfg, st, log)
+	if err != nil {
+		return d.fail(err)
+	}
+
+	srv := &server.Server{Store: st, Connect: connect, Log: log, Locks: locks, Secrets: vault}
 	if cfg.Deploy.Drain != nil {
 		drain := time.Duration(*cfg.Deploy.Drain)
 		srv.Drain = &drain
@@ -245,6 +251,46 @@ func (d *Daemon) serve(ctx context.Context) int {
 
 	log.Info("limand stopped")
 	return exitOK
+}
+
+// openVault loads the master key, creating it on the very first start, and
+// returns the vault that encrypts app secrets with it.
+func (d *Daemon) openVault(ctx context.Context, cfg config.Config, st *store.Store, log *slog.Logger) (*secrets.Vault, error) {
+	path := cfg.Secrets.KeyFile
+	if path == "" {
+		path = filepath.Join(d.Home, "master.key")
+	}
+
+	exists, err := secrets.KeyExists(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var key []byte
+	if exists {
+		if key, err = secrets.LoadKey(path); err != nil {
+			return nil, err
+		}
+	} else {
+		// No key file. On a first start that is expected, and a key is
+		// created. But if secrets are already stored, they were encrypted
+		// with a key that is now missing: generating a new one would look
+		// like a working setup while every stored secret had become
+		// unreadable. Refuse, and say what to do.
+		count, err := st.CountSecrets(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if count > 0 {
+			return nil, fmt.Errorf("the master key %s is missing, but %d secrets are stored that were encrypted with it; restore the key file from your backup (without it those secrets cannot be recovered)", path, count)
+		}
+		if key, err = secrets.CreateKey(path); err != nil {
+			return nil, err
+		}
+		log.Warn("created a new master key; back it up, secrets cannot be recovered without it", "path", path)
+	}
+
+	return secrets.NewVault(key, st)
 }
 
 // recordRestart returns the callback that writes the monitor's restarts

@@ -442,3 +442,105 @@ func TestMonitorCanBeDisabled(t *testing.T) {
 		t.Error("the monitor started although it is disabled")
 	}
 }
+
+func TestMasterKeyIsCreatedOnceAndReused(t *testing.T) {
+	td := newTestDaemon(t)
+	keyFile := filepath.Join(td.Home, "master.key")
+	clientFile := filepath.Join(t.TempDir(), "client.yaml")
+	td.Run(context.Background(), []string{"token", "create", "dev", "--write-client", clientFile})
+	cfg, _ := config.LoadClient(clientFile)
+
+	// First start: the key is created, private, and announced.
+	addr, stop, exit := startServing(t, td)
+	client := &api.Client{BaseURL: "http://" + addr, Token: cfg.Token}
+	if err := client.SetSecret(context.Background(), "web", "API_KEY", []byte("k-123")); err != nil {
+		t.Fatalf("SetSecret() error = %v", err)
+	}
+	stop()
+	<-exit
+
+	info, err := os.Stat(keyFile)
+	if err != nil {
+		t.Fatalf("no master key was created: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("master key mode = %o, want 600", perm)
+	}
+	if !strings.Contains(td.stderr.String(), "created a new master key") {
+		t.Errorf("the log does not announce the new key:\n%s", td.stderr.String())
+	}
+	before, _ := os.ReadFile(keyFile)
+
+	// Second start: the same key is used, so the stored secret still works.
+	td.engine.Add(engine.Container{Name: "placeholder", App: "placeholder"})
+	addr, stop, exit = startServing(t, td)
+	client.BaseURL = "http://" + addr
+	const definition = "name: web\nimage: web:1.0\ndomain: web.example.com\nport: 80\nsecrets:\n  - API_KEY\n"
+	if _, err := client.Deploy(context.Background(), []byte(definition), api.DeployOptions{}, io.Discard); err != nil {
+		t.Errorf("Deploy() with a secret stored before the restart error = %v", err)
+	}
+	stop()
+	<-exit
+
+	if after, _ := os.ReadFile(keyFile); string(after) != string(before) {
+		t.Error("the master key changed between starts")
+	}
+	// The key itself must never be logged.
+	if strings.Contains(td.stderr.String(), strings.TrimSpace(string(before))) {
+		t.Error("the log contains the master key")
+	}
+}
+
+func TestDaemonRefusesToStartWhenKeyIsLostButSecretsExist(t *testing.T) {
+	td := newTestDaemon(t)
+	keyFile := filepath.Join(td.Home, "master.key")
+	clientFile := filepath.Join(t.TempDir(), "client.yaml")
+	td.Run(context.Background(), []string{"token", "create", "dev", "--write-client", clientFile})
+	cfg, _ := config.LoadClient(clientFile)
+
+	addr, stop, exit := startServing(t, td)
+	client := &api.Client{BaseURL: "http://" + addr, Token: cfg.Token}
+	if err := client.SetSecret(context.Background(), "web", "API_KEY", []byte("k-123")); err != nil {
+		t.Fatal(err)
+	}
+	stop()
+	<-exit
+
+	// The key file is lost (a restore that only brought back the database).
+	if err := os.Remove(keyFile); err != nil {
+		t.Fatal(err)
+	}
+
+	code := td.Run(context.Background(), nil)
+
+	if code != exitError {
+		t.Fatalf("exit code = %d, want the daemon to refuse to start", code)
+	}
+	for _, want := range []string{"master key", "is missing", "1 secrets are stored", "restore the key file"} {
+		if !strings.Contains(td.stderr.String(), want) {
+			t.Errorf("stderr does not contain %q:\n%s", want, td.stderr.String())
+		}
+	}
+	// Above all, it must not have quietly made a new key.
+	if _, err := os.Stat(keyFile); err == nil {
+		t.Error("a new master key was created although secrets encrypted with the old one exist")
+	}
+}
+
+func TestDaemonRefusesAKeyReadableByOthers(t *testing.T) {
+	td := newTestDaemon(t)
+	keyFile := filepath.Join(td.Home, "master.key")
+	// 32 zero bytes in base64: a well-formed key with the wrong permissions.
+	if err := os.WriteFile(keyFile, []byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(keyFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	code := td.Run(context.Background(), nil)
+
+	if code != exitError || !strings.Contains(td.stderr.String(), "readable by others") {
+		t.Errorf("code %d, stderr %q; want a refusal over the key's permissions", code, td.stderr.String())
+	}
+}

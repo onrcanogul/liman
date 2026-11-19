@@ -41,6 +41,16 @@ func TestLoadDaemonListen(t *testing.T) {
 	}
 }
 
+func TestLoadSecretsKeyFile(t *testing.T) {
+	cfg, err := Load(write(t, "secrets:\n  key_file: /etc/liman/master.key\n"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Secrets.KeyFile != "/etc/liman/master.key" {
+		t.Errorf("Secrets.KeyFile = %q, want the configured path", cfg.Secrets.KeyFile)
+	}
+}
+
 func TestClientConfigRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "client.yaml")
 	want := Client{URL: "http://10.8.0.1:7070", Token: "liman_abc"}
