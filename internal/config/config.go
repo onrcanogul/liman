@@ -126,12 +126,17 @@ func (c *Config) applyDefaults() {
 }
 
 func (c *Config) validate() error {
-	n := c.Nginx
-	if !n.Enabled() {
-		return nil
+	var errs []error
+
+	if err := CheckListenAddress(c.Daemon.Listen); err != nil {
+		errs = append(errs, fmt.Errorf("daemon.listen: %w", err))
 	}
 
-	var errs []error
+	n := c.Nginx
+	if !n.Enabled() {
+		return errors.Join(errs...)
+	}
+
 	// The paths end up inside the generated Nginx config, where a relative
 	// path would be resolved against Nginx's own directory, not ours.
 	// A slice of anonymous structs keeps the checks in a fixed order; a map
@@ -202,6 +207,9 @@ func LoadClient(path string) (Client, error) {
 	}
 	if c.URL == "" {
 		c.URL = "http://" + DefaultListen
+	}
+	if err := CheckClientURL(c.URL); err != nil {
+		return Client{}, fmt.Errorf("daemon URL: %w", err)
 	}
 	return c, nil
 }

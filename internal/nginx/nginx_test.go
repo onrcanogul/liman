@@ -379,3 +379,32 @@ func TestWaitReleaseReportsUnreachableProxy(t *testing.T) {
 		t.Errorf("WaitRelease() error = %v, want it to mention the refused connection", err)
 	}
 }
+
+func TestFileOperationsRefusePathTraversal(t *testing.T) {
+	m, _ := newTestManager(t)
+
+	// A file outside the config directory that must stay untouched.
+	outside := filepath.Join(filepath.Dir(filepath.Dir(m.Path("x"))), "victim.conf")
+	if err := os.WriteFile(outside, []byte("precious\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// "../victim" + ".conf", joined to the config directory, is that file.
+	hostile := "../victim"
+
+	if _, err := m.Current(hostile); err == nil {
+		t.Error("Current() accepted a path traversal name")
+	}
+	if err := m.Write(hostile, []byte("overwritten\n")); err == nil {
+		t.Error("Write() accepted a path traversal name")
+	}
+	if err := m.Remove(hostile); err == nil {
+		t.Error("Remove() accepted a path traversal name")
+	}
+	if err := m.Restore(hostile, nil); err == nil {
+		t.Error("Restore() accepted a path traversal name")
+	}
+
+	if got, err := os.ReadFile(outside); err != nil || string(got) != "precious\n" {
+		t.Errorf("the file outside the config directory is now %q (error %v)", got, err)
+	}
+}

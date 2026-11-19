@@ -119,9 +119,10 @@ daemon:
   listen: 127.0.0.1:7070   # the default
 ```
 
-The API is plain HTTP and controls Docker, so `listen` must never be a public
-address. On a server it will be the address of a private (WireGuard)
-interface.
+The API is plain HTTP and controls Docker. The daemon therefore refuses to
+start with a `listen` address that is not loopback or a private network
+(`0.0.0.0`, an empty host and public addresses are rejected), and the CLI
+refuses to send its token over `http://` to a public address.
 
 On SIGTERM or Ctrl+C the daemon stops accepting requests and waits for running
 ones, so a deploy in progress finishes or rolls back instead of being cut off.
@@ -163,6 +164,31 @@ The environment variables `LIMAN_URL` and `LIMAN_TOKEN` take precedence.
 | `GET /v1/apps/{name}/logs[?follow=true]` | Logs as plain text |
 | `DELETE /v1/apps/{name}` | Stop and remove an app |
 | `GET /v1/history[?app=][&limit=]` | Executed steps |
+
+## Security
+
+Anyone with a valid token can run arbitrary containers on the server, which
+is equivalent to root. The API is built around keeping everyone else out:
+
+- **Network.** Loopback or private network only, enforced on both sides (see
+  above). Encryption is delegated to that network (WireGuard).
+- **Authentication.** Bearer tokens of 256 random bits; only their SHA-256 is
+  stored. Ten failed attempts from one address within a minute lock that
+  address out (429) until the minute is over, valid token or not.
+- **Browsers.** Requests carrying an `Origin` header are refused, so a web
+  page open on the same machine cannot talk to a daemon on 127.0.0.1.
+- **Slow and large requests.** Headers must arrive within 10 seconds and a
+  body within 15; headers are limited to 16 KiB and bodies to 1 MiB; at most
+  64 requests are handled at once; idle connections are closed.
+- **Input.** Every field of an app definition and every app name in a URL is
+  checked against an allowlist of characters and a maximum length. Values are
+  never concatenated into SQL, shell commands or file paths.
+- **Files.** `liman.db` and `client.yaml` are readable by their owner only.
+  Tokens and environment variable values are never written to logs.
+
+Known limits: no TLS of its own, no scopes (every token can do everything),
+tokens do not expire, and the failed-attempt limit is per address and kept in
+memory.
 
 ## Private images
 

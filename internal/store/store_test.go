@@ -298,3 +298,33 @@ func TestTokenIsNotStoredInPlainText(t *testing.T) {
 		}
 	}
 }
+
+func TestDatabaseFilesArePrivate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "liman.db")
+	ctx := context.Background()
+
+	// An existing, too permissive file must be tightened as well.
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	// A write makes SQLite create its companion files.
+	if _, err := s.CreateToken(ctx, "laptop"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, file := range []string{path, path + "-wal", path + "-shm"} {
+		info, err := os.Stat(file)
+		if err != nil {
+			continue // the companion files exist only in WAL mode, while open
+		}
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			t.Errorf("%s has mode %o, want no access for group and others", filepath.Base(file), perm)
+		}
+	}
+}

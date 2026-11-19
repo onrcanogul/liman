@@ -4,6 +4,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -48,6 +49,14 @@ type Server struct {
 	// to answer. Zero means ten minutes.
 	ConfirmTimeout time.Duration
 
+	// MaxInFlight caps the number of requests handled at the same time.
+	// Zero means a default.
+	MaxInFlight int
+
+	// BodyReadTimeout is how long a client gets to send a request body.
+	// Zero means a default.
+	BodyReadTimeout time.Duration
+
 	// NewDeployer builds the deployer for a request. Nil means deploy.New;
 	// tests replace it to control ports, timing and release names.
 	NewDeployer func(e engine.Engine, out io.Writer) *deploy.Deployer
@@ -60,6 +69,20 @@ type Server struct {
 	busy map[string]bool
 	// confirms holds the questions that are waiting for an answer.
 	confirms map[string]chan bool
+
+	// limiter locks out clients that keep failing to authenticate. It is
+	// created on first use; initLimiter makes that safe when the first
+	// requests arrive at the same time.
+	limiter     *authLimiter
+	initLimiter sync.Once
+}
+
+// authFailures returns the failed-authentication limiter.
+func (s *Server) authFailures() *authLimiter {
+	// Once.Do runs the function exactly once, no matter how many goroutines
+	// call it concurrently; the others wait until it has finished.
+	s.initLimiter.Do(func() { s.limiter = newAuthLimiter() })
+	return s.limiter
 }
 
 // Handler returns the HTTP handler that serves the API.
@@ -77,10 +100,24 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/apps/{name}", s.handleStop)
 	mux.HandleFunc("GET /v1/history", s.handleHistory)
 
-	// Middleware wraps the handler from the inside out: a request passes
-	// through recovery first, then logging, then authentication, and only
-	// then reaches the mux.
-	return s.recoverPanics(s.logRequests(s.authenticate(mux)))
+	// Middleware wraps the handler from the inside out; a request passes
+	// through the list below from top to bottom. The order is deliberate:
+	//
+	//   recoverPanics     outermost, so it also covers the other middleware
+	//   logRequests       before any rejection, so rejected requests are
+	//                     logged too: they are the interesting ones
+	//   secureHeaders     so even error responses carry the headers
+	//   limitConcurrency  cheap, and before anything that does real work
+	//   rejectBrowsers    cheap, and before authentication
+	//   authenticate      last: everything behind it is trusted
+	var h http.Handler = mux
+	h = s.authenticate(h)
+	h = s.rejectBrowsers(h)
+	h = s.limitConcurrency(h)
+	h = s.secureHeaders(h)
+	h = s.logRequests(h)
+	h = s.recoverPanics(h)
+	return h
 }
 
 // --- handlers -------------------------------------------------------------
@@ -92,10 +129,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	// MaxBytesReader makes ReadAll fail once the limit is exceeded.
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxDefinitionBytes))
+	body, err := s.readBody(w, r, maxDefinitionBytes)
 	if err != nil {
-		writeError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("read app definition: %w", err))
+		writeError(w, bodyErrorStatus(err), fmt.Errorf("read app definition: %w", err))
 		return
 	}
 
@@ -172,8 +208,18 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request) {
+	body, err := s.readBody(w, r, 1024)
+	if err != nil {
+		writeError(w, bodyErrorStatus(err), fmt.Errorf("read request body: %w", err))
+		return
+	}
+
 	var req api.ConfirmRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&req); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	// A request with fields this version does not know is more likely a
+	// mistake than something to guess the meaning of.
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
 		return
 	}
@@ -229,7 +275,12 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	eng, containers, status, err := s.containersOf(ctx, r.PathValue("name"))
+	name, ok := appName(w, r)
+	if !ok {
+		return
+	}
+
+	eng, containers, status, err := s.containersOf(ctx, name)
 	if err != nil {
 		writeError(w, status, err)
 		return
@@ -252,7 +303,11 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	name := r.PathValue("name")
+
+	name, ok := appName(w, r)
+	if !ok {
+		return
+	}
 
 	unlock, ok := s.lock(name)
 	if !ok {
@@ -304,7 +359,16 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		limit = n
 	}
 
-	stored, err := s.Store.Events(r.Context(), r.URL.Query().Get("app"), limit)
+	// The filter is only ever a bound SQL parameter, which is safe with any
+	// value; rejecting impossible names is still clearer than answering
+	// with an empty list.
+	filter := r.URL.Query().Get("app")
+	if filter != "" && !app.ValidName(filter) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid app name %q", filter))
+		return
+	}
+
+	stored, err := s.Store.Events(r.Context(), filter, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -322,6 +386,23 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- helpers used by handlers ---------------------------------------------
+
+// appName returns the app named in the request path. If the name is not a
+// valid app name it answers 400 and returns false.
+//
+// The name comes straight from the URL and goes on to be compared with
+// container labels and turned into a file name for the proxy config. A
+// value such as "../../nginx" must never get that far.
+func appName(w http.ResponseWriter, r *http.Request) (string, bool) {
+	name := r.PathValue("name")
+	if !app.ValidName(name) {
+		// %q quotes the value, so control characters in it cannot reach a
+		// terminal or a log line unescaped.
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid app name %q", name))
+		return "", false
+	}
+	return name, true
+}
 
 func (s *Server) newDeployer(e engine.Engine, out io.Writer) *deploy.Deployer {
 	if s.NewDeployer != nil {

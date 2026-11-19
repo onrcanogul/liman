@@ -70,6 +70,21 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, fmt.Errorf("create database directory: %w", err)
 	}
 
+	// Create the file ourselves before SQLite does, so that it is private
+	// from its first moment. SQLite gives its companion files (the -wal and
+	// -shm files) the same permissions as the database.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("create database %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("create database %s: %w", path, err)
+	}
+	// O_CREATE only applies the mode to a new file; tighten an existing one.
+	if err := os.Chmod(path, 0o600); err != nil {
+		return nil, fmt.Errorf("protect database %s: %w", path, err)
+	}
+
 	// The part after "?" configures every connection:
 	//   busy_timeout  wait up to 5s for another process's lock instead of
 	//                 failing at once (the daemon and "limand token" may

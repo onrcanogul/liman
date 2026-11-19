@@ -80,15 +80,15 @@ func TestSaveClientTightensExistingFile(t *testing.T) {
 
 func TestLoadClientEnvironmentWins(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "client.yaml")
-	if err := SaveClient(path, Client{URL: "http://from-file:7070", Token: "liman_file"}); err != nil {
+	if err := SaveClient(path, Client{URL: "http://10.1.1.1:7070", Token: "liman_file"}); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("LIMAN_URL", "http://from-env:7070")
+	t.Setenv("LIMAN_URL", "http://10.9.9.9:7070")
 	t.Setenv("LIMAN_TOKEN", "liman_env")
 
 	got, err := LoadClient(path)
 
-	want := Client{URL: "http://from-env:7070", Token: "liman_env"}
+	want := Client{URL: "http://10.9.9.9:7070", Token: "liman_env"}
 	if err != nil || got != want {
 		t.Errorf("LoadClient() = %+v, %v; want %+v", got, err, want)
 	}
@@ -172,5 +172,102 @@ func TestLoadRejectsBadConfig(t *testing.T) {
 				t.Errorf("Load() error = %v, want it to contain %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestCheckListenAddress(t *testing.T) {
+	tests := []struct {
+		address string
+		wantErr string // empty means allowed
+	}{
+		{"127.0.0.1:7070", ""},
+		{"[::1]:7070", ""},
+		{"10.8.0.1:7070", ""},      // typical WireGuard address
+		{"192.168.1.20:7070", ""},  // home or office network
+		{"172.16.5.4:7070", ""},    // private
+		{"100.101.102.103:80", ""}, // Tailscale (shared address space)
+		{"[fd00::1]:7070", ""},     // IPv6 unique local
+
+		{"0.0.0.0:7070", "every interface"},
+		{"[::]:7070", "every interface"},
+		{":7070", "every interface"},
+		{"8.8.8.8:7070", "public address"},
+		{"203.0.113.10:7070", "public address"},
+		{"[2001:db8::1]:7070", "public address"},
+		{"[::ffff:8.8.8.8]:7070", "public address"}, // IPv4 hidden in IPv6 form
+		{"example.com:7070", "must be an IP address"},
+		{"localhost:7070", "must be an IP address"},
+		{"127.0.0.1", "host:port"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.address, func(t *testing.T) {
+			err := CheckListenAddress(tt.address)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("CheckListenAddress() error = %v, want it allowed", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("CheckListenAddress() error = %v, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsPublicListenAddress(t *testing.T) {
+	_, err := Load(write(t, "daemon:\n  listen: 0.0.0.0:7070\n"))
+
+	if err == nil || !strings.Contains(err.Error(), "daemon.listen") {
+		t.Errorf("Load() error = %v, want daemon.listen to be rejected", err)
+	}
+}
+
+func TestCheckClientURL(t *testing.T) {
+	tests := []struct {
+		url     string
+		wantErr string // empty means allowed
+	}{
+		{"http://127.0.0.1:7070", ""},
+		{"http://localhost:7070", ""},
+		{"http://10.8.0.1:7070", ""},
+		{"http://[fd00::1]:7070", ""},
+		{"https://liman.example.com", ""}, // TLS protects the token
+		{"https://8.8.8.8:7070", ""},
+
+		{"http://8.8.8.8:7070", "public address"},
+		{"http://liman.example.com:7070", "host name"},
+		{"ftp://10.8.0.1", "must start with http"},
+		{"10.8.0.1:7070", "must start with http"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.url, func(t *testing.T) {
+			err := CheckClientURL(tt.url)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Errorf("CheckClientURL() error = %v, want it allowed", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("CheckClientURL() error = %v, want it to contain %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadClientRejectsClearTextToPublicAddress(t *testing.T) {
+	t.Setenv("LIMAN_URL", "http://203.0.113.10:7070")
+	t.Setenv("LIMAN_TOKEN", "liman_secret")
+
+	_, err := LoadClient(filepath.Join(t.TempDir(), "missing.yaml"))
+
+	if err == nil || !strings.Contains(err.Error(), "refusing to send the token") {
+		t.Fatalf("LoadClient() error = %v, want a refusal", err)
+	}
+	if strings.Contains(err.Error(), "liman_secret") {
+		t.Error("the error message contains the token")
 	}
 }

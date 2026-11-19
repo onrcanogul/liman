@@ -111,6 +111,21 @@ func TestValidate(t *testing.T) {
 		{name: "image without tag", mutate: func(a *App) { a.Image = "ghcr.io/user/api" }, wantErr: "must include a tag"},
 		{name: "registry port is not a tag", mutate: func(a *App) { a.Image = "localhost:5000/api" }, wantErr: "must include a tag"},
 		{name: "latest tag", mutate: func(a *App) { a.Image = "ghcr.io/user/api:latest" }, wantErr: "fixed tag"},
+		{name: "image with whitespace", mutate: func(a *App) { a.Image = "ghcr.io/user/api:1.0 --privileged" }, wantErr: "not allowed in an image reference"},
+		{name: "image with shell syntax", mutate: func(a *App) { a.Image = "api:1.0;rm" }, wantErr: "not allowed in an image reference"},
+		{name: "image with terminal escape", mutate: func(a *App) { a.Image = "api:1.0\x1b[2J" }, wantErr: "not allowed in an image reference"},
+		{name: "image too long", mutate: func(a *App) { a.Image = "a/" + strings.Repeat("x", 300) + ":1" }, wantErr: "at most 255 characters"},
+		{name: "domain with nginx syntax", mutate: func(a *App) { a.Domain = "a.example.com; return 200" }, wantErr: "domain:"},
+		{name: "domain with newline", mutate: func(a *App) { a.Domain = "a.example.com\n}" }, wantErr: "domain:"},
+		{name: "domain too long", mutate: func(a *App) { a.Domain = strings.Repeat("a.", 130) + "com" }, wantErr: "domain:"},
+		{name: "name with path traversal", mutate: func(a *App) { a.Name = "../etc" }, wantErr: "name:"},
+		{name: "name with slash", mutate: func(a *App) { a.Name = "a/b" }, wantErr: "name:"},
+		{name: "env value with NUL", mutate: func(a *App) { a.Env = map[string]string{"KEY": "a\x00b"} }, wantErr: "contains a NUL byte"},
+		{name: "env value with newline is fine", mutate: func(a *App) { a.Env = map[string]string{"KEY": "line1\nline2"} }},
+		{name: "healthcheck path with query", mutate: func(a *App) { a.Healthcheck = &Healthcheck{Path: "/health?deep=1"} }},
+		{name: "healthcheck path with space", mutate: func(a *App) { a.Healthcheck = &Healthcheck{Path: "/health check"} }, wantErr: "healthcheck.path:"},
+		{name: "healthcheck path with newline", mutate: func(a *App) { a.Healthcheck = &Healthcheck{Path: "/h\r\nHost: evil"} }, wantErr: "healthcheck.path:"},
+		{name: "healthcheck path too long", mutate: func(a *App) { a.Healthcheck = &Healthcheck{Path: "/" + strings.Repeat("a", 300)} }, wantErr: "at most 200 characters"},
 		{name: "domain without dot", mutate: func(a *App) { a.Domain = "localhost" }, wantErr: "domain:"},
 		{name: "domain with scheme", mutate: func(a *App) { a.Domain = "https://api.example.com" }, wantErr: "domain:"},
 		{name: "port zero", mutate: func(a *App) { a.Port = 0 }, wantErr: "port:"},
@@ -165,5 +180,31 @@ func TestMemoryBytes(t *testing.T) {
 				t.Errorf("MemoryBytes() = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestTooManyEnvVars(t *testing.T) {
+	a := validApp()
+	a.Env = map[string]string{}
+	for i := range 201 {
+		a.Env["VAR_"+strings.Repeat("X", i)] = "v"
+	}
+
+	if err := a.Validate(); err == nil || !strings.Contains(err.Error(), "at most 200 variables") {
+		t.Errorf("Validate() error = %v, want the variable limit", err)
+	}
+}
+
+func TestValidName(t *testing.T) {
+	for _, name := range []string{"web", "orders-api", "a1"} {
+		if !ValidName(name) {
+			t.Errorf("ValidName(%q) = false, want true", name)
+		}
+	}
+	// Everything that could escape a directory or change a command.
+	for _, name := range []string{"", "..", "../x", "a/b", "a b", "A", "a.conf", "-a", "a\x00", strings.Repeat("a", 64)} {
+		if ValidName(name) {
+			t.Errorf("ValidName(%q) = true, want false", name)
+		}
 	}
 }

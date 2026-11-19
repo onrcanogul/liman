@@ -23,7 +23,33 @@ var (
 
 	// A positive integer followed by a unit, the same notation Docker uses.
 	memoryRe = regexp.MustCompile(`^([1-9][0-9]*)([kmg])$`)
+
+	// The characters an image reference can contain. This is an allowlist:
+	// anything not listed is rejected, including spaces, quotes, shell
+	// metacharacters and terminal control sequences.
+	imageRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]*$`)
+
+	// A URL path, optionally with a query string, from the same kind of
+	// allowlist.
+	healthPathRe = regexp.MustCompile(`^/[A-Za-z0-9._~%/?&=+:@-]*$`)
 )
+
+// Limits on the size of individual values. The whole file is already
+// bounded by the API; these keep single fields within what the systems
+// they are handed to accept.
+const (
+	maxImageLength      = 255
+	maxDomainLength     = 253
+	maxHealthPathLength = 200
+	maxEnvVars          = 200
+)
+
+// ValidName reports whether name is a valid app name. The name ends up in
+// container names, file names and URLs, so every place that receives one
+// from outside must check it with this function.
+func ValidName(name string) bool {
+	return nameRe.MatchString(name)
+}
 
 // Validate checks that the definition describes a deployable app.
 //
@@ -40,12 +66,16 @@ func (a *App) Validate() error {
 		errs = append(errs, fmt.Errorf("image: %w", err))
 	}
 
-	if !domainRe.MatchString(a.Domain) {
+	if len(a.Domain) > maxDomainLength || !domainRe.MatchString(a.Domain) {
 		errs = append(errs, fmt.Errorf("domain: must be a lowercase host name such as api.example.com, got %q", a.Domain))
 	}
 
 	if a.Port < 1 || a.Port > 65535 {
 		errs = append(errs, fmt.Errorf("port: must be between 1 and 65535, got %d", a.Port))
+	}
+
+	if len(a.Env) > maxEnvVars {
+		errs = append(errs, fmt.Errorf("env: at most %d variables are allowed, got %d", maxEnvVars, len(a.Env)))
 	}
 
 	// Map iteration order is random in Go. Sort the keys so the error
@@ -59,6 +89,11 @@ func (a *App) Validate() error {
 		if !envKeyRe.MatchString(k) {
 			errs = append(errs, fmt.Errorf("env: invalid variable name %q", k))
 		}
+		// A NUL byte ends a string in C, which is what the kernel uses for
+		// the environment: everything after it would silently disappear.
+		if strings.ContainsRune(a.Env[k], 0) {
+			errs = append(errs, fmt.Errorf("env: value of %s contains a NUL byte", k))
+		}
 	}
 
 	if a.Resources.Memory != "" {
@@ -71,8 +106,16 @@ func (a *App) Validate() error {
 		errs = append(errs, fmt.Errorf("resources.cpus: must not be negative, got %g", a.Resources.CPUs))
 	}
 
-	if a.Healthcheck != nil && !strings.HasPrefix(a.Healthcheck.Path, "/") {
-		errs = append(errs, fmt.Errorf("healthcheck.path: must start with \"/\", got %q", a.Healthcheck.Path))
+	if a.Healthcheck != nil {
+		path := a.Healthcheck.Path
+		switch {
+		case !strings.HasPrefix(path, "/"):
+			errs = append(errs, fmt.Errorf("healthcheck.path: must start with \"/\", got %q", path))
+		case len(path) > maxHealthPathLength:
+			errs = append(errs, fmt.Errorf("healthcheck.path: must be at most %d characters", maxHealthPathLength))
+		case !healthPathRe.MatchString(path):
+			errs = append(errs, fmt.Errorf("healthcheck.path: contains characters that are not allowed in a URL path, got %q", path))
+		}
 	}
 
 	// errors.Join returns nil when errs is empty, so no special case is
@@ -87,8 +130,14 @@ func validateImage(image string) error {
 	if image == "" {
 		return errors.New("is required")
 	}
-	if strings.ContainsAny(image, " \t\n") {
-		return fmt.Errorf("must not contain whitespace, got %q", image)
+	if len(image) > maxImageLength {
+		return fmt.Errorf("must be at most %d characters", maxImageLength)
+	}
+	// %q prints the value quoted with control characters escaped, so a
+	// hostile value cannot smuggle escape sequences into the terminal
+	// through this error message.
+	if !imageRe.MatchString(image) {
+		return fmt.Errorf("contains characters that are not allowed in an image reference, got %q", image)
 	}
 
 	// A digest reference (name@sha256:...) is always a fixed version.

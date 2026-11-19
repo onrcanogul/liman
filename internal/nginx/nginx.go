@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/onrcanogul/liman/internal/app"
 	"github.com/onrcanogul/liman/internal/config"
 )
 
@@ -175,9 +176,26 @@ func (m *Manager) servedRelease(ctx context.Context, domain string) (string, err
 	return resp.Header.Get(ReleaseHeader), nil
 }
 
+// checkName refuses names that are not valid app names.
+//
+// The name becomes part of a file path. A name such as "../../nginx" would
+// make the methods below read, overwrite or delete files outside liman's
+// directory. Callers validate names too; this check is here so that the
+// package that touches the file system does not depend on every caller
+// remembering to.
+func checkName(name string) error {
+	if !app.ValidName(name) {
+		return fmt.Errorf("invalid app name %q", name)
+	}
+	return nil
+}
+
 // Current returns the configuration currently on disk for app, or nil if
 // there is none.
 func (m *Manager) Current(app string) ([]byte, error) {
+	if err := checkName(app); err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(m.Path(app))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
@@ -191,6 +209,9 @@ func (m *Manager) Current(app string) ([]byte, error) {
 // Write replaces the configuration of app atomically: Nginx either sees the
 // complete old file or the complete new one, never a half-written file.
 func (m *Manager) Write(app string, content []byte) error {
+	if err := checkName(app); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(m.cfg.ConfDir, 0o755); err != nil {
 		return fmt.Errorf("create nginx config directory: %w", err)
 	}
@@ -227,6 +248,9 @@ func (m *Manager) Write(app string, content []byte) error {
 // Remove deletes the configuration of app. Removing a file that does not
 // exist is not an error, which makes Remove safe to repeat.
 func (m *Manager) Remove(app string) error {
+	if err := checkName(app); err != nil {
+		return err
+	}
 	err := os.Remove(m.Path(app))
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("remove nginx config: %w", err)

@@ -129,10 +129,23 @@ func (d *Daemon) serve(ctx context.Context) int {
 
 	httpServer := &http.Server{
 		Handler: srv.Handler(),
+
+		// Each limit below closes a way of tying up the daemon without
+		// being authenticated.
+		//
 		// A client that opens a connection and never finishes its headers
-		// would otherwise hold it forever. There is deliberately no write
-		// timeout: deploys and followed logs are long-lived responses.
+		// would otherwise hold it, and a goroutine, forever (the attack is
+		// known as Slowloris).
 		ReadHeaderTimeout: 10 * time.Second,
+		// The default allows a megabyte of headers per request.
+		MaxHeaderBytes: 16 << 10,
+		// Connections kept open between requests are closed when idle.
+		IdleTimeout: 2 * time.Minute,
+
+		// There is deliberately no ReadTimeout and no WriteTimeout. Both
+		// are measured from the start of a request and would cut off a
+		// deploy or a followed log that is working as intended. Slow
+		// request bodies are limited per handler instead (server.readBody).
 	}
 
 	if tokens, err := st.Tokens(ctx); err == nil && len(tokens) == 0 {

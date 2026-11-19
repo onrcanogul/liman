@@ -22,8 +22,20 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			return
 		}
 
+		client := clientAddress(r)
+		limiter := s.authFailures()
+
+		// Checked before the token is even looked at: during a lockout the
+		// client learns nothing, not even whether a guess was right.
+		if wait, locked := limiter.blocked(client); locked {
+			w.Header().Set("Retry-After", retryAfter(wait))
+			writeError(w, http.StatusTooManyRequests, tooManyAttempts(wait))
+			return
+		}
+
 		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if !ok {
+			limiter.recordFailure(client)
 			// WWW-Authenticate tells the client which scheme is expected.
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeError(w, http.StatusUnauthorized, errors.New("missing bearer token"))
@@ -36,6 +48,9 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			return
 		}
 		if !valid {
+			limiter.recordFailure(client)
+			// The answer is the same whether the token is malformed,
+			// unknown or revoked: an attacker learns nothing from it.
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeError(w, http.StatusUnauthorized, errors.New("invalid token"))
 			return

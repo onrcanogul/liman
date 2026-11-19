@@ -50,8 +50,9 @@ type Harness struct {
 	releases atomic.Int32
 }
 
-// New starts a server that is shut down when the test ends.
-func New(t *testing.T) *Harness {
+// New starts a server that is shut down when the test ends. Each option can
+// adjust the server before it starts handling requests.
+func New(t *testing.T, options ...func(*server.Server)) *Harness {
 	t.Helper()
 
 	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "liman.db"))
@@ -88,6 +89,10 @@ func New(t *testing.T) *Harness {
 			d.HealthInterval = time.Millisecond
 			return d
 		},
+	}
+
+	for _, option := range options {
+		option(h.Server)
 	}
 
 	srv := httptest.NewServer(h.Server.Handler())
