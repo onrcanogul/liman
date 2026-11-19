@@ -308,3 +308,26 @@ func TestLoadRejectsBadMonitorSettings(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadDeployDrain(t *testing.T) {
+	// Left out: nil, meaning "use the default".
+	cfg, err := Load(write(t, "monitor:\n  interval: 10s\n"))
+	if err != nil || cfg.Deploy.Drain != nil {
+		t.Errorf("Drain without a setting = %v, %v; want nil", cfg.Deploy.Drain, err)
+	}
+
+	// Zero is a real value: do not wait.
+	cfg, err = Load(write(t, "deploy:\n  drain: 0s\n"))
+	if err != nil || cfg.Deploy.Drain == nil || time.Duration(*cfg.Deploy.Drain) != 0 {
+		t.Errorf("Drain 0s = %v, %v; want a pointer to zero", cfg.Deploy.Drain, err)
+	}
+
+	cfg, err = Load(write(t, "deploy:\n  drain: 30s\n"))
+	if err != nil || cfg.Deploy.Drain == nil || time.Duration(*cfg.Deploy.Drain) != 30*time.Second {
+		t.Errorf("Drain 30s = %v, %v", cfg.Deploy.Drain, err)
+	}
+
+	if _, err := Load(write(t, "deploy:\n  drain: 1h\n")); err == nil || !strings.Contains(err.Error(), "deploy.drain") {
+		t.Errorf("Drain 1h error = %v, want it rejected", err)
+	}
+}

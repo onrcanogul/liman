@@ -66,6 +66,11 @@ type Server struct {
 	// Zero means a default.
 	BodyReadTimeout time.Duration
 
+	// Drain, when set, overrides how long the previous release is given to
+	// finish its requests after the proxy has been switched. It is a
+	// pointer so that "not set" and "zero: do not wait" can be told apart.
+	Drain *time.Duration
+
 	// NewDeployer builds the deployer for a request. Nil means deploy.New;
 	// tests replace it to control ports, timing and release names.
 	NewDeployer func(e engine.Engine, out io.Writer) *deploy.Deployer
@@ -111,6 +116,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/confirmations/{id}", s.handleConfirm)
 	mux.HandleFunc("GET /v1/apps", s.handleApps)
 	mux.HandleFunc("GET /v1/apps/{name}/logs", s.handleLogs)
+	mux.HandleFunc("POST /v1/apps/{name}/rollback", s.handleRollback)
 	mux.HandleFunc("DELETE /v1/apps/{name}", s.handleStop)
 	mux.HandleFunc("GET /v1/history", s.handleHistory)
 
@@ -197,7 +203,6 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	stream := newEventStream(w)
 
 	deployer := s.newDeployer(eng, stream)
-	deployer.Proxy = s.Proxy
 
 	opts := deploy.Options{DryRun: dryRun}
 	if !dryRun {
@@ -234,6 +239,79 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	// while this handler still holds the lock, and be refused with a 409
 	// for a deploy that had, as far as it could tell, finished. (Found by
 	// the load test: about one sequential deploy in five thousand.)
+	unlock()
+	stream.send(api.DeployEvent{Type: api.EventResult, Result: result})
+}
+
+func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	name, ok := appName(w, r)
+	if !ok {
+		return
+	}
+
+	query := r.URL.Query()
+	dryRun := query.Get("dry_run") == "true"
+	stepMode := query.Get("step") == "true"
+	if dryRun && stepMode {
+		writeError(w, http.StatusBadRequest, errors.New("dry_run and step cannot be combined"))
+		return
+	}
+
+	unlock := func() {}
+	if !dryRun {
+		release, ok := s.lock(name)
+		if !ok {
+			writeError(w, http.StatusConflict, fmt.Errorf("another operation on %s is in progress", name))
+			return
+		}
+		unlock = sync.OnceFunc(release)
+		defer unlock()
+	}
+
+	// Unlike a deploy, even a dry run needs the engine: what a rollback
+	// does depends entirely on which containers exist.
+	eng, containers, status, err := s.containersOf(ctx, name)
+	if err != nil {
+		writeError(w, status, err)
+		return
+	}
+	// Checked here, before the stream starts, so that "there is nothing to
+	// roll back to" is an ordinary error with a status code of its own
+	// rather than a failed operation inside a 200 response.
+	if len(containers) < 2 {
+		writeError(w, http.StatusConflict, fmt.Errorf("%s: %w; deploy the version you want instead", name, deploy.ErrNoPrevious))
+		return
+	}
+
+	stream := newEventStream(w)
+	deployer := s.newDeployer(eng, stream)
+
+	opts := deploy.Options{DryRun: dryRun}
+	if !dryRun {
+		opts.OnEvent = s.recordEvent(name)
+		if stepMode {
+			opts.Confirm = s.confirmer(ctx, stream)
+		}
+	}
+
+	res, err := deployer.Rollback(ctx, name, opts)
+
+	result := &api.DeployResult{
+		OK:        err == nil,
+		App:       name,
+		Release:   res.Release,
+		Container: res.Container,
+		HostPort:  res.HostPort,
+		Routed:    err == nil && !dryRun && s.Proxy != nil,
+		DryRun:    dryRun,
+	}
+	if err != nil {
+		result.Error = err.Error()
+	}
+
+	// As in handleDeploy: the app is released before the result is sent.
 	unlock()
 	stream.send(api.DeployEvent{Type: api.EventResult, Result: result})
 }
@@ -287,6 +365,14 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The list is ordered by app and then oldest first, so the last
+	// container seen for an app is its newest: the one in service. Any
+	// other is a previous release, stopped and kept for a rollback.
+	current := map[string]string{}
+	for _, c := range containers {
+		current[c.App] = c.Name
+	}
+
 	// make with length 0 (rather than a nil slice) so that an empty result
 	// is encoded as [] and not as null.
 	out := make([]api.Container, 0, len(containers))
@@ -298,6 +384,13 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 			State:     c.State,
 			Status:    c.Status,
 			HostPort:  c.HostPort,
+			Role:      "current",
+		}
+		if current[c.App] != c.Name {
+			entry.Role = "previous"
+			out = append(out, entry)
+			// The monitor's verdict is about the release in service.
+			continue
 		}
 		if s.HealthOf != nil {
 			if health, detail, restarts, ok := s.HealthOf(c.App); ok {
@@ -445,10 +538,17 @@ func appName(w http.ResponseWriter, r *http.Request) (string, bool) {
 }
 
 func (s *Server) newDeployer(e engine.Engine, out io.Writer) *deploy.Deployer {
+	var d *deploy.Deployer
 	if s.NewDeployer != nil {
-		return s.NewDeployer(e, out)
+		d = s.NewDeployer(e, out)
+	} else {
+		d = deploy.New(e, out)
 	}
-	return deploy.New(e, out)
+	d.Proxy = s.Proxy
+	if s.Drain != nil {
+		d.Drain = *s.Drain
+	}
+	return d
 }
 
 // lock marks app as busy. It returns false if it already is; otherwise it

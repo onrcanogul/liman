@@ -18,8 +18,18 @@ import (
 // Config is the content of config.yaml in liman's home directory.
 type Config struct {
 	Daemon  Daemon  `yaml:"daemon"`
+	Deploy  Deploy  `yaml:"deploy"`
 	Monitor Monitor `yaml:"monitor"`
 	Nginx   Nginx   `yaml:"nginx"`
+}
+
+// Deploy configures how releases are switched.
+type Deploy struct {
+	// Drain is how long the previous release keeps running after the proxy
+	// has been switched away from it, written like "5s". It is a pointer so
+	// that leaving it out (use the default) can be told apart from "0s"
+	// (do not wait at all).
+	Drain *Duration `yaml:"drain"`
 }
 
 // Monitor configures the health monitor, which restarts apps that have
@@ -161,6 +171,10 @@ func (c *Config) validate() error {
 
 	if err := CheckListenAddress(c.Daemon.Listen); err != nil {
 		errs = append(errs, fmt.Errorf("daemon.listen: %w", err))
+	}
+
+	if d := c.Deploy.Drain; d != nil && (time.Duration(*d) < 0 || time.Duration(*d) > 10*time.Minute) {
+		errs = append(errs, fmt.Errorf("deploy.drain: must be between 0s and 10m, got %s", time.Duration(*d)))
 	}
 
 	// Zero means "use the default" for both; anything else must make sense.

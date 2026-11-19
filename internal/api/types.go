@@ -72,6 +72,10 @@ type Container struct {
 	Status    string `json:"status"`
 	HostPort  int    `json:"host_port,omitempty"`
 
+	// Role is "current" for the container in service and "previous" for
+	// one that is stopped and kept for a rollback.
+	Role string `json:"role,omitempty"`
+
 	// Health is the health monitor's verdict: "healthy", "unhealthy",
 	// "restarting" or "down". It is empty when the monitor has not looked
 	// at the app yet, or is not running.

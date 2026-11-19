@@ -481,7 +481,7 @@ func TestApps(t *testing.T) {
 	h.Engine.Add(engine.Container{Name: "web-r1", App: "web", Image: "web:1.0", Status: "Up 2 minutes", HostPort: 40123})
 
 	got, err = h.Client.Apps(ctx())
-	want := api.Container{App: "web", Container: "web-r1", Image: "web:1.0", State: "running", Status: "Up 2 minutes", HostPort: 40123}
+	want := api.Container{App: "web", Container: "web-r1", Image: "web:1.0", State: "running", Status: "Up 2 minutes", HostPort: 40123, Role: "current"}
 	if err != nil || len(got) != 1 || got[0] != want {
 		t.Errorf("Apps() = %+v, %v; want %+v", got, err, want)
 	}
@@ -1024,5 +1024,159 @@ func TestAppIsUnlockedBeforeTheResultIsSent(t *testing.T) {
 		if _, err := h.Client.Deploy(ctx(), []byte(definition), api.DeployOptions{}, io.Discard); err != nil {
 			t.Fatalf("deploy %d directly after a stop: %v", i+1, err)
 		}
+	}
+}
+
+// --- rollback ---------------------------------------------------------------
+
+// deployTwice leaves r1 stopped and kept, and r2 in service.
+func deployTwice(t *testing.T, h *servertest.Harness) {
+	t.Helper()
+	for i := range 2 {
+		if _, err := h.Client.Deploy(ctx(), []byte(definition), api.DeployOptions{}, io.Discard); err != nil {
+			t.Fatalf("deploy %d: %v", i+1, err)
+		}
+	}
+}
+
+func TestRollback(t *testing.T) {
+	h := servertest.New(t)
+	proxy := h.WithProxy(t, "true")
+	deployTwice(t, h)
+	var out bytes.Buffer
+
+	res, err := h.Client.Rollback(ctx(), "orders-api", api.DeployOptions{}, &out)
+	if err != nil {
+		t.Fatalf("Rollback() error = %v\n%s", err, out.String())
+	}
+
+	if !res.OK || res.Release != "r1" || res.Container != "orders-api-r1" || !res.Routed {
+		t.Errorf("result = %+v, want release r1 routed", res)
+	}
+	if got := h.Engine.Running(); len(got) != 1 || got[0] != "orders-api-r1" {
+		t.Errorf("running = %v, want only orders-api-r1", got)
+	}
+	conf, _ := os.ReadFile(proxy.Path("orders-api"))
+	if !strings.Contains(string(conf), `X-Liman-Release "r1"`) {
+		t.Errorf("proxy config does not report release r1:\n%s", conf)
+	}
+	if !strings.Contains(out.String(), "==> [1/5] Start previous container orders-api-r1") {
+		t.Errorf("output does not show the steps:\n%s", out.String())
+	}
+
+	// The steps of the rollback are in the history.
+	events, _ := h.Client.History(ctx(), "orders-api", 5)
+	if len(events) != 5 || events[0].Step != "Start previous container orders-api-r1" || events[0].Release != "r1" {
+		t.Errorf("last five history entries = %+v, want the rollback's steps for r1", events)
+	}
+
+	// The listing shows a single, current container again.
+	apps, _ := h.Client.Apps(ctx())
+	if len(apps) != 1 || apps[0].Role != "current" || apps[0].Container != "orders-api-r1" {
+		t.Errorf("Apps() = %+v, want only orders-api-r1 as current", apps)
+	}
+}
+
+func TestRollbackIsRefusedBeforeItStarts(t *testing.T) {
+	h := servertest.New(t)
+	h.Engine.Add(engine.Container{Name: "single-r1", App: "single"})
+
+	tests := []struct {
+		name       string
+		app        string
+		wantStatus int
+		wantErr    string
+	}{
+		{"unknown app", "nope", http.StatusNotFound, "container not found"},
+		{"only one release", "single", http.StatusConflict, "no previous release is kept"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := h.Client.Rollback(ctx(), tt.app, api.DeployOptions{}, io.Discard)
+
+			var apiErr *api.Error
+			if !errors.As(err, &apiErr) || apiErr.Status != tt.wantStatus || !strings.Contains(apiErr.Message, tt.wantErr) {
+				t.Errorf("Rollback() error = %v, want status %d containing %q", err, tt.wantStatus, tt.wantErr)
+			}
+		})
+	}
+
+	// A hostile name never reaches the engine.
+	resp := request(t, h, http.MethodPost, "/v1/apps/..%2Fx/rollback", nil)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusNotFound {
+		t.Errorf("rollback with a traversal name = %d, want it refused", resp.StatusCode)
+	}
+
+	// None of the refusals may leave the app locked.
+	if _, err := h.Client.Stop(ctx(), "single"); err != nil {
+		t.Errorf("Stop() after a refused rollback error = %v", err)
+	}
+}
+
+func TestRollbackDryRunAndListingRoles(t *testing.T) {
+	h := servertest.New(t)
+	deployTwice(t, h)
+
+	apps, err := h.Client.Apps(ctx())
+	if err != nil || len(apps) != 2 {
+		t.Fatalf("Apps() = %+v, %v; want two containers", apps, err)
+	}
+	if apps[0].Container != "orders-api-r1" || apps[0].Role != "previous" || apps[0].State != "exited" {
+		t.Errorf("first entry = %+v, want the stopped previous release", apps[0])
+	}
+	if apps[1].Container != "orders-api-r2" || apps[1].Role != "current" {
+		t.Errorf("second entry = %+v, want the current release", apps[1])
+	}
+
+	var out bytes.Buffer
+	res, err := h.Client.Rollback(ctx(), "orders-api", api.DeployOptions{DryRun: true}, &out)
+	if err != nil || !res.DryRun {
+		t.Fatalf("Rollback(dry run) = %+v, %v", res, err)
+	}
+	if got := h.Engine.Running(); len(got) != 1 || got[0] != "orders-api-r2" {
+		t.Errorf("running after a dry run = %v, want nothing changed", got)
+	}
+	events, _ := h.Client.History(ctx(), "orders-api", 50)
+	if len(events) != 10 {
+		t.Errorf("history has %d entries, want only the 10 of the two deploys", len(events))
+	}
+}
+
+func TestRollbackAndDeployExcludeEachOther(t *testing.T) {
+	h := servertest.New(t)
+	deployTwice(t, h)
+
+	// A step-mode rollback parked at its first question holds the app.
+	asked := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	done := make(chan error, 1)
+	go func() {
+		opts := api.DeployOptions{Confirm: func(string) (bool, error) {
+			once.Do(func() { close(asked) })
+			<-release
+			return false, nil
+		}}
+		_, err := h.Client.Rollback(ctx(), "orders-api", opts, io.Discard)
+		done <- err
+	}()
+
+	select {
+	case <-asked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the rollback never asked its first question")
+	}
+
+	_, err := h.Client.Deploy(ctx(), []byte(definition), api.DeployOptions{}, io.Discard)
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusConflict {
+		t.Errorf("Deploy() during a rollback error = %v, want a 409", err)
+	}
+
+	close(release)
+	if err := <-done; err == nil {
+		t.Error("the declined rollback reported success")
 	}
 }

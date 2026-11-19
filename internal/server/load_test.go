@@ -411,16 +411,23 @@ func eventually(check func() bool) bool {
 	return true
 }
 
-// containerCount asks the daemon how many containers it manages. Going
+// containerCount asks the daemon how many containers are in service. Going
 // through the API (rather than reading the fake engine's map) is safe while
-// requests are still in flight.
+// requests are still in flight. Stopped containers kept for a rollback are
+// not counted: after the second deploy every app has one of those too.
 func containerCount(t *testing.T, client *api.Client) int {
 	t.Helper()
 	apps, err := client.Apps(context.Background())
 	if err != nil {
 		t.Fatalf("list apps: %v", err)
 	}
-	return len(apps)
+	running := 0
+	for _, c := range apps {
+		if c.State == "running" {
+			running++
+		}
+	}
+	return running
 }
 
 func firstLine(s string) string {

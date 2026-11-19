@@ -122,6 +122,10 @@ func (d *Daemon) serve(ctx context.Context) int {
 	locks := &applock.Locks{}
 
 	srv := &server.Server{Store: st, Connect: connect, Log: log, Locks: locks}
+	if cfg.Deploy.Drain != nil {
+		drain := time.Duration(*cfg.Deploy.Drain)
+		srv.Drain = &drain
+	}
 	// Only assign the proxy when it is enabled. Assigning a nil
 	// *nginx.Manager to the interface field would make the field non-nil.
 	if cfg.Nginx.Enabled() {

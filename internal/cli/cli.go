@@ -41,6 +41,8 @@ Commands:
                        Deploy an app. --dry-run only shows the steps and the
                        equivalent manual commands; --step asks before each step
   plan <file>          Same as deploy --dry-run
+  rollback [--dry-run] [--step] <app>
+                       Put the previous release back into service
   ps                   List containers managed by liman
   logs [-f] <app>      Show the logs of an app (-f keeps following)
   stop <app>           Stop and remove an app
@@ -82,6 +84,8 @@ func (c *CLI) Run(ctx context.Context, args []string) int {
 		return c.runDeploy(ctx, rest, false)
 	case "plan":
 		return c.runDeploy(ctx, rest, true)
+	case "rollback":
+		return c.runRollback(ctx, rest)
 	case "ps":
 		return c.runPs(ctx, rest)
 	case "logs":
@@ -179,6 +183,57 @@ func (c *CLI) runDeploy(ctx context.Context, args []string, planOnly bool) int {
 	return exitOK
 }
 
+func (c *CLI) runRollback(ctx context.Context, args []string) int {
+	const synopsis = "liman rollback [--dry-run] [--step] <app>"
+
+	fs := flag.NewFlagSet("rollback", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	dryRun := fs.Bool("dry-run", false, "show the steps without executing them")
+	stepMode := fs.Bool("step", false, "ask for confirmation before every step")
+
+	if err := fs.Parse(args); err != nil || fs.NArg() != 1 {
+		return c.usageError(synopsis)
+	}
+	if *dryRun && *stepMode {
+		fmt.Fprintln(c.Stderr, "liman: --dry-run and --step cannot be combined")
+		return exitUsage
+	}
+	name := fs.Arg(0)
+	// Checked here so a mistyped name is reported without a round trip;
+	// the daemon checks again.
+	if !app.ValidName(name) {
+		return c.fail(fmt.Errorf("invalid app name %q", name))
+	}
+
+	opts := api.DeployOptions{DryRun: *dryRun}
+	if *stepMode {
+		opts.Confirm = c.confirm()
+	}
+	if *dryRun {
+		fmt.Fprintf(c.Stdout, "Dry run of a rollback of %s: nothing will be changed.\n\n", name)
+	}
+
+	res, err := c.API.Rollback(ctx, name, opts, c.Stdout)
+	if err != nil {
+		if errors.Is(err, api.ErrDeployFailed) && res != nil {
+			fmt.Fprintf(c.Stderr, "liman: %s\n", res.Error)
+			return exitError
+		}
+		return c.fail(err)
+	}
+
+	if res.DryRun {
+		return exitOK
+	}
+
+	fmt.Fprintf(c.Stdout, "\n%s is back on release %s, running on the server at 127.0.0.1:%d\n", res.App, res.Release, res.HostPort)
+	if res.Routed {
+		fmt.Fprintln(c.Stdout, "Nginx routes its domain to it")
+	}
+	fmt.Fprintln(c.Stdout, "The release that was rolled back from has been removed; deploy again to move forward")
+	return exitOK
+}
+
 // confirm returns the callback that asks the user before each step.
 func (c *CLI) confirm() func(step string) (bool, error) {
 	// One reader for all questions: a bufio.Reader may read ahead, so
@@ -218,7 +273,7 @@ func (c *CLI) runPs(ctx context.Context, args []string) int {
 	// tabwriter aligns tab-separated cells into columns once Flush is
 	// called, so the widths adapt to the longest value.
 	w := tabwriter.NewWriter(c.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "APP\tCONTAINER\tIMAGE\tSTATE\tHEALTH\tADDRESS\tSTATUS")
+	fmt.Fprintln(w, "APP\tCONTAINER\tROLE\tIMAGE\tSTATE\tHEALTH\tADDRESS\tSTATUS")
 	// Explanations of anything that is not healthy are printed below the
 	// table: they are sentences, and would wreck the columns.
 	var notes []string
@@ -242,7 +297,12 @@ func (c *CLI) runPs(ctx context.Context, args []string) int {
 			notes = append(notes, fmt.Sprintf("%s: %s", ctr.App, ctr.HealthDetail))
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ctr.App, ctr.Container, ctr.Image, ctr.State, health, address, ctr.Status)
+		role := ctr.Role
+		if role == "" {
+			role = "-"
+		}
+
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ctr.App, ctr.Container, role, ctr.Image, ctr.State, health, address, ctr.Status)
 	}
 	if err := w.Flush(); err != nil {
 		return c.fail(err)

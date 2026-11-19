@@ -36,11 +36,11 @@ func (e *Error) Error() string {
 	return e.Message
 }
 
-// ErrDeployFailed is wrapped by the error Deploy returns when the daemon ran
-// the deploy and it did not succeed.
+// ErrDeployFailed is wrapped by the error Deploy and Rollback return when
+// the daemon ran the operation and it did not succeed.
 var ErrDeployFailed = errors.New("deploy failed")
 
-// DeployOptions selects how the daemon executes a deploy.
+// DeployOptions selects how the daemon executes a deploy or a rollback.
 type DeployOptions struct {
 	DryRun bool
 	// Confirm, when set, enables step-by-step mode. It is called with the
@@ -51,6 +51,18 @@ type DeployOptions struct {
 // Deploy sends an app definition to the daemon and copies the progress
 // output to out while the deploy runs.
 func (c *Client) Deploy(ctx context.Context, definition []byte, opts DeployOptions, out io.Writer) (*DeployResult, error) {
+	return c.runStreamed(ctx, "/v1/deploys", "application/yaml", bytes.NewReader(definition), opts, out)
+}
+
+// Rollback asks the daemon to put the previous release of an app back into
+// service, and copies the progress output to out.
+func (c *Client) Rollback(ctx context.Context, app string, opts DeployOptions, out io.Writer) (*DeployResult, error) {
+	return c.runStreamed(ctx, "/v1/apps/"+url.PathEscape(app)+"/rollback", "", nil, opts, out)
+}
+
+// runStreamed posts to an endpoint that answers with a stream of
+// DeployEvents and follows that stream to its result.
+func (c *Client) runStreamed(ctx context.Context, path, contentType string, body io.Reader, opts DeployOptions, out io.Writer) (*DeployResult, error) {
 	query := url.Values{}
 	if opts.DryRun {
 		query.Set("dry_run", "true")
@@ -59,7 +71,7 @@ func (c *Client) Deploy(ctx context.Context, definition []byte, opts DeployOptio
 		query.Set("step", "true")
 	}
 
-	resp, err := c.do(ctx, http.MethodPost, "/v1/deploys", query, "application/yaml", bytes.NewReader(definition))
+	resp, err := c.do(ctx, http.MethodPost, path, query, contentType, body)
 	if err != nil {
 		return nil, err
 	}
@@ -73,14 +85,14 @@ func (c *Client) Deploy(ctx context.Context, definition []byte, opts DeployOptio
 		var ev DeployEvent
 		if err := dec.Decode(&ev); err != nil {
 			// The stream ended without a result event: the daemon died or
-			// the connection broke. The deploy's fate is unknown.
+			// the connection broke. The outcome is unknown.
 			if errors.Is(err, io.EOF) {
-				return nil, errors.New("connection to the daemon was lost before the deploy finished; check with: liman ps")
+				return nil, errors.New("connection to the daemon was lost before the operation finished; check with: liman ps")
 			}
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			return nil, fmt.Errorf("read deploy progress: %w", err)
+			return nil, fmt.Errorf("read progress: %w", err)
 		}
 
 		switch ev.Type {

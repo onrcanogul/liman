@@ -132,7 +132,7 @@ func TestRun(t *testing.T) {
 			args:       []string{"ps"},
 			setup:      func(h *harness) { h.Engine.Add(web) },
 			wantCode:   exitOK,
-			wantStdout: "web  web-r1     web:1.0  running  -       127.0.0.1:40123  Up 2 minutes",
+			wantStdout: "web  web-r1     current  web:1.0  running  -       127.0.0.1:40123  Up 2 minutes",
 		},
 		{name: "ps with arguments", args: []string{"ps", "extra"}, wantCode: exitUsage, wantStderr: "usage: liman ps"},
 
@@ -169,6 +169,23 @@ func TestRun(t *testing.T) {
 		},
 		{name: "stop unknown app", args: []string{"stop", "web"}, wantCode: exitError, wantStderr: "web: container not found"},
 		{name: "stop without app", args: []string{"stop"}, wantCode: exitUsage, wantStderr: "usage: liman stop <app>"},
+
+		{name: "rollback without app", args: []string{"rollback"}, wantCode: exitUsage, wantStderr: "usage: liman rollback"},
+		{name: "rollback with invalid name", args: []string{"rollback", "../x"}, wantCode: exitError, wantStderr: `invalid app name "../x"`},
+		{name: "rollback of unknown app", args: []string{"rollback", "web"}, wantCode: exitError, wantStderr: "web: container not found"},
+		{
+			name:       "rollback without a previous release",
+			args:       []string{"rollback", "web"},
+			setup:      func(h *harness) { h.Engine.Add(web) },
+			wantCode:   exitError,
+			wantStderr: "web: no previous release is kept; deploy the version you want instead",
+		},
+		{
+			name:       "rollback rejects dry run with step",
+			args:       []string{"rollback", "--dry-run", "--step", "web"},
+			wantCode:   exitUsage,
+			wantStderr: "cannot be combined",
+		},
 
 		{name: "history when empty", args: []string{"history"}, wantCode: exitOK, wantStdout: "No history yet."},
 		{name: "history with bad limit", args: []string{"history", "-n", "0"}, wantCode: exitUsage, wantStderr: "usage: liman history"},
@@ -435,5 +452,91 @@ func TestPsShowsHealth(t *testing.T) {
 	// A healthy app gets no note.
 	if strings.Contains(out, "\nweb: ") {
 		t.Errorf("a healthy app has a note:\n%s", out)
+	}
+}
+
+func TestDeployTwiceThenRollback(t *testing.T) {
+	h := newHarness(t, "")
+	file := writeFile(t, validDefinition)
+
+	for range 2 {
+		if code := h.run("deploy", file); code != exitOK {
+			t.Fatalf("deploy exit code = %d, stderr: %s", code, h.stderr.String())
+		}
+	}
+
+	// Both releases are listed, with their roles.
+	h.stdout.Reset()
+	h.run("ps")
+	ps := h.stdout.String()
+	for _, want := range []string{"orders-api-r1  previous", "orders-api-r2  current"} {
+		if !strings.Contains(ps, want) {
+			t.Errorf("ps does not contain %q:\n%s", want, ps)
+		}
+	}
+
+	// A dry run names the containers and changes nothing.
+	h.stdout.Reset()
+	if code := h.run("rollback", "--dry-run", "orders-api"); code != exitOK {
+		t.Fatalf("rollback --dry-run exit code = %d, stderr: %s", code, h.stderr.String())
+	}
+	for _, want := range []string{"Dry run of a rollback of orders-api", "$ docker start orders-api-r1", "$ docker rm -f orders-api-r2"} {
+		if !strings.Contains(h.stdout.String(), want) {
+			t.Errorf("dry run does not contain %q:\n%s", want, h.stdout.String())
+		}
+	}
+	if got := h.Engine.Running(); len(got) != 1 || got[0] != "orders-api-r2" {
+		t.Fatalf("running after the dry run = %v, want only orders-api-r2", got)
+	}
+
+	h.stdout.Reset()
+	if code := h.run("rollback", "orders-api"); code != exitOK {
+		t.Fatalf("rollback exit code = %d, stderr: %s", code, h.stderr.String())
+	}
+	for _, want := range []string{
+		"==> [1/3] Start previous container orders-api-r1",
+		"==> [3/3] Remove container orders-api-r2",
+		"orders-api is back on release r1",
+	} {
+		if !strings.Contains(h.stdout.String(), want) {
+			t.Errorf("rollback output does not contain %q:\n%s", want, h.stdout.String())
+		}
+	}
+	if got := h.Engine.Running(); len(got) != 1 || got[0] != "orders-api-r1" {
+		t.Errorf("running after the rollback = %v, want only orders-api-r1", got)
+	}
+
+	// The rollback is in the history, under the release it restored.
+	h.stdout.Reset()
+	h.run("history", "-n", "3", "orders-api")
+	if !strings.Contains(h.stdout.String(), "Start previous container orders-api-r1") {
+		t.Errorf("history does not show the rollback:\n%s", h.stdout.String())
+	}
+
+	// There is nothing further back.
+	if code := h.run("rollback", "orders-api"); code != exitError || !strings.Contains(h.stderr.String(), "no previous release is kept") {
+		t.Errorf("second rollback: code %d, stderr %q", code, h.stderr.String())
+	}
+}
+
+func TestRollbackStepModeDeclineKeepsCurrentRelease(t *testing.T) {
+	// Approve starting the old release and its health check, decline the
+	// removal of the current one.
+	h := newHarness(t, "y\ny\nn\n")
+	file := writeFile(t, validDefinition)
+	for range 2 {
+		h.run("deploy", file)
+	}
+
+	code := h.run("rollback", "--step", "orders-api")
+
+	if code != exitError || !strings.Contains(h.stderr.String(), `aborted before "Remove container orders-api-r2"`) {
+		t.Fatalf("code %d, stderr %q; want an abort before the removal", code, h.stderr.String())
+	}
+	if got := h.Engine.Running(); len(got) != 1 || got[0] != "orders-api-r2" {
+		t.Errorf("running = %v, want the current release to keep serving", got)
+	}
+	if got := h.Engine.State("orders-api-r1"); got != "exited" {
+		t.Errorf("state of the previous release = %q, want it stopped again and kept", got)
 	}
 }
