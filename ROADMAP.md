@@ -94,6 +94,9 @@ collection.
 - [x] Stage 3
 - [x] Stage 4
 - [ ] Stage 5
+  - [x] 5a: daemon, HTTP API, token auth, SQLite, CLI as a client (local)
+  - [ ] 5b: install on the server (systemd, WireGuard, host Nginx)
+  - [ ] 5c: certificates from Let's Encrypt
 - [ ] Stage 6
 - [ ] Stage 7
 - [ ] Stage 8

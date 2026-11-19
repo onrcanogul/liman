@@ -4,18 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/onrcanogul/liman/internal/config"
+	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/engine"
-	"github.com/onrcanogul/liman/internal/engine/enginetest"
-	"github.com/onrcanogul/liman/internal/history"
-	"github.com/onrcanogul/liman/internal/nginx"
+	"github.com/onrcanogul/liman/internal/server/servertest"
 )
 
 const validDefinition = `
@@ -32,33 +28,31 @@ domain: api.example.com
 port: 3000
 `
 
-// harness bundles a CLI with the fakes behind it.
+// harness is a CLI wired to a complete test daemon: a real HTTP server and
+// database, with Docker and Nginx replaced by stand-ins. Every command
+// therefore travels the same path as in production.
 type harness struct {
+	*servertest.Harness
 	cli    *CLI
-	fake   *enginetest.Fake
 	stdout bytes.Buffer
 	stderr bytes.Buffer
-	// connectErr makes Connect fail, simulating Docker being down.
-	connectErr error
 }
 
 func newHarness(t *testing.T, stdin string) *harness {
 	t.Helper()
 
-	h := &harness{fake: enginetest.New()}
+	h := &harness{Harness: servertest.New(t)}
 	h.cli = &CLI{
 		Stdin:  strings.NewReader(stdin),
 		Stdout: &h.stdout,
 		Stderr: &h.stderr,
-		Connect: func(context.Context) (engine.Engine, error) {
-			if h.connectErr != nil {
-				return nil, h.connectErr
-			}
-			return h.fake, nil
-		},
-		History: history.Store{Path: filepath.Join(t.TempDir(), "history.jsonl")},
+		API:    h.Client,
 	}
 	return h
+}
+
+func (h *harness) run(args ...string) int {
+	return h.cli.Run(context.Background(), args)
 }
 
 func TestRun(t *testing.T) {
@@ -90,26 +84,25 @@ func TestRun(t *testing.T) {
 		{
 			name:       "plan works without docker",
 			args:       []string{"plan", validFile},
-			setup:      func(h *harness) { h.connectErr = errors.New("docker is down") },
+			setup:      func(h *harness) { h.ConnectErr = servertest.ErrDockerDown },
 			wantCode:   exitOK,
 			wantStdout: "Dry run for orders-api: nothing will be changed.",
 		},
 
-		{name: "deploy", args: []string{"deploy", validFile}, wantCode: exitOK, wantStdout: "orders-api is running at http://127.0.0.1:"},
+		{name: "deploy", args: []string{"deploy", validFile}, wantCode: exitOK, wantStdout: "orders-api is running on the server at 127.0.0.1:40001 (release r1)"},
 		{name: "deploy without file", args: []string{"deploy"}, wantCode: exitUsage, wantStderr: "usage: liman deploy"},
 		{name: "deploy with unknown flag", args: []string{"deploy", "--force", validFile}, wantCode: exitUsage, wantStderr: "usage: liman deploy"},
 		{name: "deploy with invalid file", args: []string{"deploy", invalidFile}, wantCode: exitError, wantStderr: "must include a tag"},
 		{
 			name:       "deploy without docker",
 			args:       []string{"deploy", validFile},
-			setup:      func(h *harness) { h.connectErr = errors.New("docker is down") },
+			setup:      func(h *harness) { h.ConnectErr = servertest.ErrDockerDown },
 			wantCode:   exitError,
-			wantStderr: "docker is down",
+			wantStderr: "connect to docker (is it running?)",
 		},
 		{
-			name:       "deploy dry run works without docker",
+			name:       "deploy dry run",
 			args:       []string{"deploy", "--dry-run", validFile},
-			setup:      func(h *harness) { h.connectErr = errors.New("docker is down") },
 			wantCode:   exitOK,
 			wantStdout: "==> [5/5] Remove previous containers of orders-api",
 		},
@@ -122,16 +115,22 @@ func TestRun(t *testing.T) {
 		{
 			name:       "deploy reports failure",
 			args:       []string{"deploy", validFile},
-			setup:      func(h *harness) { h.fake.PullErr = errors.New("manifest unknown") },
+			setup:      func(h *harness) { h.Engine.PullErr = errors.New("manifest unknown") },
 			wantCode:   exitError,
 			wantStderr: "liman: Pull image ghcr.io/user/orders-api:1.4: manifest unknown",
+		},
+		{
+			name:       "deploy without a proxy says so",
+			args:       []string{"deploy", validFile},
+			wantCode:   exitOK,
+			wantStdout: "No Nginx is configured on the server",
 		},
 
 		{name: "ps with no apps", args: []string{"ps"}, wantCode: exitOK, wantStdout: "No apps."},
 		{
 			name:       "ps",
 			args:       []string{"ps"},
-			setup:      func(h *harness) { h.fake.Add(web) },
+			setup:      func(h *harness) { h.Engine.Add(web) },
 			wantCode:   exitOK,
 			wantStdout: "web  web-r1     web:1.0  running  127.0.0.1:40123  Up 2 minutes",
 		},
@@ -141,8 +140,8 @@ func TestRun(t *testing.T) {
 			name: "logs",
 			args: []string{"logs", "web"},
 			setup: func(h *harness) {
-				h.fake.Add(web)
-				h.fake.LogOutput = "listening on :3000\n"
+				h.Engine.Add(web)
+				h.Engine.LogOutput = "listening on :3000\n"
 			},
 			wantCode:   exitOK,
 			wantStdout: "listening on :3000",
@@ -151,8 +150,8 @@ func TestRun(t *testing.T) {
 			name: "logs with follow flag",
 			args: []string{"logs", "-f", "web"},
 			setup: func(h *harness) {
-				h.fake.Add(web)
-				h.fake.LogOutput = "listening on :3000\n"
+				h.Engine.Add(web)
+				h.Engine.LogOutput = "listening on :3000\n"
 			},
 			wantCode:   exitOK,
 			wantStdout: "listening on :3000",
@@ -164,7 +163,7 @@ func TestRun(t *testing.T) {
 		{
 			name:       "stop",
 			args:       []string{"stop", "web"},
-			setup:      func(h *harness) { h.fake.Add(web) },
+			setup:      func(h *harness) { h.Engine.Add(web) },
 			wantCode:   exitOK,
 			wantStdout: "Stopped and removed web-r1",
 		},
@@ -174,6 +173,30 @@ func TestRun(t *testing.T) {
 		{name: "history when empty", args: []string{"history"}, wantCode: exitOK, wantStdout: "No history yet."},
 		{name: "history with bad limit", args: []string{"history", "-n", "0"}, wantCode: exitUsage, wantStderr: "usage: liman history"},
 		{name: "history with too many arguments", args: []string{"history", "a", "b"}, wantCode: exitUsage, wantStderr: "usage: liman history"},
+
+		{name: "status", args: []string{"status"}, wantCode: exitOK, wantStdout: "Token accepted"},
+		{
+			name:       "status with a rejected token",
+			args:       []string{"status"},
+			setup:      func(h *harness) { h.cli.API = &api.Client{BaseURL: h.URL, Token: "liman_wrong"} },
+			wantCode:   exitError,
+			wantStdout: "is up",
+			wantStderr: "the token was rejected",
+		},
+		{
+			name:       "status when docker is down",
+			args:       []string{"status"},
+			setup:      func(h *harness) { h.ConnectErr = servertest.ErrDockerDown },
+			wantCode:   exitError,
+			wantStderr: "token accepted, but the daemon reports a problem",
+		},
+		{
+			name:       "status when the daemon is unreachable",
+			args:       []string{"status"},
+			setup:      func(h *harness) { h.cli.API = &api.Client{BaseURL: "http://127.0.0.1:1"} },
+			wantCode:   exitError,
+			wantStderr: "is limand running?",
+		},
 	}
 
 	for _, tt := range tests {
@@ -194,9 +217,9 @@ func TestRun(t *testing.T) {
 			if !strings.Contains(h.stderr.String(), tt.wantStderr) {
 				t.Errorf("stderr = %q, want it to contain %q", h.stderr.String(), tt.wantStderr)
 			}
-			// Errors must not leak into stdout, and a failing command must
-			// say something on stderr.
-			if tt.wantStderr == "" && h.stderr.Len() != 0 {
+			// A successful command writes nothing to stderr, and a failing
+			// one always explains itself there.
+			if tt.wantCode == exitOK && h.stderr.Len() != 0 {
 				t.Errorf("unexpected stderr: %q", h.stderr.String())
 			}
 			if tt.wantCode != exitOK && h.stderr.Len() == 0 {
@@ -206,59 +229,31 @@ func TestRun(t *testing.T) {
 	}
 }
 
-func TestLogsShowsNewestContainer(t *testing.T) {
+func TestInvalidFileIsRejectedWithoutTheDaemon(t *testing.T) {
 	h := newHarness(t, "")
-	h.fake.Add(engine.Container{Name: "web-r1", App: "web"})
-	h.fake.Add(engine.Container{Name: "web-r2", App: "web"})
-	h.fake.Add(engine.Container{Name: "other-r9", App: "other"})
+	// An unreachable daemon proves the validation happens locally.
+	h.cli.API = &api.Client{BaseURL: "http://127.0.0.1:1"}
 
-	if code := h.cli.Run(context.Background(), []string{"logs", "web"}); code != exitOK {
-		t.Fatalf("exit code = %d, stderr: %s", code, h.stderr.String())
+	code := h.run("deploy", writeFile(t, invalidDefinition))
+
+	if code != exitError || !strings.Contains(h.stderr.String(), "must include a tag") {
+		t.Errorf("code %d, stderr %q; want the local validation error", code, h.stderr.String())
 	}
-
-	if want := []string{"logs web-r2"}; !equal(h.fake.Calls, want) {
-		t.Errorf("calls = %v, want %v", h.fake.Calls, want)
+	if strings.Contains(h.stderr.String(), "limand") {
+		t.Errorf("the CLI tried to reach the daemon for an invalid file: %q", h.stderr.String())
 	}
 }
 
-func TestStopRemovesAllContainersOfApp(t *testing.T) {
-	h := newHarness(t, "")
-	h.fake.Add(engine.Container{Name: "web-r1", App: "web"})
-	h.fake.Add(engine.Container{Name: "web-r2", App: "web"})
-	h.fake.Add(engine.Container{Name: "other-r9", App: "other"})
-
-	if code := h.cli.Run(context.Background(), []string{"stop", "web"}); code != exitOK {
-		t.Fatalf("exit code = %d, stderr: %s", code, h.stderr.String())
-	}
-
-	if _, ok := h.fake.Containers["other-r9"]; !ok || len(h.fake.Containers) != 1 {
-		t.Errorf("containers = %v, want only other-r9", h.fake.Containers)
-	}
-}
-
-func TestDeployRecordsHistory(t *testing.T) {
+func TestDeployThenHistory(t *testing.T) {
 	h := newHarness(t, "")
 	file := writeFile(t, validDefinition)
 
-	if code := h.cli.Run(context.Background(), []string{"deploy", file}); code != exitOK {
+	if code := h.run("deploy", file); code != exitOK {
 		t.Fatalf("deploy exit code = %d, stderr: %s", code, h.stderr.String())
 	}
 
-	events, err := h.cli.History.Read()
-	if err != nil {
-		t.Fatalf("History.Read() error = %v", err)
-	}
-	if len(events) != 5 {
-		t.Fatalf("history has %d events, want 5", len(events))
-	}
-	first := events[0]
-	if first.App != "orders-api" || first.Action != "run" || !first.OK || first.Release == "" {
-		t.Errorf("first event = %+v, want a successful run for orders-api with a release", first)
-	}
-
-	// The same events must be visible through the history command.
 	h.stdout.Reset()
-	if code := h.cli.Run(context.Background(), []string{"history", "orders-api"}); code != exitOK {
+	if code := h.run("history", "orders-api"); code != exitOK {
 		t.Fatalf("history exit code = %d, stderr: %s", code, h.stderr.String())
 	}
 	out := h.stdout.String()
@@ -267,62 +262,41 @@ func TestDeployRecordsHistory(t *testing.T) {
 	}
 
 	h.stdout.Reset()
-	h.cli.Run(context.Background(), []string{"history", "-n", "2"})
+	h.run("history", "-n", "2")
 	if got := strings.Count(h.stdout.String(), "\n"); got != 3 {
 		t.Errorf("history -n 2 printed %d lines, want header and 2 rows", got)
 	}
 
 	h.stdout.Reset()
-	h.cli.Run(context.Background(), []string{"history", "another-app"})
+	h.run("history", "another-app")
 	if !strings.Contains(h.stdout.String(), "No history yet.") {
 		t.Errorf("history of another app = %q, want it to be empty", h.stdout.String())
 	}
 }
 
-func TestFailedDeployRecordsFailureAndUndo(t *testing.T) {
+func TestFailedDeployShowsRollbackAndHistory(t *testing.T) {
 	h := newHarness(t, "")
-	h.fake.StartState = "exited"
+	h.Engine.StartState = "exited"
 	file := writeFile(t, validDefinition)
 
-	if code := h.cli.Run(context.Background(), []string{"deploy", file}); code != exitError {
+	if code := h.run("deploy", file); code != exitError {
 		t.Fatalf("deploy exit code = %d, want %d", code, exitError)
 	}
-
-	events, err := h.cli.History.Read()
-	if err != nil {
-		t.Fatalf("History.Read() error = %v", err)
+	// The rollback happened on the daemon and must be visible in the
+	// streamed output; the summary goes to stderr.
+	if !strings.Contains(h.stdout.String(), "<== Undo: Start container orders-api-r1") {
+		t.Errorf("stdout does not show the rollback:\n%s", h.stdout.String())
+	}
+	if !strings.Contains(h.stderr.String(), "liman: Health check: container is exited") {
+		t.Errorf("stderr = %q, want the reason", h.stderr.String())
 	}
 
-	var summary []string
-	for _, ev := range events {
-		result := "ok"
-		if !ev.OK {
-			result = "failed"
+	h.stdout.Reset()
+	h.run("history")
+	for _, want := range []string{"FAILED", "undo"} {
+		if !strings.Contains(h.stdout.String(), want) {
+			t.Errorf("history does not contain %q:\n%s", want, h.stdout.String())
 		}
-		summary = append(summary, ev.Action+" "+result)
-	}
-	// pull, port, start succeed; health fails; start is undone.
-	want := []string{"run ok", "run ok", "run ok", "run failed", "undo ok"}
-	if !equal(summary, want) {
-		t.Errorf("history = %v, want %v", summary, want)
-	}
-	if last := events[3]; last.Error == "" {
-		t.Error("the failed event has no error message")
-	}
-}
-
-func TestDryRunRecordsNoHistory(t *testing.T) {
-	h := newHarness(t, "")
-	file := writeFile(t, validDefinition)
-
-	h.cli.Run(context.Background(), []string{"deploy", "--dry-run", file})
-
-	events, err := h.cli.History.Read()
-	if err != nil || len(events) != 0 {
-		t.Errorf("history after dry run = %v, %v; want empty", events, err)
-	}
-	if len(h.fake.Calls) != 0 {
-		t.Errorf("engine calls during dry run = %v, want none", h.fake.Calls)
 	}
 }
 
@@ -339,21 +313,21 @@ func TestStepMode(t *testing.T) {
 		{name: "decline first", stdin: "n\n", wantCode: exitError, wantContainers: 0, wantStderr: "aborted before"},
 		{name: "empty answer means no", stdin: "\n", wantCode: exitError, wantContainers: 0, wantStderr: "aborted before"},
 		{name: "decline after start undoes it", stdin: "y\ny\ny\nn\n", wantCode: exitError, wantContainers: 0, wantStderr: `aborted before "Health check"`},
-		{name: "input ends early", stdin: "y\n", wantCode: exitError, wantContainers: 0, wantStderr: "read answer"},
+		// Input ending is treated as "no" for the pending question.
+		{name: "input ends early", stdin: "y\n", wantCode: exitError, wantContainers: 0, wantStderr: "aborted before"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			h := newHarness(t, tt.stdin)
-			file := writeFile(t, validDefinition)
 
-			code := h.cli.Run(context.Background(), []string{"deploy", "--step", file})
+			code := h.run("deploy", "--step", writeFile(t, validDefinition))
 
 			if code != tt.wantCode {
 				t.Errorf("exit code = %d, want %d (stderr: %s)", code, tt.wantCode, h.stderr.String())
 			}
-			if len(h.fake.Containers) != tt.wantContainers {
-				t.Errorf("%d containers left, want %d", len(h.fake.Containers), tt.wantContainers)
+			if len(h.Engine.Containers) != tt.wantContainers {
+				t.Errorf("%d containers left, want %d", len(h.Engine.Containers), tt.wantContainers)
 			}
 			if !strings.Contains(h.stderr.String(), tt.wantStderr) {
 				t.Errorf("stderr = %q, want it to contain %q", h.stderr.String(), tt.wantStderr)
@@ -365,74 +339,17 @@ func TestStepMode(t *testing.T) {
 	}
 }
 
-func TestHistoryWriteFailureWarnsOnce(t *testing.T) {
+func TestDeployWithProxy(t *testing.T) {
 	h := newHarness(t, "")
-	// A path below a regular file cannot be created.
-	blocker := writeFile(t, "not a directory")
-	h.cli.History = history.Store{Path: filepath.Join(blocker, "history.jsonl")}
-	file := writeFile(t, validDefinition)
+	proxy := h.WithProxy(t, "true")
 
-	code := h.cli.Run(context.Background(), []string{"deploy", file})
-
-	if code != exitOK {
-		t.Errorf("exit code = %d, want the deploy to succeed despite the history failure", code)
-	}
-	if got := strings.Count(h.stderr.String(), "warning: history is not being recorded"); got != 1 {
-		t.Errorf("warning printed %d times, want once:\n%s", got, h.stderr.String())
-	}
-}
-
-// withProxy gives the harness a real nginx.Manager that writes into a
-// temporary directory. Nginx itself is replaced by two stand-ins:
-//
-//   - the test and reload commands are the standard Unix programs true and
-//     false, which do nothing and exit with success or failure;
-//   - a local HTTP server answers the release probe by looking at the files
-//     in the config directory, as an Nginx that reloads instantly would.
-func (h *harness) withProxy(t *testing.T, reloadCommand string) *nginx.Manager {
-	t.Helper()
-
-	confDir := t.TempDir()
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		files, _ := filepath.Glob(filepath.Join(confDir, "*.conf"))
-		for _, file := range files {
-			content, err := os.ReadFile(file)
-			if err == nil && strings.Contains(string(content), "server_name "+r.Host+";") {
-				w.Header().Set(nginx.ReleaseHeader, nginx.ReleaseOf(content))
-				return
-			}
-		}
-		http.NotFound(w, r)
-	}))
-	t.Cleanup(srv.Close)
-
-	m := nginx.New(config.Nginx{
-		ConfDir:       confDir,
-		UpstreamHost:  "127.0.0.1",
-		ProbeAddr:     strings.TrimPrefix(srv.URL, "http://"),
-		TestCommand:   []string{"true"},
-		ReloadCommand: []string{reloadCommand},
-	})
-	h.cli.Proxy = m
-	return m
-}
-
-func TestDeployWithProxyWritesConfig(t *testing.T) {
-	h := newHarness(t, "")
-	proxy := h.withProxy(t, "true")
-	file := writeFile(t, validDefinition)
-
-	if code := h.cli.Run(context.Background(), []string{"deploy", file}); code != exitOK {
+	if code := h.run("deploy", writeFile(t, validDefinition)); code != exitOK {
 		t.Fatalf("exit code = %d, stderr: %s", code, h.stderr.String())
 	}
 
 	conf, err := os.ReadFile(proxy.Path("orders-api"))
-	if err != nil {
-		t.Fatalf("config file was not written: %v", err)
-	}
-	if !strings.Contains(string(conf), "server_name api.example.com;") {
-		t.Errorf("config does not route the domain:\n%s", conf)
+	if err != nil || !strings.Contains(string(conf), "server_name api.example.com;") {
+		t.Errorf("config = %q, %v; want it to route the domain", conf, err)
 	}
 	for _, want := range []string{"==> [6/7] Reload Nginx", "Nginx routes api.example.com to it"} {
 		if !strings.Contains(h.stdout.String(), want) {
@@ -441,89 +358,34 @@ func TestDeployWithProxyWritesConfig(t *testing.T) {
 	}
 }
 
-func TestDeployWithProxyReloadFailureLeavesNothingBehind(t *testing.T) {
+func TestStopWithProxyReportsRemovedConfig(t *testing.T) {
 	h := newHarness(t, "")
-	proxy := h.withProxy(t, "false")
-	file := writeFile(t, validDefinition)
-
-	if code := h.cli.Run(context.Background(), []string{"deploy", file}); code != exitError {
-		t.Fatalf("exit code = %d, want %d", code, exitError)
-	}
-
-	if _, err := os.Stat(proxy.Path("orders-api")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("config file still exists after a failed first deploy (stat error: %v)", err)
-	}
-	if len(h.fake.Containers) != 0 {
-		t.Errorf("%d containers left, want none", len(h.fake.Containers))
-	}
-	if !strings.Contains(h.stderr.String(), "nginx reload failed") {
-		t.Errorf("stderr = %q, want it to explain the reload failure", h.stderr.String())
-	}
-}
-
-func TestDeployWithoutProxySaysSo(t *testing.T) {
-	h := newHarness(t, "")
-	file := writeFile(t, validDefinition)
-
-	h.cli.Run(context.Background(), []string{"deploy", file})
-
-	if !strings.Contains(h.stdout.String(), "No Nginx is configured") {
-		t.Errorf("stdout does not mention the missing proxy:\n%s", h.stdout.String())
-	}
-}
-
-func TestStopRemovesProxyConfig(t *testing.T) {
-	h := newHarness(t, "")
-	proxy := h.withProxy(t, "true")
-	h.fake.Add(engine.Container{Name: "web-r1", App: "web"})
+	proxy := h.WithProxy(t, "true")
+	h.Engine.Add(engine.Container{Name: "web-r1", App: "web"})
 	if err := proxy.Write("web", []byte("server {}\n")); err != nil {
 		t.Fatal(err)
 	}
 
-	if code := h.cli.Run(context.Background(), []string{"stop", "web"}); code != exitOK {
+	if code := h.run("stop", "web"); code != exitOK {
 		t.Fatalf("exit code = %d, stderr: %s", code, h.stderr.String())
 	}
 
-	if _, err := os.Stat(proxy.Path("web")); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("config file still exists after stop (stat error: %v)", err)
-	}
-	if len(h.fake.Containers) != 0 {
-		t.Error("container still exists after stop")
+	want := "Removed Nginx config " + proxy.Path("web") + "\nStopped and removed web-r1\n"
+	if h.stdout.String() != want {
+		t.Errorf("stdout = %q, want %q", h.stdout.String(), want)
 	}
 }
 
-func TestStopKeepsEverythingWhenReloadFails(t *testing.T) {
+func TestInterruptedCommandExplainsItself(t *testing.T) {
 	h := newHarness(t, "")
-	proxy := h.withProxy(t, "false")
-	h.fake.Add(engine.Container{Name: "web-r1", App: "web"})
-	if err := proxy.Write("web", []byte("server {}\n")); err != nil {
-		t.Fatal(err)
-	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // as if Ctrl+C had already been pressed
 
-	if code := h.cli.Run(context.Background(), []string{"stop", "web"}); code != exitError {
-		t.Fatalf("exit code = %d, want %d", code, exitError)
-	}
+	code := h.cli.Run(ctx, []string{"ps"})
 
-	// Nginx is still serving the old config, so the file must be back and
-	// the container it points at must still be running.
-	if conf, _ := os.ReadFile(proxy.Path("web")); string(conf) != "server {}\n" {
-		t.Errorf("config after failed stop = %q, want the original restored", conf)
+	if code != exitError || !strings.Contains(h.stderr.String(), "interrupted") {
+		t.Errorf("code %d, stderr %q; want an interruption message", code, h.stderr.String())
 	}
-	if len(h.fake.Containers) != 1 {
-		t.Error("container was removed although the proxy still routes to it")
-	}
-}
-
-func equal(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // writeFile creates an app.yaml in a temporary directory that the testing

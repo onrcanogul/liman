@@ -16,8 +16,21 @@ import (
 
 // Config is the content of config.yaml in liman's home directory.
 type Config struct {
-	Nginx Nginx `yaml:"nginx"`
+	Daemon Daemon `yaml:"daemon"`
+	Nginx  Nginx  `yaml:"nginx"`
 }
+
+// Daemon configures limand itself.
+type Daemon struct {
+	// Listen is the address the API is served on. It defaults to the
+	// loopback interface. On a server it is set to the WireGuard address;
+	// it must never be a public one, because the API is plain HTTP and
+	// controls Docker.
+	Listen string `yaml:"listen"`
+}
+
+// DefaultListen is used when daemon.listen is not set.
+const DefaultListen = "127.0.0.1:7070"
 
 // Nginx describes how liman manages the reverse proxy. The zero value
 // means "no proxy": apps are then only reachable on their loopback port.
@@ -61,7 +74,9 @@ func (n Nginx) Enabled() bool {
 func Load(path string) (Config, error) {
 	data, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return Config{}, nil
+		var cfg Config
+		cfg.applyDefaults()
+		return cfg, nil
 	}
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
@@ -88,6 +103,10 @@ func Load(path string) (Config, error) {
 // applyDefaults fills in the values that suit an Nginx installed directly
 // on the host, which is the production setup.
 func (c *Config) applyDefaults() {
+	if c.Daemon.Listen == "" {
+		c.Daemon.Listen = DefaultListen
+	}
+
 	n := &c.Nginx
 	if !n.Enabled() {
 		return
@@ -128,4 +147,82 @@ func (c *Config) validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// Home returns the directory liman keeps its files in: $LIMAN_HOME if set,
+// otherwise ~/.liman.
+func Home() string {
+	if dir := os.Getenv("LIMAN_HOME"); dir != "" {
+		return dir
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		// No home directory (unusual, but possible in minimal containers):
+		// fall back to the current directory rather than refusing to run.
+		return ".liman"
+	}
+	return filepath.Join(home, ".liman")
+}
+
+// Client is how the liman CLI reaches a daemon. It lives in its own file,
+// client.yaml, because it belongs to the machine commands are typed on,
+// which is usually not the machine the daemon runs on.
+type Client struct {
+	// URL is the base address of the daemon, e.g. http://127.0.0.1:7070.
+	URL string `yaml:"url"`
+	// Token authenticates the client.
+	Token string `yaml:"token"`
+}
+
+// LoadClient reads client.yaml at path and then applies the environment
+// variables LIMAN_URL and LIMAN_TOKEN, which take precedence. A missing
+// file is not an error.
+func LoadClient(path string) (Client, error) {
+	var c Client
+
+	data, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// Environment variables alone may be enough.
+	case err != nil:
+		return Client{}, fmt.Errorf("read client config: %w", err)
+	default:
+		dec := yaml.NewDecoder(bytes.NewReader(data))
+		dec.KnownFields(true)
+		if err := dec.Decode(&c); err != nil && !errors.Is(err, io.EOF) {
+			return Client{}, fmt.Errorf("%s: parse yaml: %w", path, err)
+		}
+	}
+
+	if v := os.Getenv("LIMAN_URL"); v != "" {
+		c.URL = v
+	}
+	if v := os.Getenv("LIMAN_TOKEN"); v != "" {
+		c.Token = v
+	}
+	if c.URL == "" {
+		c.URL = "http://" + DefaultListen
+	}
+	return c, nil
+}
+
+// SaveClient writes c to path, readable by the owner only because it
+// contains the token.
+func SaveClient(path string, c Client) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create client config directory: %w", err)
+	}
+	data, err := yaml.Marshal(c)
+	if err != nil {
+		return fmt.Errorf("encode client config: %w", err)
+	}
+	// WriteFile only applies the mode when it creates the file. Chmod
+	// covers the case where a more permissive file was already there.
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write client config: %w", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("protect client config: %w", err)
+	}
+	return nil
 }

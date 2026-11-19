@@ -1,4 +1,8 @@
 // Package cli implements the liman command-line interface.
+//
+// The CLI is a client: it reads arguments and files, asks the daemon to do
+// the work over the HTTP API and prints what comes back. It never talks to
+// Docker or Nginx itself.
 package cli
 
 import (
@@ -8,16 +12,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"os"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/app"
 	"github.com/onrcanogul/liman/internal/buildinfo"
-	"github.com/onrcanogul/liman/internal/deploy"
-	"github.com/onrcanogul/liman/internal/engine"
-	"github.com/onrcanogul/liman/internal/history"
-	"github.com/onrcanogul/liman/internal/pipeline"
 )
 
 // Exit codes returned by Run. Following the common Unix convention, 2 means
@@ -42,28 +45,25 @@ Commands:
   logs [-f] <app>      Show the logs of an app (-f keeps following)
   stop <app>           Stop and remove an app
   history [-n N] [app] Show the last N executed steps (default 20)
+  status               Check that the daemon is reachable
   version              Print version information
   help                 Show this help
+
+liman sends these commands to the limand daemon. Its address and token come
+from $LIMAN_HOME/client.yaml (default ~/.liman/client.yaml) or from the
+LIMAN_URL and LIMAN_TOKEN environment variables.
 `
 
 // CLI holds everything a command needs from the outside world. main fills
-// it with the real streams and the real Docker connection; tests fill it
-// with buffers and a fake engine.
+// it with the real streams and a client for the real daemon; tests point
+// the client at a test server.
 type CLI struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
 
-	// Connect returns the container engine. It is a function rather than a
-	// ready-made engine so that commands which do not need Docker (plan,
-	// history, version) work even when Docker is not running.
-	Connect func(ctx context.Context) (engine.Engine, error)
-
-	// History is where executed steps are recorded.
-	History history.Store
-
-	// Proxy manages the reverse proxy. Nil means none is configured.
-	Proxy deploy.Proxy
+	// API is the connection to the daemon.
+	API *api.Client
 }
 
 // Run executes the CLI with the given arguments (without the program name)
@@ -89,7 +89,9 @@ func (c *CLI) Run(ctx context.Context, args []string) int {
 	case "stop":
 		return c.runStop(ctx, rest)
 	case "history":
-		return c.runHistory(rest)
+		return c.runHistory(ctx, rest)
+	case "status":
+		return c.runStatus(ctx, rest)
 	case "version":
 		fmt.Fprintln(c.Stdout, buildinfo.String())
 		return exitOK
@@ -133,87 +135,57 @@ func (c *CLI) runDeploy(ctx context.Context, args []string, planOnly bool) int {
 		return exitUsage
 	}
 
-	// Validate the file before connecting to Docker: a typo in app.yaml
-	// should be reported even when Docker is down.
-	a, err := app.Load(fs.Arg(0))
+	definition, err := os.ReadFile(fs.Arg(0))
 	if err != nil {
-		return c.fail(err)
+		return c.fail(fmt.Errorf("read app definition: %w", err))
+	}
+	// Validate locally before going to the network: a typo in app.yaml is
+	// reported at once, even when the daemon is unreachable. The daemon
+	// validates again, because it cannot trust its clients.
+	a, err := app.Parse(definition)
+	if err != nil {
+		return c.fail(fmt.Errorf("%s: %w", fs.Arg(0), err))
 	}
 
-	var eng engine.Engine
-	opts := deploy.Options{DryRun: *dryRun}
-
+	opts := api.DeployOptions{DryRun: *dryRun}
+	if *stepMode {
+		opts.Confirm = c.confirm()
+	}
 	if *dryRun {
 		fmt.Fprintf(c.Stdout, "Dry run for %s: nothing will be changed.\n\n", a.Name)
-	} else {
-		// A dry run needs no engine, so Docker is only contacted here.
-		if eng, err = c.Connect(ctx); err != nil {
-			return c.fail(err)
-		}
-		opts.OnEvent = c.recordEvent(a.Name)
-		if *stepMode {
-			opts.Confirm = c.confirm()
-		}
 	}
 
-	deployer := deploy.New(eng, c.Stdout)
-	deployer.Proxy = c.Proxy
-
-	res, err := deployer.Deploy(ctx, a, opts)
+	// The daemon's progress output is copied to stdout as it arrives.
+	res, err := c.API.Deploy(ctx, definition, opts, c.Stdout)
 	if err != nil {
+		// The details were already streamed; the summary is enough here.
+		if errors.Is(err, api.ErrDeployFailed) && res != nil {
+			fmt.Fprintf(c.Stderr, "liman: %s\n", res.Error)
+			return exitError
+		}
 		return c.fail(err)
 	}
 
-	if *dryRun {
+	if res.DryRun {
 		return exitOK
 	}
 
-	fmt.Fprintf(c.Stdout, "\n%s is running at http://127.0.0.1:%d (release %s)\n", a.Name, res.HostPort, res.Release)
-	if c.Proxy != nil {
-		fmt.Fprintf(c.Stdout, "Nginx routes %s to it\n", a.Domain)
+	fmt.Fprintf(c.Stdout, "\n%s is running on the server at 127.0.0.1:%d (release %s)\n", res.App, res.HostPort, res.Release)
+	if res.Routed {
+		fmt.Fprintf(c.Stdout, "Nginx routes %s to it\n", res.Domain)
 	} else {
-		fmt.Fprintln(c.Stdout, "No Nginx is configured, so it is only reachable on that address")
+		fmt.Fprintln(c.Stdout, "No Nginx is configured on the server, so it is only reachable on that address")
 	}
 	return exitOK
 }
 
-// recordEvent returns the callback that writes pipeline events of one app
-// to the history.
-func (c *CLI) recordEvent(appName string) func(release string, ev pipeline.Event) {
-	// warned is captured by the closure below and keeps its value between
-	// calls, so the warning is printed once instead of once per step.
-	warned := false
-
-	return func(release string, ev pipeline.Event) {
-		rec := history.Event{
-			Time:       ev.Started,
-			App:        appName,
-			Release:    release,
-			Step:       ev.Step,
-			Action:     string(ev.Action),
-			OK:         ev.Err == nil,
-			DurationMS: ev.Duration.Milliseconds(),
-		}
-		if ev.Err != nil {
-			rec.Error = ev.Err.Error()
-		}
-
-		// Failing to write the record must not fail a deploy that is
-		// otherwise fine, but it must not go unnoticed either.
-		if err := c.History.Append(rec); err != nil && !warned {
-			warned = true
-			fmt.Fprintf(c.Stderr, "liman: warning: history is not being recorded: %v\n", err)
-		}
-	}
-}
-
 // confirm returns the callback that asks the user before each step.
-func (c *CLI) confirm() func(pipeline.Step) (bool, error) {
+func (c *CLI) confirm() func(step string) (bool, error) {
 	// One reader for all questions: a bufio.Reader may read ahead, so
 	// creating a new one per question could lose input.
 	in := bufio.NewReader(c.Stdin)
 
-	return func(pipeline.Step) (bool, error) {
+	return func(string) (bool, error) {
 		fmt.Fprint(c.Stdout, "    Run this step? [y/N] ")
 
 		line, err := in.ReadString('\n')
@@ -234,12 +206,7 @@ func (c *CLI) runPs(ctx context.Context, args []string) int {
 		return c.usageError("liman ps")
 	}
 
-	eng, err := c.Connect(ctx)
-	if err != nil {
-		return c.fail(err)
-	}
-
-	containers, err := eng.List(ctx)
+	containers, err := c.API.Apps(ctx)
 	if err != nil {
 		return c.fail(err)
 	}
@@ -257,7 +224,7 @@ func (c *CLI) runPs(ctx context.Context, args []string) int {
 		if ctr.HostPort != 0 {
 			address = fmt.Sprintf("127.0.0.1:%d", ctr.HostPort)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", ctr.App, ctr.Name, ctr.Image, ctr.State, address, ctr.Status)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", ctr.App, ctr.Container, ctr.Image, ctr.State, address, ctr.Status)
 	}
 	if err := w.Flush(); err != nil {
 		return c.fail(err)
@@ -273,18 +240,9 @@ func (c *CLI) runLogs(ctx context.Context, args []string) int {
 	if err := fs.Parse(args); err != nil || fs.NArg() != 1 {
 		return c.usageError("liman logs [-f] <app>")
 	}
+
 	// fs.Arg(0) is the first argument that is not a flag.
-	appName := fs.Arg(0)
-
-	eng, containers, err := c.containersOf(ctx, appName)
-	if err != nil {
-		return c.fail(err)
-	}
-	// The list is ordered oldest first; the newest container is the one
-	// whose logs are interesting.
-	newest := containers[len(containers)-1]
-
-	err = eng.Logs(ctx, newest.Name, *follow, c.Stdout, c.Stderr)
+	err := c.API.Logs(ctx, fs.Arg(0), *follow, c.Stdout)
 	// Pressing Ctrl+C while following cancels ctx. That is the normal way
 	// to stop following, not a failure.
 	if err != nil && ctx.Err() == nil {
@@ -297,83 +255,22 @@ func (c *CLI) runStop(ctx context.Context, args []string) int {
 	if len(args) != 1 {
 		return c.usageError("liman stop <app>")
 	}
-	appName := args[0]
 
-	eng, containers, err := c.containersOf(ctx, appName)
+	res, err := c.API.Stop(ctx, args[0])
 	if err != nil {
 		return c.fail(err)
 	}
 
-	// Take the app out of the proxy first. The other way round there would
-	// be a moment in which Nginx forwards requests to a container that is
-	// already gone.
-	if c.Proxy != nil {
-		if err := c.unroute(ctx, appName); err != nil {
-			return c.fail(err)
-		}
+	if res.ProxyConfig != "" {
+		fmt.Fprintf(c.Stdout, "Removed Nginx config %s\n", res.ProxyConfig)
 	}
-
-	for _, ctr := range containers {
-		if err := eng.Remove(ctx, ctr.Name); err != nil {
-			return c.fail(err)
-		}
-		fmt.Fprintf(c.Stdout, "Stopped and removed %s\n", ctr.Name)
+	for _, name := range res.Removed {
+		fmt.Fprintf(c.Stdout, "Stopped and removed %s\n", name)
 	}
 	return exitOK
 }
 
-// unroute removes the app's proxy config and reloads Nginx. If the reload
-// cannot be done the config is put back, so the file on disk keeps matching
-// what Nginx is actually serving.
-func (c *CLI) unroute(ctx context.Context, appName string) error {
-	old, err := c.Proxy.Current(appName)
-	if err != nil {
-		return err
-	}
-	if old == nil {
-		return nil // never routed, nothing to do
-	}
-
-	if err := c.Proxy.Restore(appName, nil); err != nil {
-		return err
-	}
-
-	err = c.Proxy.Test(ctx)
-	if err == nil {
-		err = c.Proxy.Reload(ctx)
-	}
-	if err != nil {
-		// errors.Join keeps both: why the reload failed and, if it also
-		// happened, why the file could not be put back.
-		return errors.Join(err, c.Proxy.Restore(appName, old))
-	}
-
-	fmt.Fprintf(c.Stdout, "Removed Nginx config %s\n", c.Proxy.Path(appName))
-	return nil
-}
-
-// containersOf connects to the engine and returns the containers of an app.
-// It fails with engine.ErrNotFound when the app has none, so callers can
-// rely on the slice being non-empty.
-func (c *CLI) containersOf(ctx context.Context, appName string) (engine.Engine, []engine.Container, error) {
-	eng, err := c.Connect(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	all, err := eng.List(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	containers := engine.ForApp(all, appName)
-	if len(containers) == 0 {
-		return nil, nil, fmt.Errorf("%s: %w", appName, engine.ErrNotFound)
-	}
-	return eng, containers, nil
-}
-
-func (c *CLI) runHistory(args []string) int {
+func (c *CLI) runHistory(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("history", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	limit := fs.Int("n", 20, "number of entries to show")
@@ -381,32 +278,15 @@ func (c *CLI) runHistory(args []string) int {
 	if err := fs.Parse(args); err != nil || fs.NArg() > 1 || *limit < 1 {
 		return c.usageError("liman history [-n N] [app]")
 	}
-	appName := fs.Arg(0) // empty when no app was given
 
-	events, err := c.History.Read()
+	// fs.Arg(0) is empty when no app was given, which means "all apps".
+	events, err := c.API.History(ctx, fs.Arg(0), *limit)
 	if err != nil {
 		return c.fail(err)
 	}
-
-	if appName != "" {
-		// Filter in place: kept reuses the backing array of events, which
-		// is safe because the write index never overtakes the read index.
-		kept := events[:0]
-		for _, ev := range events {
-			if ev.App == appName {
-				kept = append(kept, ev)
-			}
-		}
-		events = kept
-	}
-
 	if len(events) == 0 {
 		fmt.Fprintln(c.Stdout, "No history yet.")
 		return exitOK
-	}
-	// Keep only the newest entries.
-	if len(events) > *limit {
-		events = events[len(events)-*limit:]
 	}
 
 	w := tabwriter.NewWriter(c.Stdout, 0, 0, 2, ' ', 0)
@@ -428,8 +308,46 @@ func (c *CLI) runHistory(args []string) int {
 	return exitOK
 }
 
+// runStatus checks the two things that can be wrong on the client side:
+// the address and the token.
+func (c *CLI) runStatus(ctx context.Context, args []string) int {
+	if len(args) != 0 {
+		return c.usageError("liman status")
+	}
+
+	// The health endpoint needs no token, so this tells "unreachable"
+	// apart from "reachable but not authorised".
+	health, err := c.API.Health(ctx)
+	if err != nil {
+		return c.fail(err)
+	}
+	fmt.Fprintf(c.Stdout, "Daemon at %s is up (version %s)\n", c.API.BaseURL, health.Version)
+
+	if _, err := c.API.Apps(ctx); err != nil {
+		var apiErr *api.Error
+		// errors.As looks for an error of this type in the chain and, if
+		// found, assigns it so its fields can be read.
+		if errors.As(err, &apiErr) && apiErr.Status == http.StatusUnauthorized {
+			fmt.Fprintf(c.Stderr, "liman: the token was rejected: %v\n", err)
+			return exitError
+		}
+		// Reachable and authorised, but something behind the daemon is not
+		// working, typically Docker.
+		fmt.Fprintf(c.Stderr, "liman: token accepted, but the daemon reports a problem: %v\n", err)
+		return exitError
+	}
+	fmt.Fprintln(c.Stdout, "Token accepted")
+	return exitOK
+}
+
 // fail prints err and returns the failure exit code.
 func (c *CLI) fail(err error) int {
+	if errors.Is(err, context.Canceled) {
+		// The daemon notices the closed connection and rolls back on its
+		// own; say so, because the output stopped before showing it.
+		fmt.Fprintln(c.Stderr, "liman: interrupted; if a deploy was running, the daemon is rolling it back (see: liman history)")
+		return exitError
+	}
 	fmt.Fprintf(c.Stderr, "liman: %v\n", err)
 	return exitError
 }

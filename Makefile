@@ -10,8 +10,9 @@ LDFLAGS := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
 
 .PHONY: build test test-integration lint fmt check clean dev-nginx dev-nginx-stop dev-cert
 
-build: ## Build the CLI into bin/liman
+build: ## Build the CLI (bin/liman) and the daemon (bin/limand)
 	go build -ldflags "$(LDFLAGS)" -o bin/liman ./cmd/liman
+	go build -ldflags "$(LDFLAGS)" -o bin/limand ./cmd/limand
 
 test: ## Run all tests with the race detector
 	go test -race ./...

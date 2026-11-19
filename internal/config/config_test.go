@@ -25,6 +25,84 @@ func TestLoadMissingFileDisablesNginx(t *testing.T) {
 	if cfg.Nginx.Enabled() {
 		t.Error("Nginx is enabled without a config file")
 	}
+	if cfg.Daemon.Listen != DefaultListen {
+		t.Errorf("Daemon.Listen = %q, want the loopback default", cfg.Daemon.Listen)
+	}
+}
+
+func TestLoadDaemonListen(t *testing.T) {
+	cfg, err := Load(write(t, "daemon:\n  listen: 10.8.0.1:7070\n"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Daemon.Listen != "10.8.0.1:7070" {
+		t.Errorf("Daemon.Listen = %q, want the configured address", cfg.Daemon.Listen)
+	}
+}
+
+func TestClientConfigRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "client.yaml")
+	want := Client{URL: "http://10.8.0.1:7070", Token: "liman_abc"}
+
+	if err := SaveClient(path, want); err != nil {
+		t.Fatalf("SaveClient() error = %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("file mode = %o, want 600 because the file holds a token", perm)
+	}
+
+	got, err := LoadClient(path)
+	if err != nil || got != want {
+		t.Errorf("LoadClient() = %+v, %v; want %+v", got, err, want)
+	}
+}
+
+func TestSaveClientTightensExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client.yaml")
+	if err := os.WriteFile(path, []byte("url: old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := SaveClient(path, Client{URL: "http://x", Token: "liman_abc"}); err != nil {
+		t.Fatalf("SaveClient() error = %v", err)
+	}
+
+	info, _ := os.Stat(path)
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("file mode = %o, want 600 even though the file existed with 644", perm)
+	}
+}
+
+func TestLoadClientEnvironmentWins(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client.yaml")
+	if err := SaveClient(path, Client{URL: "http://from-file:7070", Token: "liman_file"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LIMAN_URL", "http://from-env:7070")
+	t.Setenv("LIMAN_TOKEN", "liman_env")
+
+	got, err := LoadClient(path)
+
+	want := Client{URL: "http://from-env:7070", Token: "liman_env"}
+	if err != nil || got != want {
+		t.Errorf("LoadClient() = %+v, %v; want %+v", got, err, want)
+	}
+}
+
+func TestLoadClientDefaults(t *testing.T) {
+	t.Setenv("LIMAN_URL", "")
+	t.Setenv("LIMAN_TOKEN", "")
+
+	got, err := LoadClient(filepath.Join(t.TempDir(), "missing.yaml"))
+
+	if err != nil || got.URL != "http://"+DefaultListen || got.Token != "" {
+		t.Errorf("LoadClient() = %+v, %v; want the default URL and no token", got, err)
+	}
 }
 
 func TestLoadEmptyFile(t *testing.T) {

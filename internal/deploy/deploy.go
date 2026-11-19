@@ -103,16 +103,24 @@ type Result struct {
 // out.
 func New(e engine.Engine, out io.Writer) *Deployer {
 	return &Deployer{
-		engine:       e,
-		out:          out,
-		AllocatePort: freePort,
-		Probe:        httpProbe,
-		// The reference time in Go layouts is Mon Jan 2 15:04:05 2006; the
-		// layout below therefore reads as YYYYMMDD-HHMMSS.
-		NewRelease:     func() string { return time.Now().UTC().Format("20060102-150405") },
+		engine:         e,
+		out:            out,
+		AllocatePort:   freePort,
+		Probe:          httpProbe,
+		NewRelease:     timeRelease,
 		HealthTimeout:  30 * time.Second,
 		HealthInterval: 500 * time.Millisecond,
 	}
+}
+
+// timeRelease returns a release identifier derived from the current time,
+// to the millisecond: YYYYMMDD-HHMMSS-mmm. Two deploys of one app never run
+// at the same time, so they cannot land in the same millisecond.
+func timeRelease() string {
+	// The reference time in Go layouts is Mon Jan 2 15:04:05 2006. The
+	// fractional part must follow a dot in the layout; the dot is then
+	// replaced so the result is safe in container names and file names.
+	return strings.Replace(time.Now().UTC().Format("20060102-150405.000"), ".", "-", 1)
 }
 
 // Deploy runs the deploy pipeline for a.
