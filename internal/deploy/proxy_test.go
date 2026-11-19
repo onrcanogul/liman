@@ -146,7 +146,7 @@ func TestDeployWithProxySwitchesTrafficBeforeRemovingPrevious(t *testing.T) {
 		"Health check",
 		"Write Nginx config for api.example.com",
 		"Reload Nginx",
-		"Remove previous containers of orders-api",
+		"Retire previous containers of orders-api",
 	}
 	if !slices.Equal(events, wantSteps) {
 		t.Errorf("steps = %v, want %v", events, wantSteps)
@@ -190,7 +190,7 @@ func TestDeployWithProxyFailureRestoresRouting(t *testing.T) {
 		{
 			name: "user declines the removal of the previous release",
 			opts: Options{Confirm: func(step pipeline.Step) (bool, error) {
-				return !strings.HasPrefix(step.Name, "Remove previous"), nil
+				return !strings.HasPrefix(step.Name, "Retire previous"), nil
 			}},
 			// Traffic had already been switched, so the undo of the reload
 			// step restores the file and reloads; the undo of the write
@@ -275,7 +275,7 @@ func TestDryRunWithProxyShowsDiffAndChangesNothing(t *testing.T) {
     + proxy_pass 127.0.0.1:<free port>;
 ==> [6/7] Reload Nginx
     $ nginx -t && nginx -s reload
-==> [7/7] Remove previous containers of orders-api
+==> [7/7] Retire previous containers of orders-api
 `
 	if !strings.Contains(out.String(), want) {
 		t.Errorf("output does not contain\n%s\ngot\n%s", want, out.String())

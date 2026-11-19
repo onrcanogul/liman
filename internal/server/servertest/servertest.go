@@ -87,6 +87,7 @@ func New(t *testing.T, options ...func(*server.Server)) *Harness {
 			d.NewRelease = func() string { return fmt.Sprintf("r%d", h.releases.Add(1)) }
 			d.HealthTimeout = 100 * time.Millisecond
 			d.HealthInterval = time.Millisecond
+			d.Drain = 0
 			return d
 		},
 	}

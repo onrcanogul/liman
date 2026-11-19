@@ -43,6 +43,9 @@ func newTestDeployer(e engine.Engine, out io.Writer) *Deployer {
 	d.NewRelease = func() string { return "r2" }
 	d.HealthTimeout = 200 * time.Millisecond
 	d.HealthInterval = time.Millisecond
+	// No draining unless a test asks for it; it adds a step.
+	d.Drain = 0
+	d.Sleep = func(context.Context, time.Duration) error { return nil }
 	return d
 }
 
@@ -107,14 +110,14 @@ func TestDeployFirstTime(t *testing.T) {
 	}
 }
 
-func TestDeployRemovesPreviousOnlyAfterNewIsHealthy(t *testing.T) {
+func TestDeployRetiresPreviousOnlyAfterNewIsHealthy(t *testing.T) {
 	fake := withPrevious()
 	d := newTestDeployer(fake, io.Discard)
 
 	// At the moment of the health probe both releases must be running.
 	d.Probe = func(context.Context, string) error {
-		if len(fake.Containers) != 2 {
-			t.Errorf("during health check %d containers exist, want old and new", len(fake.Containers))
+		if got := fake.Running(); len(got) != 2 {
+			t.Errorf("during the health check %v are running, want old and new", got)
 		}
 		return nil
 	}
@@ -123,12 +126,47 @@ func TestDeployRemovesPreviousOnlyAfterNewIsHealthy(t *testing.T) {
 		t.Fatalf("Deploy() error = %v", err)
 	}
 
-	wantCalls := []string{"pull " + testImage, "start " + newContainer, "remove " + prevContainer}
+	wantCalls := []string{"pull " + testImage, "start " + newContainer, "stop " + prevContainer}
 	if !slices.Equal(fake.Calls, wantCalls) {
 		t.Errorf("calls = %v, want %v", fake.Calls, wantCalls)
 	}
-	if _, ok := fake.Containers[newContainer]; !ok || len(fake.Containers) != 1 {
-		t.Errorf("containers = %v, want only %s", fake.Containers, newContainer)
+	// Only the new release runs; the previous one is stopped but kept.
+	if got := fake.Running(); !slices.Equal(got, []string{newContainer}) {
+		t.Errorf("running = %v, want only %s", got, newContainer)
+	}
+	if got := fake.State(prevContainer); got != "exited" {
+		t.Errorf("previous container state = %q, want it stopped and kept for rollback", got)
+	}
+}
+
+func TestDeployKeepsOnlyOnePreviousRelease(t *testing.T) {
+	fake := enginetest.New()
+	// An older stopped release (kept by the deploy before last) and the
+	// release currently in service.
+	fake.Add(engine.Container{Name: "orders-api-r0", App: "orders-api", State: "exited"})
+	fake.Add(engine.Container{Name: prevContainer, App: "orders-api", HostPort: 40000})
+	// A container of another app must not be touched.
+	fake.Add(engine.Container{Name: "other-r9", App: "other"})
+	var out bytes.Buffer
+	d := newTestDeployer(fake, &out)
+
+	if _, err := d.Deploy(context.Background(), testApp(), Options{}); err != nil {
+		t.Fatalf("Deploy() error = %v", err)
+	}
+
+	if got := fake.State("orders-api-r0"); got != "" {
+		t.Errorf("the release before last still exists (state %q), want it removed", got)
+	}
+	if got := fake.State(prevContainer); got != "exited" {
+		t.Errorf("the last release has state %q, want it stopped and kept", got)
+	}
+	if got := fake.State("other-r9"); got != "running" {
+		t.Errorf("a container of another app has state %q, want it untouched", got)
+	}
+	for _, want := range []string{"removed orders-api-r0", "stopped " + prevContainer + " (kept for rollback)"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("output does not contain %q:\n%s", want, out.String())
+		}
 	}
 }
 
@@ -328,8 +366,8 @@ func TestDryRunTouchesNothing(t *testing.T) {
     $ docker run -d --name orders-api-r2 --label liman.app=orders-api -p 127.0.0.1:<free port>:3000 --memory 512m --cpus 0.5 -e API_KEY=*** -e NODE_ENV=*** ghcr.io/user/orders-api:1.4
 ==> [4/5] Health check
     $ curl --fail http://127.0.0.1:<free port>/health
-==> [5/5] Remove previous containers of orders-api
-    $ docker rm -f $(docker ps -aq --filter label=liman.app=orders-api)   # except orders-api-r2
+==> [5/5] Retire previous containers of orders-api
+    $ docker stop <current container of orders-api>   # kept for rollback; older ones are removed
 `
 	if out.String() != want {
 		t.Errorf("output =\n%s\nwant\n%s", out.String(), want)
@@ -363,7 +401,7 @@ func TestDeclinedStepRollsBack(t *testing.T) {
 	// Approve everything up to and including the health check, then decline
 	// the removal of the previous release.
 	opts := Options{Confirm: func(step pipeline.Step) (bool, error) {
-		return !strings.HasPrefix(step.Name, "Remove previous"), nil
+		return !strings.HasPrefix(step.Name, "Retire previous"), nil
 	}}
 
 	_, err := d.Deploy(context.Background(), testApp(), opts)

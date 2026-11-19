@@ -78,7 +78,18 @@ type Deployer struct {
 	HealthTimeout time.Duration
 	// HealthInterval is the pause between health attempts.
 	HealthInterval time.Duration
+
+	// Drain is how long the previous release keeps running after the proxy
+	// has been switched away from it, so that requests it had already
+	// accepted can finish. Zero skips the wait.
+	Drain time.Duration
+	// Sleep waits for d or until ctx is cancelled. Tests replace it.
+	Sleep func(ctx context.Context, d time.Duration) error
 }
+
+// DefaultDrain is how long connections to the previous release are given to
+// finish when nothing else is configured.
+const DefaultDrain = 5 * time.Second
 
 // Options selects how a deploy is executed.
 type Options struct {
@@ -110,6 +121,19 @@ func New(e engine.Engine, out io.Writer) *Deployer {
 		NewRelease:     timeRelease,
 		HealthTimeout:  30 * time.Second,
 		HealthInterval: 500 * time.Millisecond,
+		Drain:          DefaultDrain,
+		Sleep:          sleep,
+	}
+}
+
+// sleep waits for d, returning early with the context's error if ctx is
+// cancelled first.
+func sleep(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
 	}
 }
 
@@ -126,8 +150,10 @@ func timeRelease() string {
 // Deploy runs the deploy pipeline for a.
 //
 // The new release starts next to the previous one, under its own name and
-// port. The previous containers are only removed once the new one is
-// healthy, so a failed deploy leaves the running version untouched.
+// port. The previous one is only retired once the new one is healthy and
+// receiving the traffic, so a failed deploy leaves the running version
+// untouched. Retiring means stopping, not deleting: the container is kept
+// so that Rollback can bring it back.
 func (d *Deployer) Deploy(ctx context.Context, a *app.App, opts Options) (Result, error) {
 	memory, err := a.Resources.MemoryBytes()
 	if err != nil {
@@ -139,7 +165,16 @@ func (d *Deployer) Deploy(ctx context.Context, a *app.App, opts Options) (Result
 
 	// state is shared by the step closures below: one step fills a field
 	// in, a later step reads it.
-	st := &state{app: a, memory: memory, container: res.Container, release: release}
+	st := &state{
+		app:         a,
+		name:        a.Name,
+		domain:      a.Domain,
+		healthPath:  healthPath(a),
+		memoryLimit: a.Resources.Memory,
+		memory:      memory,
+		container:   res.Container,
+		release:     release,
+	}
 
 	popts := pipeline.Options{
 		Out:     d.out,
@@ -156,10 +191,21 @@ func (d *Deployer) Deploy(ctx context.Context, a *app.App, opts Options) (Result
 	return res, err
 }
 
-// state is the data that flows between the steps of one deploy.
+// state is the data that flows between the steps of one deploy or rollback.
 type state struct {
-	app       *app.App
-	memory    int64
+	// app is the definition being deployed. It is nil in a rollback, which
+	// has no definition to work from, only what the container's labels say.
+	app *app.App
+
+	// The fields the steps shared by deploy and rollback need.
+	name        string // app name
+	domain      string
+	healthPath  string // "" if the app has no health check
+	memoryLimit string // as written in the definition, for messages
+
+	memory int64
+	// container is the container being brought into service: the new one
+	// in a deploy, the previous one in a rollback.
 	container string
 	release   string
 
@@ -224,7 +270,8 @@ func (d *Deployer) steps(st *state) []pipeline.Step {
 					MemoryBytes:   st.memory,
 					CPUs:          a.Resources.CPUs,
 					Release:       st.release,
-					HealthPath:    healthPath(a),
+					HealthPath:    st.healthPath,
+					Domain:        a.Domain,
 				})
 				if err != nil {
 					return err
@@ -252,22 +299,37 @@ func (d *Deployer) steps(st *state) []pipeline.Step {
 	}
 
 	// With a proxy, traffic is switched to the new container after it has
-	// proven healthy and before the old containers are removed.
+	// proven healthy, and the previous one is given time to finish the
+	// requests it had already accepted.
 	if d.Proxy != nil {
 		steps = append(steps, d.proxySteps(st)...)
+		if d.Drain > 0 {
+			steps = append(steps, d.drainStep(st))
+		}
 	}
 
-	// The removal is appended last on purpose: it is the one step that
-	// cannot be undone.
 	return append(steps, pipeline.Step{
-		Name:   "Remove previous containers of " + a.Name,
-		Manual: func() string { return removeCommand(st) },
+		Name:   "Retire previous containers of " + a.Name,
+		Manual: func() string { return retireCommand(st) },
 		Run: func(ctx context.Context) error {
 			if len(st.previous) == 0 {
 				d.detail("none (first deploy)")
 				return nil
 			}
-			for _, prev := range st.previous {
+
+			// The list is ordered oldest first, so the last entry is the
+			// release that was serving until a moment ago. It is stopped
+			// but kept: Rollback starts it again. Anything older has been
+			// superseded twice and is removed.
+			last := len(st.previous) - 1
+			for i, prev := range st.previous {
+				if i == last {
+					if err := d.engine.Stop(ctx, prev.Name); err != nil {
+						return err
+					}
+					d.detail("stopped %s (kept for rollback)", prev.Name)
+					continue
+				}
 				if err := d.engine.Remove(ctx, prev.Name); err != nil && !errors.Is(err, engine.ErrNotFound) {
 					return err
 				}
@@ -275,20 +337,42 @@ func (d *Deployer) steps(st *state) []pipeline.Step {
 			}
 			return nil
 		},
-		// No Undo: a removed container cannot be brought back. This is
-		// the point of no return, which is why it is the last step.
+		// No Undo. Nothing follows this step, so there is never anything to
+		// roll back from here; and removing the older containers cannot be
+		// undone in any case.
 	})
 }
 
-// proxySteps returns the two steps that point the domain at the new
-// container.
-func (d *Deployer) proxySteps(st *state) []pipeline.Step {
-	a := st.app
+// drainStep waits while the previous release finishes the requests it had
+// accepted before the proxy was switched.
+//
+// After a reload Nginx sends new requests to the new release, but lets its
+// old worker processes finish the requests they were already handling,
+// against the old release. Stopping that release at once would cut those
+// requests off halfway.
+func (d *Deployer) drainStep(st *state) pipeline.Step {
+	return pipeline.Step{
+		Name:   "Drain connections to the previous release",
+		Manual: func() string { return fmt.Sprintf("sleep %g", d.Drain.Seconds()) },
+		Run: func(ctx context.Context) error {
+			if len(st.previous) == 0 {
+				d.detail("nothing to drain (first deploy)")
+				return nil
+			}
+			d.detail("waiting %s", d.Drain)
+			return d.Sleep(ctx, d.Drain)
+		},
+		// No Undo: waiting changes nothing.
+	}
+}
 
+// proxySteps returns the two steps that point the domain at the container
+// being brought into service. Deploy and rollback share them.
+func (d *Deployer) proxySteps(st *state) []pipeline.Step {
 	return []pipeline.Step{
 		{
-			Name:   "Write Nginx config for " + a.Domain,
-			Manual: func() string { return "$EDITOR " + d.Proxy.Path(a.Name) },
+			Name:   "Write Nginx config for " + st.domain,
+			Manual: func() string { return "$EDITOR " + d.Proxy.Path(st.name) },
 			// The preview is computed when the step is about to run, so in
 			// a real deploy it shows the allocated port and in a dry run a
 			// placeholder.
@@ -296,20 +380,20 @@ func (d *Deployer) proxySteps(st *state) []pipeline.Step {
 			Run: func(context.Context) error {
 				// Keep the old content before overwriting it: it is what
 				// Undo puts back.
-				old, err := d.Proxy.Current(a.Name)
+				old, err := d.Proxy.Current(st.name)
 				if err != nil {
 					return err
 				}
 				st.previousConf = old
 
-				content, err := d.Proxy.Render(a.Name, a.Domain, st.hostPort, st.release)
+				content, err := d.Proxy.Render(st.name, st.domain, st.hostPort, st.release)
 				if err != nil {
 					return err
 				}
-				return d.Proxy.Write(a.Name, content)
+				return d.Proxy.Write(st.name, content)
 			},
 			Undo: func(context.Context) error {
-				return d.Proxy.Restore(a.Name, st.previousConf)
+				return d.Proxy.Restore(st.name, st.previousConf)
 			},
 		},
 		{
@@ -326,16 +410,16 @@ func (d *Deployer) proxySteps(st *state) []pipeline.Step {
 					return err
 				}
 				// The reload command returns before Nginx has switched.
-				// The next step removes the old container, so wait until
-				// Nginx itself reports the new release.
-				return d.Proxy.WaitRelease(ctx, a.Domain, st.release)
+				// The other release is retired next, so wait until Nginx
+				// itself reports the release being brought into service.
+				return d.Proxy.WaitRelease(ctx, st.domain, st.release)
 			},
 			// Undo runs before the undo of the previous step (reverse
 			// order), so it cannot rely on the old file being back yet. It
 			// restores the file itself and then reloads; the later restore
 			// by the previous step is then a harmless repeat.
 			Undo: func(ctx context.Context) error {
-				if err := d.Proxy.Restore(a.Name, st.previousConf); err != nil {
+				if err := d.Proxy.Restore(st.name, st.previousConf); err != nil {
 					return err
 				}
 				if err := d.Proxy.Test(ctx); err != nil {
@@ -344,10 +428,10 @@ func (d *Deployer) proxySteps(st *state) []pipeline.Step {
 				if err := d.Proxy.Reload(ctx); err != nil {
 					return err
 				}
-				// The new container is removed right after this, by the
-				// undo of the start step. Wait until Nginx is back on the
-				// release it served before.
-				return d.Proxy.WaitRelease(ctx, a.Domain, d.Proxy.ReleaseOf(st.previousConf))
+				// The container that was being brought into service goes
+				// away right after this, by the undo of the start step.
+				// Wait until Nginx is back on the release it served before.
+				return d.Proxy.WaitRelease(ctx, st.domain, d.Proxy.ReleaseOf(st.previousConf))
 			},
 		},
 	}
@@ -356,11 +440,11 @@ func (d *Deployer) proxySteps(st *state) []pipeline.Step {
 // previewConf returns the diff between the config on disk and the one that
 // is about to be written.
 func (d *Deployer) previewConf(st *state) string {
-	old, err := d.Proxy.Current(st.app.Name)
+	old, err := d.Proxy.Current(st.name)
 	if err != nil {
 		return fmt.Sprintf("(cannot read the current config: %v)", err)
 	}
-	updated, err := d.Proxy.Render(st.app.Name, st.app.Domain, st.hostPort, st.release)
+	updated, err := d.Proxy.Render(st.name, st.domain, st.hostPort, st.release)
 	if err != nil {
 		return fmt.Sprintf("(cannot render the new config: %v)", err)
 	}
@@ -382,8 +466,8 @@ func (d *Deployer) waitHealthy(ctx context.Context, st *state) error {
 	defer cancel()
 
 	url := ""
-	if st.app.Healthcheck != nil {
-		url = health.URL(st.hostPort, st.app.Healthcheck.Path)
+	if st.healthPath != "" {
+		url = health.URL(st.hostPort, st.healthPath)
 		d.detail("GET %s", url)
 	} else {
 		d.detail("no healthcheck defined; checking that the container stays up")
@@ -399,7 +483,11 @@ func (d *Deployer) waitHealthy(ctx context.Context, st *state) error {
 		}
 		if !ctr.Running() {
 			if ctr.OOMKilled {
-				return fmt.Errorf("container was killed for exceeding its memory limit (%s)", st.app.Resources.Memory)
+				limit := ""
+				if st.memoryLimit != "" {
+					limit = " (" + st.memoryLimit + ")"
+				}
+				return fmt.Errorf("container was killed for exceeding its memory limit%s", limit)
 			}
 			return fmt.Errorf("container is %s (exit code %d)", ctr.State, ctr.ExitCode)
 		}
@@ -483,28 +571,34 @@ func runCommand(st *state) string {
 }
 
 func healthCommand(st *state) string {
-	if st.app.Healthcheck == nil {
+	if st.healthPath == "" {
 		return "docker inspect --format '{{.State.Status}}' " + st.container
 	}
 	port := "<free port>"
 	if st.hostPort != 0 {
 		port = fmt.Sprint(st.hostPort)
 	}
-	return fmt.Sprintf("curl --fail http://127.0.0.1:%s%s", port, st.app.Healthcheck.Path)
+	return fmt.Sprintf("curl --fail http://127.0.0.1:%s%s", port, st.healthPath)
 }
 
-func removeCommand(st *state) string {
+// retireCommand returns the commands equivalent to the retire step.
+func retireCommand(st *state) string {
 	if len(st.previous) == 0 {
 		// In a dry run nothing has been listed yet, so the names are not
-		// known; describe how they would be found instead.
-		return fmt.Sprintf("docker rm -f $(docker ps -aq --filter label=%s=%s)   # except %s",
-			engine.LabelApp, st.app.Name, st.container)
+		// known; describe what would happen instead.
+		return fmt.Sprintf("docker stop <current container of %s>   # kept for rollback; older ones are removed", st.name)
 	}
-	names := make([]string, len(st.previous))
-	for i, prev := range st.previous {
-		names[i] = prev.Name
+
+	last := len(st.previous) - 1
+	cmd := "docker stop " + st.previous[last].Name
+	if last > 0 {
+		names := make([]string, last)
+		for i, prev := range st.previous[:last] {
+			names[i] = prev.Name
+		}
+		cmd += " && docker rm -f " + strings.Join(names, " ")
 	}
-	return "docker rm -f " + strings.Join(names, " ")
+	return cmd
 }
 
 // freePort asks the operating system for an unused port by listening on

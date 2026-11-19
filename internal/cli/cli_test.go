@@ -104,7 +104,7 @@ func TestRun(t *testing.T) {
 			name:       "deploy dry run",
 			args:       []string{"deploy", "--dry-run", validFile},
 			wantCode:   exitOK,
-			wantStdout: "==> [5/5] Remove previous containers of orders-api",
+			wantStdout: "==> [5/5] Retire previous containers of orders-api",
 		},
 		{
 			name:       "deploy rejects dry run with step",

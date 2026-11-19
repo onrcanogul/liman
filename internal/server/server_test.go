@@ -134,7 +134,7 @@ func TestDeployStreamsOutputAndRecordsEverything(t *testing.T) {
 	if !res.OK || res.App != "orders-api" || res.HostPort != 40001 || res.Release == "" || res.Routed {
 		t.Errorf("result = %+v", res)
 	}
-	for _, want := range []string{"==> [1/5] Pull image ghcr.io/user/orders-api:1.4", "==> [5/5] Remove previous containers of orders-api"} {
+	for _, want := range []string{"==> [1/5] Pull image ghcr.io/user/orders-api:1.4", "==> [5/5] Retire previous containers of orders-api"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("output does not contain %q:\n%s", want, out.String())
 		}
@@ -431,7 +431,7 @@ func TestClientDisconnectRollsBack(t *testing.T) {
 	// would. By then the new container has been started.
 	clientCtx, cancel := context.WithCancel(ctx())
 	opts := api.DeployOptions{Confirm: func(step string) (bool, error) {
-		if strings.HasPrefix(step, "Remove previous") {
+		if strings.HasPrefix(step, "Retire previous") {
 			cancel()
 			return false, clientCtx.Err()
 		}
