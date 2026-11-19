@@ -31,6 +31,9 @@ var loopback = netip.MustParseAddr("127.0.0.1")
 // Client talks to a Docker daemon.
 type Client struct {
 	api *client.Client
+
+	// creds finds registry credentials for pulling private images.
+	creds *credentialStore
 }
 
 // This line makes the compiler verify that *Client implements engine.Engine.
@@ -54,12 +57,36 @@ func Connect(ctx context.Context) (*Client, error) {
 		return nil, fmt.Errorf("connect to docker (is it running?): %w", err)
 	}
 
-	return &Client{api: api}, nil
+	return &Client{api: api, creds: newCredentialStore()}, nil
 }
 
 // Pull implements engine.Engine. POST /images/create.
 func (c *Client) Pull(ctx context.Context, image string, progress io.Writer) error {
-	resp, err := c.api.ImagePull(ctx, image, client.ImagePullOptions{})
+	opts := client.ImagePullOptions{}
+
+	// The daemon does not read the user's docker config; that is the
+	// client's job. Without this, a private image fails with "denied" even
+	// though "docker pull" of the same image works.
+	creds, loggedIn, err := c.creds.lookup(ctx, image)
+	if err != nil {
+		return fmt.Errorf("pull %s: look up registry credentials: %w", image, err)
+	}
+	if loggedIn {
+		if opts.RegistryAuth, err = encodeAuth(creds, image); err != nil {
+			return fmt.Errorf("pull %s: encode registry credentials: %w", image, err)
+		}
+		// The user name is not a secret; the password is never printed.
+		fmt.Fprintf(progress, "Authenticating to %s as %s\n", displayHost(image), creds.Username)
+	}
+
+	if err := c.pull(ctx, image, opts, progress); err != nil {
+		return explainPullError(err, image, loggedIn)
+	}
+	return nil
+}
+
+func (c *Client) pull(ctx context.Context, image string, opts client.ImagePullOptions, progress io.Writer) error {
+	resp, err := c.api.ImagePull(ctx, image, opts)
 	if err != nil {
 		return fmt.Errorf("pull %s: %w", image, err)
 	}
@@ -83,6 +110,33 @@ func (c *Client) Pull(ctx context.Context, image string, progress io.Writer) err
 		}
 	}
 	return nil
+}
+
+// explainPullError adds a hint to errors that are about access.
+//
+// Registries deliberately answer "denied" or "not found" for a private image
+// regardless of whether it exists, so the message alone does not tell the
+// user what to do.
+func explainPullError(err error, image string, loggedIn bool) error {
+	msg := strings.ToLower(err.Error())
+	accessProblem := strings.Contains(msg, "denied") || strings.Contains(msg, "unauthorized") ||
+		strings.Contains(msg, "authentication required") || strings.Contains(msg, "no basic auth credentials")
+	if !accessProblem {
+		return err
+	}
+
+	host := registryHost(image)
+	if host == dockerHub {
+		host = "" // "docker login" without an argument means Docker Hub
+	}
+	login := strings.TrimSpace("docker login " + host)
+
+	if loggedIn {
+		return fmt.Errorf("%w\nthe stored credentials for %s were rejected or lack access to this image; log in again with: %s",
+			err, displayHost(image), login)
+	}
+	return fmt.Errorf("%w\nno credentials for %s were found; if the image is private, log in with: %s",
+		err, displayHost(image), login)
 }
 
 // Start implements engine.Engine. POST /containers/create, then

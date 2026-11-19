@@ -150,7 +150,29 @@ make dev-nginx-stop
 ```
 
 liman only lists and touches containers it started itself (label
-`liman.app`). Private registries are not supported yet.
+`liman.app`).
+
+## Private images
+
+liman keeps no registry credentials of its own. It uses the ones `docker
+login` stored, the same way the docker CLI does: from
+`~/.docker/config.json` (or `$DOCKER_CONFIG/config.json`), including
+credential helpers such as the macOS keychain. Log in once:
+
+```
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u <github-user> --password-stdin
+```
+
+For GHCR the token needs the `read:packages` scope. A deploy then shows which
+account it uses, never the secret:
+
+```
+==> [1/5] Pull image ghcr.io/user/orders-api:1.4
+    Authenticating to ghcr.io as user
+```
+
+If a pull is denied, the error says whether no credentials were found or the
+stored ones were rejected.
 
 ## Layout
 
