@@ -72,6 +72,14 @@ type Container struct {
 	Status    string `json:"status"`
 	HostPort  int    `json:"host_port,omitempty"`
 
+	// Release, Domain and Healthcheck are what the container was deployed
+	// with; Created is when it was created. A client that only has the
+	// listing (the panel) could not know them otherwise.
+	Release     string    `json:"release,omitempty"`
+	Domain      string    `json:"domain,omitempty"`
+	Healthcheck string    `json:"healthcheck,omitempty"`
+	Created     time.Time `json:"created"`
+
 	// Role is "current" for the container in service and "previous" for
 	// one that is stopped and kept for a rollback.
 	Role string `json:"role,omitempty"`
@@ -119,4 +127,72 @@ type Event struct {
 type Secret struct {
 	Name      string    `json:"name"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// Release is one entry of GET /v1/releases: a deploy and how it ended.
+type Release struct {
+	App     string `json:"app"`
+	Release string `json:"release"`
+	Image   string `json:"image"`
+	// Status is "succeeded" or "failed".
+	Status     string    `json:"status"`
+	Error      string    `json:"error,omitempty"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at"`
+}
+
+// HealthHistory is the answer to GET /v1/apps/{name}/health: the health
+// checks of an app over a stretch of time, summarised in buckets of equal
+// width.
+type HealthHistory struct {
+	App   string    `json:"app"`
+	Since time.Time `json:"since"`
+	Until time.Time `json:"until"`
+	// BucketSeconds is the width of one bucket.
+	BucketSeconds int `json:"bucket_seconds"`
+	// Buckets is ordered oldest first. A stretch in which the app was not
+	// checked at all has no entry: no data is not the same as healthy.
+	Buckets []HealthBucket `json:"buckets"`
+}
+
+// HealthBucket summarises the health checks within one bucket.
+type HealthBucket struct {
+	Start  time.Time `json:"start"`
+	OK     int       `json:"ok"`
+	Failed int       `json:"failed"`
+	// Probed counts the checks that measured a response time. AvgMS and
+	// MaxMS describe those; they are left out when there were none.
+	Probed int     `json:"probed"`
+	AvgMS  float64 `json:"avg_ms,omitempty"`
+	MaxMS  int64   `json:"max_ms,omitempty"`
+}
+
+// Info is the answer to GET /v1/info: what this daemon is and how it is
+// set up. Unlike GET /v1/health it needs a token.
+type Info struct {
+	Version string `json:"version"`
+	Commit  string `json:"commit"`
+	Built   string `json:"built"`
+
+	// StartedAt is when the daemon started; Now is its clock at the time of
+	// the answer, so a client can tell if its own clock disagrees.
+	StartedAt time.Time `json:"started_at"`
+	Now       time.Time `json:"now"`
+
+	// Proxy says whether the daemon manages a reverse proxy, Secrets whether
+	// it has secret storage.
+	Proxy   bool `json:"proxy"`
+	Secrets bool `json:"secrets"`
+
+	// Monitor describes the health monitor; it is absent when the monitor
+	// is turned off.
+	Monitor *MonitorInfo `json:"monitor,omitempty"`
+}
+
+// MonitorInfo describes the health monitor's settings.
+type MonitorInfo struct {
+	IntervalSeconds  int `json:"interval_seconds"`
+	FailureThreshold int `json:"failure_threshold"`
+	// RetentionSeconds is how long health checks are kept.
+	RetentionSeconds int `json:"retention_seconds"`
 }

@@ -52,6 +52,18 @@ type Server struct {
 	// The last result is false if the monitor knows nothing about it.
 	HealthOf func(app string) (health, detail string, restarts int, ok bool)
 
+	// Monitoring describes the health monitor for GET /v1/info. Nil means
+	// the monitor is turned off.
+	Monitoring *api.MonitorInfo
+
+	// Started is when the daemon started, for GET /v1/info.
+	Started time.Time
+
+	// Panel, when set, serves the web panel under /ui/. Its files are
+	// public: they contain no data, and the page they make up has to ask
+	// the API for everything, with a token, like any other client.
+	Panel http.Handler
+
 	// Secrets holds the apps' secret values, encrypted. Nil means the
 	// daemon has no secret storage; apps that refer to secrets cannot be
 	// deployed then.
@@ -128,6 +140,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/apps/{name}/secrets/{key}", s.handleSecretSet)
 	mux.HandleFunc("DELETE /v1/apps/{name}/secrets/{key}", s.handleSecretDelete)
 	mux.HandleFunc("GET /v1/history", s.handleHistory)
+	mux.HandleFunc("GET /v1/info", s.handleInfo)
+	mux.HandleFunc("GET /v1/releases", s.handleReleases)
+	mux.HandleFunc("GET /v1/apps/{name}/health", s.handleHealthHistory)
 
 	// Middleware wraps the handler from the inside out; a request passes
 	// through the list below from top to bottom. The order is deliberate:
@@ -144,6 +159,32 @@ func (s *Server) Handler() http.Handler {
 	h = s.authenticate(h)
 	h = s.rejectBrowsers(h)
 	h = s.logRequests(h)
+	h = s.limitConcurrency(h)
+	h = s.secureHeaders(h)
+	h = s.recoverPanics(h)
+
+	if s.Panel == nil {
+		return h
+	}
+
+	// The panel sits next to the API, not behind its middleware: its files
+	// must load before anybody has typed a token. Everything that is not
+	// the panel still goes to the API handler, so an unknown path is
+	// answered exactly as it was before the panel existed.
+	root := http.NewServeMux()
+	root.Handle("/", h)
+	root.Handle("/ui/", s.panelHandler())
+	// {$} matches the path "/" and nothing longer.
+	root.Handle("GET /{$}", http.RedirectHandler("/ui/", http.StatusFound))
+	return root
+}
+
+// panelHandler wraps the panel's files in the middleware that still applies
+// to them. They are neither authenticated nor logged: anybody who can reach
+// the daemon can request them, and a log line per request would let that
+// anybody fill the disk.
+func (s *Server) panelHandler() http.Handler {
+	h := http.StripPrefix("/ui", s.Panel)
 	h = s.limitConcurrency(h)
 	h = s.secureHeaders(h)
 	h = s.recoverPanics(h)
@@ -401,7 +442,13 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 			State:     c.State,
 			Status:    c.Status,
 			HostPort:  c.HostPort,
-			Role:      "current",
+
+			Release:     c.Release,
+			Domain:      c.Domain,
+			Healthcheck: c.HealthPath,
+			Created:     c.Created,
+
+			Role: "current",
 		}
 		if current[c.App] != c.Name {
 			entry.Role = "previous"
@@ -499,22 +546,8 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
-	limit := 20
-	if raw := r.URL.Query().Get("limit"); raw != "" {
-		n, err := strconv.Atoi(raw)
-		if err != nil || n < 1 || n > 1000 {
-			writeError(w, http.StatusBadRequest, errors.New("limit must be a number between 1 and 1000"))
-			return
-		}
-		limit = n
-	}
-
-	// The filter is only ever a bound SQL parameter, which is safe with any
-	// value; rejecting impossible names is still clearer than answering
-	// with an empty list.
-	filter := r.URL.Query().Get("app")
-	if filter != "" && !app.ValidName(filter) {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid app name %q", filter))
+	limit, filter, ok := listQuery(w, r)
+	if !ok {
 		return
 	}
 
@@ -533,6 +566,120 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		events = append(events, api.Event(ev))
 	}
 	writeJSON(w, http.StatusOK, events)
+}
+
+// --- read-only views for the panel --------------------------------------------
+
+func (s *Server) handleInfo(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, api.Info{
+		Version:   buildinfo.Version,
+		Commit:    buildinfo.Commit,
+		Built:     buildinfo.Date,
+		StartedAt: s.Started,
+		Now:       time.Now(),
+		Proxy:     s.Proxy != nil,
+		Secrets:   s.Secrets != nil,
+		Monitor:   s.Monitoring,
+	})
+}
+
+func (s *Server) handleReleases(w http.ResponseWriter, r *http.Request) {
+	limit, filter, ok := listQuery(w, r)
+	if !ok {
+		return
+	}
+
+	stored, err := s.Store.Releases(r.Context(), filter, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	releases := make([]api.Release, 0, len(stored))
+	for _, rel := range stored {
+		releases = append(releases, api.Release(rel))
+	}
+	writeJSON(w, http.StatusOK, releases)
+}
+
+// healthRanges are the stretches of time a health history can be asked
+// for, each with the width of one bucket. Every range has 48 buckets.
+//
+// The set is fixed on purpose. A free "from", "to" and "width" would let a
+// client ask for a week in one-second buckets: 600 000 rows of JSON from
+// one cheap request.
+var healthRanges = map[string]time.Duration{
+	"6h":  450 * time.Second,
+	"24h": 30 * time.Minute,
+	"7d":  210 * time.Minute,
+}
+
+const healthBucketCount = 48
+
+func (s *Server) handleHealthHistory(w http.ResponseWriter, r *http.Request) {
+	name, ok := appName(w, r)
+	if !ok {
+		return
+	}
+
+	span := r.URL.Query().Get("range")
+	if span == "" {
+		span = "24h"
+	}
+	width, ok := healthRanges[span]
+	if !ok {
+		writeError(w, http.StatusBadRequest, errors.New("range must be one of 6h, 24h and 7d"))
+		return
+	}
+
+	// The buckets are aligned to the clock, not to the moment of the
+	// request: the last one ends at the next multiple of the width. Asked
+	// again ten seconds later, the same checks fall into the same buckets
+	// and the picture stays still instead of shimmering.
+	until := time.Now().Truncate(width).Add(width)
+	since := until.Add(-healthBucketCount * width)
+
+	stored, err := s.Store.HealthBuckets(r.Context(), name, since, until, width)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	out := api.HealthHistory{
+		App:           name,
+		Since:         since.UTC(),
+		Until:         until.UTC(),
+		BucketSeconds: int(width / time.Second),
+		Buckets:       make([]api.HealthBucket, 0, len(stored)),
+	}
+	for _, b := range stored {
+		out.Buckets = append(out.Buckets, api.HealthBucket(b))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// listQuery reads the "limit" and "app" parameters shared by the listings.
+// If one is invalid it answers 400 and returns false.
+func listQuery(w http.ResponseWriter, r *http.Request) (limit int, filter string, ok bool) {
+	limit = 20
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 || n > 1000 {
+			writeError(w, http.StatusBadRequest, errors.New("limit must be a number between 1 and 1000"))
+			return 0, "", false
+		}
+		limit = n
+	}
+
+	// The filter is only ever a bound SQL parameter, which is safe with any
+	// value; rejecting impossible names is still clearer than answering
+	// with an empty list.
+	filter = r.URL.Query().Get("app")
+	if filter != "" && !app.ValidName(filter) {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid app name %q", filter))
+		return 0, "", false
+	}
+	return limit, filter, true
 }
 
 // --- secrets -----------------------------------------------------------------

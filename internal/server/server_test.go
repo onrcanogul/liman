@@ -21,6 +21,7 @@ import (
 
 	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/engine"
+	"github.com/onrcanogul/liman/internal/panel"
 	"github.com/onrcanogul/liman/internal/server"
 	"github.com/onrcanogul/liman/internal/server/servertest"
 	"github.com/onrcanogul/liman/internal/store"
@@ -478,12 +479,24 @@ func TestApps(t *testing.T) {
 		t.Errorf("Apps() with nothing running = %v, %v; want an empty, non-nil list", got, err)
 	}
 
-	h.Engine.Add(engine.Container{Name: "web-r1", App: "web", Image: "web:1.0", Status: "Up 2 minutes", HostPort: 40123})
+	h.Engine.Add(engine.Container{
+		Name: "web-r1", App: "web", Image: "web:1.0", Status: "Up 2 minutes", HostPort: 40123,
+		Release: "r1", Domain: "web.example.com", HealthPath: "/health",
+	})
 
 	got, err = h.Client.Apps(ctx())
-	want := api.Container{App: "web", Container: "web-r1", Image: "web:1.0", State: "running", Status: "Up 2 minutes", HostPort: 40123, Role: "current"}
-	if err != nil || len(got) != 1 || got[0] != want {
-		t.Errorf("Apps() = %+v, %v; want %+v", got, err, want)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("Apps() = %+v, %v; want one container", got, err)
+	}
+	if got[0].Created.IsZero() {
+		t.Error("Apps() reports no creation time")
+	}
+	want := api.Container{
+		App: "web", Container: "web-r1", Image: "web:1.0", State: "running", Status: "Up 2 minutes", HostPort: 40123,
+		Release: "r1", Domain: "web.example.com", Healthcheck: "/health", Created: got[0].Created, Role: "current",
+	}
+	if got[0] != want {
+		t.Errorf("Apps() = %+v, want %+v", got[0], want)
 	}
 
 	h.ConnectErr = servertest.ErrDockerDown
@@ -1430,5 +1443,196 @@ func TestChangedSecretAppliesOnNextDeployOnly(t *testing.T) {
 	}
 	if got := h.Engine.Specs[1].Env["DATABASE_URL"]; got != "new-url" {
 		t.Errorf("the new container has %q, want the new value", got)
+	}
+}
+
+// --- panel and the read-only views behind it ---------------------------------
+
+// plain sends a request without a token and without following redirects.
+func plain(t *testing.T, h *servertest.Harness, path string) *http.Response {
+	t.Helper()
+
+	client := &http.Client{
+		// The default client follows redirects; returning this error makes
+		// it hand back the redirect itself instead.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Get(h.URL + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	return resp
+}
+
+func TestPanelIsServedWithoutATokenAndTheAPIStillNeedsOne(t *testing.T) {
+	h := servertest.New(t, func(s *server.Server) { s.Panel = panel.Handler() })
+
+	if resp := plain(t, h, "/ui/"); resp.StatusCode != http.StatusOK || resp.Header.Get("Content-Security-Policy") == "" {
+		t.Errorf("GET /ui/ = %d (policy %q), want 200 with a content security policy", resp.StatusCode, resp.Header.Get("Content-Security-Policy"))
+	}
+	if resp := plain(t, h, "/ui/app.js"); resp.StatusCode != http.StatusOK || resp.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Errorf("GET /ui/app.js = %d, want 200 with the protective headers", resp.StatusCode)
+	}
+	if resp := plain(t, h, "/"); resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/ui/" {
+		t.Errorf("GET / = %d to %q, want a redirect to /ui/", resp.StatusCode, resp.Header.Get("Location"))
+	}
+
+	// Everything else is exactly as protected as before.
+	for _, path := range []string{"/v1/apps", "/v1/info", "/v1/releases", "/v1/apps/web/health", "/nope", "/uiapp.js"} {
+		if resp := plain(t, h, path); resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("GET %s without a token = %d, want 401", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestLoadingThePanelNeverLocksAClientOut(t *testing.T) {
+	h := servertest.New(t, func(s *server.Server) { s.Panel = panel.Handler() })
+
+	// Far more requests than the failed-authentication limit allows.
+	for range 30 {
+		if resp := plain(t, h, "/ui/"); resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET /ui/ = %d, want 200", resp.StatusCode)
+		}
+	}
+	if _, err := h.Client.Apps(ctx()); err != nil {
+		t.Errorf("Apps() after loading the panel many times error = %v", err)
+	}
+}
+
+func TestWithoutAPanelItsPathIsNothingSpecial(t *testing.T) {
+	h := servertest.New(t)
+
+	if resp := plain(t, h, "/ui/"); resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("GET /ui/ on a server without a panel = %d, want 401 like any unknown path", resp.StatusCode)
+	}
+}
+
+func TestInfo(t *testing.T) {
+	started := time.Now().Add(-time.Hour)
+	h := servertest.New(t, func(s *server.Server) {
+		s.Started = started
+		s.Monitoring = &api.MonitorInfo{IntervalSeconds: 10, FailureThreshold: 3, RetentionSeconds: 604800}
+	})
+
+	info, err := h.Client.Info(ctx())
+	if err != nil {
+		t.Fatalf("Info() error = %v", err)
+	}
+	if !info.StartedAt.Equal(started) || info.Now.Before(started) {
+		t.Errorf("Info() times = started %s, now %s", info.StartedAt, info.Now)
+	}
+	if info.Proxy || !info.Secrets || info.Monitor == nil || info.Monitor.IntervalSeconds != 10 {
+		t.Errorf("Info() = %+v (monitor %+v), want no proxy, secrets and the monitor's settings", info, info.Monitor)
+	}
+	if info.Version == "" {
+		t.Error("Info() reports no version")
+	}
+
+	// Unlike /v1/health this says how the server is set up, so it is not
+	// for everybody.
+	if resp := plain(t, h, "/v1/info"); resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("GET /v1/info without a token = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestReleasesListing(t *testing.T) {
+	h := servertest.New(t)
+
+	if got, err := h.Client.Releases(ctx(), "", 10); err != nil || got == nil || len(got) != 0 {
+		t.Errorf("Releases() with no deploys = %v, %v; want an empty, non-nil list", got, err)
+	}
+
+	for range 2 {
+		if _, err := h.Client.Deploy(ctx(), []byte(definition), api.DeployOptions{}, io.Discard); err != nil {
+			t.Fatalf("Deploy() error = %v", err)
+		}
+	}
+	other := strings.Replace(definition, "orders-api", "web", 2)
+	h.HealthErr = errors.New("503")
+	// A failed deploy comes back as a result and as an error.
+	if res, err := h.Client.Deploy(ctx(), []byte(other), api.DeployOptions{}, io.Discard); err == nil || res == nil || res.OK {
+		t.Fatalf("Deploy() of the failing app = %+v, %v; want a failed deploy", res, err)
+	}
+
+	all, err := h.Client.Releases(ctx(), "", 10)
+	if err != nil || len(all) != 3 {
+		t.Fatalf("Releases() = %+v, %v; want three", all, err)
+	}
+	// Newest first: the failed deploy of the other app.
+	if all[0].App != "web" || all[0].Status != store.StatusFailed || all[0].Error == "" || all[0].FinishedAt.Before(all[0].StartedAt) {
+		t.Errorf("newest release = %+v, want the failed deploy of web", all[0])
+	}
+
+	mine, err := h.Client.Releases(ctx(), "orders-api", 1)
+	if err != nil || len(mine) != 1 || mine[0].Release != "r2" || mine[0].Status != store.StatusSucceeded {
+		t.Errorf("Releases(orders-api, 1) = %+v, %v; want only r2", mine, err)
+	}
+
+	for _, query := range []string{"?limit=0", "?limit=abc", "?limit=100000", "?app=../etc"} {
+		resp := request(t, h, http.MethodGet, "/v1/releases"+query, nil)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("GET /v1/releases%s = %d, want 400", query, resp.StatusCode)
+		}
+	}
+}
+
+func TestHealthHistory(t *testing.T) {
+	h := servertest.New(t)
+	now := time.Now()
+
+	samples := []store.HealthSample{
+		{Time: now, App: "web", OK: true, Probed: true, Duration: 4 * time.Millisecond},
+		{Time: now, App: "web", OK: false, Probed: true, Duration: 8 * time.Millisecond},
+		// Older than the six hours asked for below, and another app.
+		{Time: now.Add(-7 * time.Hour), App: "web", OK: false},
+		{Time: now, App: "api", OK: false},
+	}
+	for _, sample := range samples {
+		if err := h.Store.AppendHealthSample(ctx(), sample); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := h.Client.HealthHistory(ctx(), "web", "6h")
+	if err != nil {
+		t.Fatalf("HealthHistory() error = %v", err)
+	}
+	if got.App != "web" || got.BucketSeconds != 450 {
+		t.Errorf("HealthHistory() = app %q, %ds buckets; want web and 450s", got.App, got.BucketSeconds)
+	}
+	// 48 buckets, the last of which contains this moment.
+	if span := got.Until.Sub(got.Since); span != 6*time.Hour || now.Before(got.Since) || !now.Before(got.Until) {
+		t.Errorf("HealthHistory() covers %s to %s, want six hours around now", got.Since, got.Until)
+	}
+	if len(got.Buckets) != 1 {
+		t.Fatalf("HealthHistory() buckets = %+v, want one", got.Buckets)
+	}
+	b := got.Buckets[0]
+	if b.OK != 1 || b.Failed != 1 || b.Probed != 2 || b.AvgMS != 6 || b.MaxMS != 8 {
+		t.Errorf("bucket = %+v, want 1 ok, 1 failed, average 6 ms, slowest 8 ms", b)
+	}
+	if b.Start.Before(got.Since) || !b.Start.Before(got.Until) || b.Start.Sub(got.Since)%(450*time.Second) != 0 {
+		t.Errorf("bucket starts at %s, want a multiple of the width after %s", b.Start, got.Since)
+	}
+
+	// An app nobody has checked: an empty list, not an error.
+	none, err := h.Client.HealthHistory(ctx(), "unknown", "7d")
+	if err != nil || none.Buckets == nil || len(none.Buckets) != 0 || none.BucketSeconds != 12600 {
+		t.Errorf("HealthHistory() of an unknown app = %+v, %v; want no buckets", none, err)
+	}
+
+	for path, want := range map[string]int{
+		"/v1/apps/web/health":            http.StatusOK, // the range has a default
+		"/v1/apps/web/health?range=1s":   http.StatusBadRequest,
+		"/v1/apps/web/health?range=900d": http.StatusBadRequest,
+		"/v1/apps/WEB/health?range=6h":   http.StatusBadRequest,
+	} {
+		resp := request(t, h, http.MethodGet, path, nil)
+		_ = resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("GET %s = %d, want %d", path, resp.StatusCode, want)
+		}
 	}
 }

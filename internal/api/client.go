@@ -195,6 +195,38 @@ func (c *Client) History(ctx context.Context, app string, limit int) ([]Event, e
 	return out, err
 }
 
+// Releases returns the newest limit deploys, newest first. An empty app
+// returns the deploys of all apps.
+func (c *Client) Releases(ctx context.Context, app string, limit int) ([]Release, error) {
+	query := url.Values{"limit": {strconv.Itoa(limit)}}
+	if app != "" {
+		query.Set("app", app)
+	}
+
+	var out []Release
+	err := c.getJSON(ctx, "/v1/releases", query, &out)
+	return out, err
+}
+
+// HealthHistory returns the health checks of app over the given range,
+// which is one of "6h", "24h" and "7d".
+func (c *Client) HealthHistory(ctx context.Context, app, span string) (*HealthHistory, error) {
+	var out HealthHistory
+	if err := c.getJSON(ctx, "/v1/apps/"+url.PathEscape(app)+"/health", url.Values{"range": {span}}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Info describes the daemon.
+func (c *Client) Info(ctx context.Context) (*Info, error) {
+	var out Info
+	if err := c.getJSON(ctx, "/v1/info", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // SetSecret stores value as the secret name of app.
 func (c *Client) SetSecret(ctx context.Context, app, name string, value []byte) error {
 	// The value travels in the request body, never in the URL: URLs end up
