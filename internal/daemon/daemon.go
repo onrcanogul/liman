@@ -48,7 +48,7 @@ liman CLI asks for.
 
 Usage:
   limand                          Serve the API (same as "limand serve")
-  limand token create <name> [--read-only] [--expires <90d|12h>]
+  limand token create <name> [--read-only | --deploy] [--expires <90d|12h>]
                       [--app <app>]... [--write-client <file>] [--url <url>]
                                   Create an API token. It is printed once, or
                                   with --write-client written to a client.yaml
@@ -58,7 +58,11 @@ Usage:
                                   after that many days or hours; without, it
                                   works until it is revoked. With --app it
                                   sees and acts on those apps only, and
-                                  nothing about the daemon as a whole
+                                  nothing about the daemon as a whole. A
+                                  --deploy token (a deploy key, for a CI
+                                  pipeline) needs --app and can do one
+                                  thing: trigger deploys of those apps on
+                                  the hooks.listen endpoint
   limand token list               List tokens, when they expire and were last used
   limand token revoke <name>      Revoke a token
   limand audit verify             Check the audit trail: that no entry was
@@ -122,6 +126,9 @@ type Daemon struct {
 	// Ready, when set, is called with the address the server listens on
 	// once it accepts connections. Tests use it to learn the port.
 	Ready func(addr string)
+	// HooksReady is Ready for the trigger endpoint, when hooks.listen
+	// turns it on. It is called before Ready.
+	HooksReady func(addr string)
 
 	// AuditAnchor receives a line for every audit record a limand command
 	// adds (the daemon's own go to its log): the system log in production,
@@ -292,50 +299,53 @@ func (d *Daemon) serve(ctx context.Context) int {
 	if err != nil {
 		return d.fail(fmt.Errorf("listen on %s: %w", cfg.Daemon.Listen, err))
 	}
+	httpServer := newHTTPServer(srv.Handler())
 
-	httpServer := &http.Server{
-		Handler: srv.Handler(),
-
-		// Each limit below closes a way of tying up the daemon without
-		// being authenticated.
-		//
-		// A client that opens a connection and never finishes its headers
-		// would otherwise hold it, and a goroutine, forever (the attack is
-		// known as Slowloris).
-		ReadHeaderTimeout: 10 * time.Second,
-		// The default allows a megabyte of headers per request.
-		MaxHeaderBytes: 16 << 10,
-		// Connections kept open between requests are closed when idle.
-		IdleTimeout: 2 * time.Minute,
-
-		// There is deliberately no ReadTimeout and no WriteTimeout. Both
-		// are measured from the start of a request and would cut off a
-		// deploy or a followed log that is working as intended. Slow
-		// request bodies are limited per handler instead (server.readBody).
+	// The trigger endpoint, when turned on, is a second server on a
+	// listener of its own, with the same limits and the same shutdown.
+	var hookServer *http.Server
+	var hookListener net.Listener
+	if cfg.Hooks.Enabled() {
+		if hookListener, err = net.Listen("tcp", cfg.Hooks.Listen); err != nil {
+			_ = listener.Close()
+			return d.fail(fmt.Errorf("listen on %s (hooks.listen): %w", cfg.Hooks.Listen, err))
+		}
+		hookServer = newHTTPServer(srv.HookHandler())
 	}
 
 	if tokens, err := st.Tokens(ctx); err == nil && len(tokens) == 0 {
 		log.Warn("no API tokens exist yet; create one with: limand token create <name>")
 	}
+	hooksAddr := ""
+	if hookListener != nil {
+		hooksAddr = hookListener.Addr().String()
+	}
 	log.Info("limand started",
 		"listen", listener.Addr().String(),
+		"hooks", hooksAddr,
 		"version", buildinfo.Version,
 		"nginx", cfg.Nginx.Enabled(),
 		"acme", cfg.ACME.Enabled(),
 		"monitor", !cfg.Monitor.Disabled,
 		"panel", !cfg.Panel.Disabled,
 	)
+	if d.HooksReady != nil && hookListener != nil {
+		d.HooksReady(hooksAddr)
+	}
 	if d.Ready != nil {
 		d.Ready(listener.Addr().String())
 	}
 
-	// Serve blocks, so it runs in its own goroutine and reports its result
-	// on a channel. The buffer of one lets that goroutine finish even if
-	// nobody is receiving any more.
-	serveErr := make(chan error, 1)
+	// Serve blocks, so each server runs in its own goroutine and reports
+	// its result on a channel. The buffer lets those goroutines finish
+	// even if nobody is receiving any more.
+	serveErr := make(chan error, 2)
 	go func() { serveErr <- httpServer.Serve(listener) }()
+	if hookServer != nil {
+		go func() { serveErr <- hookServer.Serve(hookListener) }()
+	}
 
-	// Wait for whichever happens first: the server failing on its own, or
+	// Wait for whichever happens first: a server failing on its own, or
 	// a request to stop (ctx is cancelled on SIGINT and SIGTERM).
 	select {
 	case err := <-serveErr:
@@ -366,18 +376,50 @@ func (d *Daemon) serve(ctx context.Context) int {
 
 	// Shutdown stops accepting new connections and waits for running
 	// requests to finish. A deploy in progress therefore completes (or
-	// rolls back) instead of being cut off halfway.
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		return d.fail(fmt.Errorf("shutdown: %w", err))
+	// rolls back) instead of being cut off halfway. The trigger endpoint
+	// goes first: no new deploy should arrive from outside while the API
+	// is draining.
+	servers := []*http.Server{httpServer}
+	if hookServer != nil {
+		servers = []*http.Server{hookServer, httpServer}
 	}
-	// After Shutdown, Serve returns http.ErrServerClosed; that is the
-	// expected way for it to end.
-	if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return d.fail(err)
+	for _, s := range servers {
+		if err := s.Shutdown(shutdownCtx); err != nil {
+			return d.fail(fmt.Errorf("shutdown: %w", err))
+		}
+		// After Shutdown, Serve returns http.ErrServerClosed; that is the
+		// expected way for it to end.
+		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return d.fail(err)
+		}
 	}
 
 	log.Info("limand stopped")
 	return exitOK
+}
+
+// newHTTPServer returns the server for one of limand's listeners.
+func newHTTPServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler: h,
+
+		// Each limit below closes a way of tying up the daemon without
+		// being authenticated.
+		//
+		// A client that opens a connection and never finishes its headers
+		// would otherwise hold it, and a goroutine, forever (the attack is
+		// known as Slowloris).
+		ReadHeaderTimeout: 10 * time.Second,
+		// The default allows a megabyte of headers per request.
+		MaxHeaderBytes: 16 << 10,
+		// Connections kept open between requests are closed when idle.
+		IdleTimeout: 2 * time.Minute,
+
+		// There is deliberately no ReadTimeout and no WriteTimeout. Both
+		// are measured from the start of a request and would cut off a
+		// deploy or a followed log that is working as intended. Slow
+		// request bodies are limited per handler instead (server.readBody).
+	}
 }
 
 // openVault loads the master key, creating it on the very first start, and
@@ -598,13 +640,14 @@ func (d *Daemon) runToken(ctx context.Context, args []string) int {
 }
 
 func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
-	const synopsis = "limand token create <name> [--read-only] [--expires <90d|12h>] [--app <app>]... [--write-client <file>] [--url <url>]"
+	const synopsis = "limand token create <name> [--read-only | --deploy] [--expires <90d|12h>] [--app <app>]... [--write-client <file>] [--url <url>]"
 
 	fs := flag.NewFlagSet("token create", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	writeClient := fs.String("write-client", "", "write the token to this client.yaml instead of printing it")
 	url := fs.String("url", "", "daemon URL to put into the client.yaml")
 	readOnly := fs.Bool("read-only", false, "the token can look at everything and change nothing")
+	deployKey := fs.Bool("deploy", false, "the token can only trigger deploys of its apps, from a pipeline")
 	expires := fs.String("expires", "", "the token stops working after this long: 90d, 12h")
 	var apps appList
 	fs.Var(&apps, "app", "limit the token to this app; repeat for more")
@@ -620,6 +663,14 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 	}
 	if *url != "" && *writeClient == "" {
 		fmt.Fprintln(d.Stderr, "limand: --url only makes sense together with --write-client")
+		return exitUsage
+	}
+	if *deployKey && *readOnly {
+		fmt.Fprintln(d.Stderr, "limand: --deploy and --read-only cannot be combined; a deploy key can neither read nor change anything but its deploys")
+		return exitUsage
+	}
+	if *deployKey && len(apps) == 0 {
+		fmt.Fprintln(d.Stderr, "limand: a --deploy token needs --app: a deploy key for every app would deploy anything from anywhere")
 		return exitUsage
 	}
 	for _, a := range apps {
@@ -649,14 +700,20 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 	defer func() { _ = st.Close() }()
 
 	scope := store.ScopeAdmin
-	if *readOnly {
+	switch {
+	case *readOnly:
 		scope = store.ScopeRead
+	case *deployKey:
+		scope = store.ScopeDeploy
 	}
 	token, err := st.CreateScopedToken(ctx, name, scope, expiresAt, apps...)
 	if err != nil {
 		return d.fail(err)
 	}
 	what := fmt.Sprintf("token %q", name)
+	if *deployKey {
+		what = fmt.Sprintf("deploy key %q", name)
+	}
 	if len(apps) > 0 {
 		what += " for " + strings.Join(apps, ", ")
 	}
@@ -678,9 +735,18 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 		if client.URL == "" {
 			cfg, err := config.Load(filepath.Join(d.Home, "config.yaml"))
 			if err != nil {
+				_ = st.RevokeToken(ctx, name)
 				return d.fail(err)
 			}
 			client.URL = "http://" + cfg.Daemon.Listen
+			// A deploy key works on the trigger endpoint only.
+			if *deployKey {
+				if !cfg.Hooks.Enabled() {
+					_ = st.RevokeToken(ctx, name)
+					return d.fail(errors.New("hooks.listen is not set, so there is no trigger endpoint to write into the file; set it, or give --url"))
+				}
+				client.URL = "http://" + cfg.Hooks.Listen
+			}
 		}
 		if err := config.SaveClient(*writeClient, client); err != nil {
 			// The token exists but nobody has it; remove it again rather
@@ -694,6 +760,10 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 	}
 
 	fmt.Fprintf(d.Stdout, "Created %s. It is shown only this once:\n\n  %s\n\n", what, token)
+	if *deployKey {
+		fmt.Fprintln(d.Stdout, "Store it as a secret variable of your CI (LIMAN_TOKEN), next to LIMAN_URL: the public address of the trigger endpoint.")
+		return exitOK
+	}
 	fmt.Fprintln(d.Stdout, "Put it into client.yaml (token: ...) or the LIMAN_TOKEN variable on the machine you run liman from.")
 	return exitOK
 }

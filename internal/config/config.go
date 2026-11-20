@@ -20,6 +20,7 @@ import (
 // Config is the content of config.yaml in liman's home directory.
 type Config struct {
 	Daemon  Daemon  `yaml:"daemon"`
+	Hooks   Hooks   `yaml:"hooks"`
 	Deploy  Deploy  `yaml:"deploy"`
 	Monitor Monitor `yaml:"monitor"`
 	Nginx   Nginx   `yaml:"nginx"`
@@ -129,6 +130,22 @@ type Daemon struct {
 	Listen string `yaml:"listen"`
 }
 
+// Hooks configures the trigger endpoint, through which a CI pipeline that
+// has pushed an image deploys it (POST /hooks/deploy, with a deploy key).
+type Hooks struct {
+	// Listen is the address of the endpoint's own listener; empty turns it
+	// off. Like daemon.listen it must be a local or private address: a
+	// reverse proxy such as Nginx makes that one path reachable over
+	// HTTPS. Nothing but the trigger is served there, so a mistake in the
+	// proxy cannot expose the rest of the API.
+	Listen string `yaml:"listen"`
+}
+
+// Enabled reports whether the trigger endpoint is served.
+func (h Hooks) Enabled() bool {
+	return h.Listen != ""
+}
+
 // DefaultListen is used when daemon.listen is not set.
 const DefaultListen = "127.0.0.1:7070"
 
@@ -230,6 +247,14 @@ func (c *Config) validate() error {
 
 	if err := CheckListenAddress(c.Daemon.Listen); err != nil {
 		errs = append(errs, fmt.Errorf("daemon.listen: %w", err))
+	}
+	if c.Hooks.Enabled() {
+		if err := CheckListenAddress(c.Hooks.Listen); err != nil {
+			errs = append(errs, fmt.Errorf("hooks.listen: %w", err))
+		} else if c.Hooks.Listen == c.Daemon.Listen && !strings.HasSuffix(c.Hooks.Listen, ":0") {
+			// Port 0 is "any free port", a different one for each.
+			errs = append(errs, errors.New("hooks.listen: must differ from daemon.listen; the trigger endpoint has a listener of its own"))
+		}
 	}
 
 	if c.Backup.Dir != "" && !filepath.IsAbs(c.Backup.Dir) {

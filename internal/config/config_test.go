@@ -242,6 +242,26 @@ func TestLoadRejectsPublicListenAddress(t *testing.T) {
 	}
 }
 
+func TestLoadHooks(t *testing.T) {
+	cfg, err := Load(write(t, "daemon:\n  listen: 127.0.0.1:7070\n"))
+	if err != nil || cfg.Hooks.Enabled() {
+		t.Errorf("Load() without hooks = %+v, %v; want them off", cfg.Hooks, err)
+	}
+	cfg, err = Load(write(t, "hooks:\n  listen: 127.0.0.1:7443\n"))
+	if err != nil || !cfg.Hooks.Enabled() || cfg.Hooks.Listen != "127.0.0.1:7443" {
+		t.Errorf("Load() = %+v, %v", cfg.Hooks, err)
+	}
+	for content, want := range map[string]string{
+		"hooks:\n  listen: 0.0.0.0:7443\n":                                      "hooks.listen",
+		"hooks:\n  listen: 203.0.113.7:7443\n":                                  "public address",
+		"daemon:\n  listen: 127.0.0.1:7070\nhooks:\n  listen: 127.0.0.1:7070\n": "must differ",
+	} {
+		if _, err := Load(write(t, content)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("Load(%q) error = %v; want %q", content, err, want)
+		}
+	}
+}
+
 func TestCheckClientURL(t *testing.T) {
 	tests := []struct {
 		url     string

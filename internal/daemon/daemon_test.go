@@ -152,6 +152,8 @@ func TestUsageErrors(t *testing.T) {
 		{"token create with a flag as name", []string{"token", "create", "--url", "x"}, "usage: limand token create"},
 		{"url without write-client", []string{"token", "create", "dev", "--url", "http://x"}, "--url only makes sense"},
 		{"revoke without name", []string{"token", "revoke"}, "usage: limand token revoke"},
+		{"deploy key without app", []string{"token", "create", "ci", "--deploy"}, "needs --app"},
+		{"deploy key read-only", []string{"token", "create", "ci", "--deploy", "--read-only", "--app", "web"}, "cannot be combined"},
 		{"serve with arguments", []string{"serve", "extra"}, "usage: limand serve"},
 	}
 
@@ -698,5 +700,81 @@ func TestTokenCreateReadOnly(t *testing.T) {
 	// A name that could forge a log field or move the terminal's cursor.
 	if code := td.Run(ctx, []string{"token", "create", "a b"}); code != exitError {
 		t.Errorf("token create with a space in the name: code %d, want %d", code, exitError)
+	}
+}
+
+func TestDeployKeyTriggersOnTheHooksListenerOnly(t *testing.T) {
+	td := newTestDaemon(t)
+	writeConfig(t, td.Home, "daemon:\n  listen: 127.0.0.1:0\nhooks:\n  listen: 127.0.0.1:0\n")
+	ctx := context.Background()
+
+	adminFile := filepath.Join(t.TempDir(), "admin.yaml")
+	keyFile := filepath.Join(t.TempDir(), "ci.yaml")
+	if code := td.Run(ctx, []string{"token", "create", "dev", "--write-client", adminFile}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	if code := td.Run(ctx, []string{"token", "create", "web-ci", "--deploy", "--app", "web", "--write-client", keyFile}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	if !strings.Contains(td.stdout.String(), `deploy key "web-ci" for web`) {
+		t.Errorf("token create --deploy says: %q", td.stdout.String())
+	}
+	if code := td.Run(ctx, []string{"token", "list"}); code != exitOK || !regexp.MustCompile(`(?m)^web-ci\s+deploy\s+web\s`).MatchString(td.stdout.String()) {
+		t.Errorf("token list does not show the deploy key:\n%s", td.stdout.String())
+	}
+	admin, _ := config.LoadClient(adminFile)
+	key, err := config.LoadClient(keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hooks := make(chan string, 1)
+	td.HooksReady = func(a string) { hooks <- a }
+	addr, stop, exit := startServing(t, td)
+	hooksAddr := <-hooks
+	// Written before the port was known; the test points the client at
+	// the real one.
+	if !strings.HasPrefix(key.URL, "http://127.0.0.1:") {
+		t.Errorf("the deploy key's client.yaml points at %s; want the hooks listener", key.URL)
+	}
+
+	api1 := &api.Client{BaseURL: "http://" + addr, Token: admin.Token}
+	if _, err := api1.Deploy(ctx, []byte("name: web\nimage: web:1.0\ndomain: web.example.com\nport: 80\n"), api.DeployOptions{}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	d := "sha256:" + strings.Repeat("ab", 32)
+	td.engine.Registry = map[string]bool{"web@" + d: true}
+
+	ci := &api.Client{BaseURL: "http://" + hooksAddr, Token: key.Token}
+	if res, err := ci.Trigger(ctx, "web", d, io.Discard); err != nil || !res.OK {
+		t.Errorf("Trigger() = %+v, %v", res, err)
+	}
+	// The key does nothing on the API, and the API's tokens nothing on
+	// the hooks listener.
+	if _, err := (&api.Client{BaseURL: "http://" + addr, Token: key.Token}).Apps(ctx); err == nil {
+		t.Error("the deploy key listed the apps")
+	}
+	if _, err := (&api.Client{BaseURL: "http://" + hooksAddr, Token: admin.Token}).Trigger(ctx, "web", d, io.Discard); err == nil {
+		t.Error("an admin token triggered a deploy")
+	}
+
+	stop()
+	if code := <-exit; code != exitOK {
+		t.Errorf("exit code = %d: %s", code, td.stderr.String())
+	}
+	if strings.Contains(td.stderr.String(), key.Token) {
+		t.Error("the log contains the deploy key")
+	}
+}
+
+func TestDeployKeyClientFileNeedsTheHooksListener(t *testing.T) {
+	td := newTestDaemon(t)
+	file := filepath.Join(t.TempDir(), "ci.yaml")
+	if code := td.Run(context.Background(), []string{"token", "create", "ci", "--deploy", "--app", "web", "--write-client", file}); code != exitError || !strings.Contains(td.stderr.String(), "hooks.listen is not set") {
+		t.Errorf("code %d, stderr %q", code, td.stderr.String())
+	}
+	// Refused, so not kept either.
+	if code := td.Run(context.Background(), []string{"token", "list"}); code != exitOK || strings.Contains(td.stdout.String(), "ci ") {
+		t.Errorf("the refused key was kept:\n%s", td.stdout.String())
 	}
 }
