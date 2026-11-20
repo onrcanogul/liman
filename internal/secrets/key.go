@@ -48,28 +48,12 @@ func CreateKey(path string) ([]byte, error) {
 		return nil, fmt.Errorf("create master key directory: %w", err)
 	}
 
-	key := make([]byte, KeySize)
-	// The operating system's cryptographic random source. A key from a
-	// predictable generator is no key at all.
-	if _, err := rand.Read(key); err != nil {
-		return nil, fmt.Errorf("generate master key: %w", err)
-	}
-
-	// O_EXCL makes creation fail if the file exists, and it does so
-	// atomically: two processes starting at once cannot both "create" it.
-	// The mode applies from the first moment, so the key is never readable
-	// by others, not even briefly.
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	key, err := newKey()
 	if err != nil {
-		return nil, fmt.Errorf("create master key: %w", err)
+		return nil, err
 	}
-
-	_, writeErr := f.WriteString(base64.StdEncoding.EncodeToString(key) + "\n")
-	closeErr := f.Close()
-	if err := errors.Join(writeErr, closeErr); err != nil {
-		// A half-written key file would block the next start; remove it.
-		_ = os.Remove(path)
-		return nil, fmt.Errorf("write master key: %w", err)
+	if err := writeKeyFile(path, key); err != nil {
+		return nil, fmt.Errorf("create master key: %w", err)
 	}
 	return key, nil
 }
@@ -85,4 +69,37 @@ func KeyExists(path string) (bool, error) {
 	default:
 		return false, fmt.Errorf("look for master key: %w", err)
 	}
+}
+
+// newKey returns a new random master key.
+func newKey() ([]byte, error) {
+	key := make([]byte, KeySize)
+	// The operating system's cryptographic random source. A key from a
+	// predictable generator is no key at all.
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("generate master key: %w", err)
+	}
+	return key, nil
+}
+
+// writeKeyFile writes key to a new file at path, readable by the owner
+// only, and makes sure it is on the disk before returning.
+func writeKeyFile(path string, key []byte) error {
+	// O_EXCL makes creation fail if the file exists, and it does so
+	// atomically: two processes starting at once cannot both "create" it.
+	// The mode applies from the first moment, so the key is never readable
+	// by others, not even briefly.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create key file: %w", err)
+	}
+	_, writeErr := f.WriteString(base64.StdEncoding.EncodeToString(key) + "\n")
+	// Sync before the rename that follows in a rotation: a key that only
+	// sits in the page cache when the power goes is a key that never was.
+	if err := errors.Join(writeErr, f.Sync(), f.Close()); err != nil {
+		// A half-written key file would block the next start; remove it.
+		_ = os.Remove(path)
+		return fmt.Errorf("write key file: %w", err)
+	}
+	return nil
 }

@@ -46,18 +46,55 @@ type Storage interface {
 // Vault stores and retrieves the secrets of apps. Values are encrypted
 // before they reach the storage and decrypted only when a deploy needs them.
 type Vault struct {
-	box     *Box
+	ring    *Keyring
 	storage Storage
 }
 
 // NewVault returns a Vault that encrypts with key and keeps its data in
 // storage.
 func NewVault(key []byte, storage Storage) (*Vault, error) {
-	box, err := NewBox(key)
+	ring, err := NewKeyring(key)
 	if err != nil {
 		return nil, err
 	}
-	return &Vault{box: box, storage: storage}, nil
+	return NewVaultWithKeyring(ring, storage), nil
+}
+
+// NewVaultWithKeyring returns a Vault that seals with the primary key of
+// ring and opens with whichever of its keys a value names.
+func NewVaultWithKeyring(ring *Keyring, storage Storage) *Vault {
+	return &Vault{ring: ring, storage: storage}
+}
+
+// Reseal opens a value stored as app/name with from and seals it again with
+// the primary key of to. It reports false, and returns sealed unchanged,
+// when the value is already sealed with that key.
+func Reseal(from, to *Keyring, app, name string, sealed []byte) ([]byte, bool, error) {
+	if id, ok := SealedWith(sealed); ok && id == to.Primary() {
+		return sealed, false, nil
+	}
+	context := sealContext(app, name)
+	plaintext, err := from.Open(sealed, context)
+	if err != nil {
+		return nil, false, fmt.Errorf("%s/%s: %w", app, name, err)
+	}
+	resealed, err := to.Seal(plaintext, context)
+	if err != nil {
+		return nil, false, err
+	}
+	return resealed, true, nil
+}
+
+// SealedBy returns the ID of the key the stored value app/name opens with.
+func (v *Vault) SealedBy(ctx context.Context, app, name string) (KeyID, error) {
+	sealed, found, err := v.storage.GetSecret(ctx, app, name)
+	if err != nil {
+		return KeyID{}, err
+	}
+	if !found {
+		return KeyID{}, fmt.Errorf("%s: %w", name, ErrNotSet)
+	}
+	return v.ring.SealedBy(sealed, sealContext(app, name))
 }
 
 // Set stores value as the secret name of app, replacing an earlier value.
@@ -76,7 +113,7 @@ func (v *Vault) Set(ctx context.Context, app, name string, value []byte) error {
 		return errors.New("the secret value contains a NUL byte")
 	}
 
-	sealed, err := v.box.Seal(value, sealContext(app, name))
+	sealed, err := v.ring.Seal(value, sealContext(app, name))
 	if err != nil {
 		return err
 	}
@@ -93,7 +130,7 @@ func (v *Vault) Get(ctx context.Context, app, name string) ([]byte, error) {
 		return nil, fmt.Errorf("%s: %w", name, ErrNotSet)
 	}
 
-	value, err := v.box.Open(sealed, sealContext(app, name))
+	value, err := v.ring.Open(sealed, sealContext(app, name))
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", name, err)
 	}

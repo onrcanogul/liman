@@ -341,34 +341,41 @@ func (d *Daemon) openVault(ctx context.Context, cfg config.Config, st *store.Sto
 		return nil, err
 	}
 
-	var key []byte
 	if exists {
-		if key, err = secrets.LoadKey(path); err != nil {
-			return nil, err
-		}
-	} else {
-		// No key file. On a first start that is expected, and a key is
-		// created. But if secrets are already stored, they were encrypted
-		// with a key that is now missing: generating a new one would look
-		// like a working setup while every stored secret had become
-		// unreadable. Refuse, and say what to do.
-		count, err := st.CountSecrets(ctx)
+		// The master key and the keys it replaced: values and backups
+		// made before a rotation name their key and are opened with it.
+		ring, err := secrets.LoadKeyring(path)
 		if err != nil {
 			return nil, err
 		}
-		if count > 0 {
-			stored := fmt.Sprintf("%d secrets are stored that were", count)
-			if count == 1 {
-				stored = "1 secret is stored that was"
-			}
-			return nil, fmt.Errorf("the master key %s is missing, but %s encrypted with it; restore the key file from your backup (without it the stored secrets cannot be recovered)", path, stored)
+		if id, pending := ring.Pending(); pending {
+			log.Warn("a key rotation did not finish; everything still opens, but finish it with: limand key rotate (daemon stopped)",
+				"pending_key", id.String(), "file", secrets.PendingKeyPath(path))
 		}
-		if key, err = secrets.CreateKey(path); err != nil {
-			return nil, err
-		}
-		log.Warn("created a new master key; back it up, secrets cannot be recovered without it", "path", path)
+		return secrets.NewVaultWithKeyring(ring, st), nil
 	}
 
+	// No key file. On a first start that is expected, and a key is
+	// created. But if secrets are already stored, they were encrypted
+	// with a key that is now missing: generating a new one would look
+	// like a working setup while every stored secret had become
+	// unreadable. Refuse, and say what to do.
+	count, err := st.CountSecrets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if count > 0 {
+		stored := fmt.Sprintf("%d secrets are stored that were", count)
+		if count == 1 {
+			stored = "1 secret is stored that was"
+		}
+		return nil, fmt.Errorf("the master key %s is missing, but %s encrypted with it; restore the key file from your backup (without it the stored secrets cannot be recovered)", path, stored)
+	}
+	key, err := secrets.CreateKey(path)
+	if err != nil {
+		return nil, err
+	}
+	log.Warn("created a new master key; back it up, secrets cannot be recovered without it", "path", path)
 	return secrets.NewVault(key, st)
 }
 

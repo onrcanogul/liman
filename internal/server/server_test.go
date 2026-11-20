@@ -1272,9 +1272,10 @@ func TestSecretsAreEncryptedInTheDatabase(t *testing.T) {
 	if strings.Contains(string(sealed), value) {
 		t.Error("the database row contains the plaintext")
 	}
-	// ...and it is longer than the value: format byte, nonce and tag.
-	if len(sealed) != len(value)+1+12+16 {
-		t.Errorf("sealed length = %d, want %d (value + 29 bytes of overhead)", len(sealed), len(value)+29)
+	// ...and it is longer than the value: format byte, key ID, nonce and
+	// tag.
+	if len(sealed) != len(value)+1+8+12+16 {
+		t.Errorf("sealed length = %d, want %d (value + 37 bytes of overhead)", len(sealed), len(value)+37)
 	}
 }
 
