@@ -288,12 +288,19 @@ func (d *Daemon) backupRestore(ctx context.Context, args []string) int {
 	}
 
 	// A restore turns the clock back for the tokens too: one that was
-	// revoked after the backup was made is valid again.
-	if tokens, err := st.Tokens(ctx); err == nil && len(tokens) > 0 {
-		names := make([]string, 0, len(tokens))
+	// revoked after the backup was made is valid again. Expiry does not go
+	// back with it (it is a moment, not a state), so expired ones are left
+	// out of the list.
+	now := time.Now()
+	var names []string
+	if tokens, err := st.Tokens(ctx); err == nil {
 		for _, t := range tokens {
-			names = append(names, t.Name)
+			if !t.Expired(now) {
+				names = append(names, t.Name)
+			}
 		}
+	}
+	if len(names) > 0 {
 		fmt.Fprintf(d.Stdout, "\nThese tokens are valid now: %s\nIf one of them was revoked after this backup was made, revoke it again: limand token revoke <name>\n", strings.Join(names, ", "))
 	}
 	fmt.Fprintln(d.Stdout, "\nStart the daemon again: systemctl start limand")

@@ -44,13 +44,16 @@ liman CLI asks for.
 
 Usage:
   limand                          Serve the API (same as "limand serve")
-  limand token create <name> [--read-only] [--write-client <file>] [--url <url>]
+  limand token create <name> [--read-only] [--expires <90d|12h>]
+                      [--write-client <file>] [--url <url>]
                                   Create an API token. It is printed once, or
                                   with --write-client written to a client.yaml
                                   instead of being printed. A --read-only
                                   token can look at everything and change
-                                  nothing
-  limand token list               List token names
+                                  nothing. With --expires it stops working
+                                  after that many days or hours; without, it
+                                  works until it is revoked
+  limand token list               List tokens and when they expire
   limand token revoke <name>      Revoke a token
   limand backup create <dir> [--keep <n>]
                                   Write a copy of the database into <dir> and
@@ -477,13 +480,14 @@ func (d *Daemon) runToken(ctx context.Context, args []string) int {
 }
 
 func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
-	const synopsis = "limand token create <name> [--read-only] [--write-client <file>] [--url <url>]"
+	const synopsis = "limand token create <name> [--read-only] [--expires <90d|12h>] [--write-client <file>] [--url <url>]"
 
 	fs := flag.NewFlagSet("token create", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	writeClient := fs.String("write-client", "", "write the token to this client.yaml instead of printing it")
 	url := fs.String("url", "", "daemon URL to put into the client.yaml")
 	readOnly := fs.Bool("read-only", false, "the token can look at everything and change nothing")
+	expires := fs.String("expires", "", "the token stops working after this long: 90d, 12h")
 
 	// The flag package stops at the first non-flag argument, so the name is
 	// taken first and the flags are parsed from what follows it.
@@ -498,6 +502,17 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 		fmt.Fprintln(d.Stderr, "limand: --url only makes sense together with --write-client")
 		return exitUsage
 	}
+	// Checked before anything is touched: a typo in --expires is a usage
+	// error, like a typo in any other flag.
+	var expiresAt time.Time
+	if *expires != "" {
+		lifetime, err := parseLifetime(*expires)
+		if err != nil {
+			fmt.Fprintln(d.Stderr, "limand:", err)
+			return exitUsage
+		}
+		expiresAt = time.Now().Add(lifetime)
+	}
 
 	st, err := d.openStore(ctx)
 	if err != nil {
@@ -509,9 +524,13 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 	if *readOnly {
 		scope = store.ScopeRead
 	}
-	token, err := st.CreateScopedToken(ctx, name, scope, time.Time{})
+	token, err := st.CreateScopedToken(ctx, name, scope, expiresAt)
 	if err != nil {
 		return d.fail(err)
+	}
+	what := fmt.Sprintf("token %q", name)
+	if !expiresAt.IsZero() {
+		what += fmt.Sprintf(" (expires %s)", expiresAt.Local().Format("2006-01-02 15:04"))
 	}
 
 	if *writeClient != "" {
@@ -530,11 +549,11 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 			return d.fail(err)
 		}
 		// The token itself is deliberately not printed in this mode.
-		fmt.Fprintf(d.Stdout, "Created token %q and wrote it to %s\n", name, *writeClient)
+		fmt.Fprintf(d.Stdout, "Created %s and wrote it to %s\n", what, *writeClient)
 		return exitOK
 	}
 
-	fmt.Fprintf(d.Stdout, "Created token %q. It is shown only this once:\n\n  %s\n\n", name, token)
+	fmt.Fprintf(d.Stdout, "Created %s. It is shown only this once:\n\n  %s\n\n", what, token)
 	fmt.Fprintln(d.Stdout, "Put it into client.yaml (token: ...) or the LIMAN_TOKEN variable on the machine you run liman from.")
 	return exitOK
 }
@@ -560,9 +579,10 @@ func (d *Daemon) tokenList(ctx context.Context, args []string) int {
 	}
 
 	w := tabwriter.NewWriter(d.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tSCOPE\tCREATED")
+	now := time.Now()
+	fmt.Fprintln(w, "NAME\tSCOPE\tCREATED\tEXPIRES")
 	for _, t := range tokens {
-		fmt.Fprintf(w, "%s\t%s\t%s\n", t.Name, t.Scope, t.CreatedAt.Local().Format("2006-01-02 15:04:05"))
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", t.Name, t.Scope, t.CreatedAt.Local().Format("2006-01-02 15:04:05"), describeExpiry(t, now))
 	}
 	if err := w.Flush(); err != nil {
 		return d.fail(err)

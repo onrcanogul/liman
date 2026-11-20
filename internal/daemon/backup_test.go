@@ -541,3 +541,29 @@ func TestKeepRemovesSignaturesWithTheirBackups(t *testing.T) {
 		t.Errorf("after --keep 1 the directory holds %v, want one backup and its signature", names)
 	}
 }
+
+func TestBackupRestoreDoesNotListExpiredTokensAsValid(t *testing.T) {
+	td := newTestDaemon(t)
+	seed(t, td)
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	st, err := store.Open(ctx, filepath.Join(td.Home, "liman.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateScopedToken(ctx, "old-ci", store.ScopeAdmin, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	_ = st.Close()
+
+	if code := td.Run(ctx, []string{"backup", "create", dir}); code != exitOK {
+		t.Fatalf("backup create: code %d, stderr %q", code, td.stderr.String())
+	}
+	if code := td.Run(ctx, []string{"backup", "restore", filepath.Join(dir, backupsIn(t, dir)[0])}); code != exitOK {
+		t.Fatalf("backup restore: code %d, stderr %q", code, td.stderr.String())
+	}
+	if out := td.stdout.String(); !strings.Contains(out, "These tokens are valid now: laptop\n") {
+		t.Errorf("restore lists an expired token as valid, or none at all:\n%s", out)
+	}
+}
