@@ -104,6 +104,13 @@ var migrations = []string{
 	`
 	ALTER TABLE tokens ADD COLUMN expires_at TEXT;
 	`,
+
+	// 6: when a token was last used, to within a minute (see TouchToken).
+	// NULL means not since this column exists: a token that is older than
+	// the upgrade may well have been used before it.
+	`
+	ALTER TABLE tokens ADD COLUMN last_used_at TEXT;
+	`,
 }
 
 // SchemaVersion is the schema version this build reads and writes.

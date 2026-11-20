@@ -53,7 +53,7 @@ Usage:
                                   nothing. With --expires it stops working
                                   after that many days or hours; without, it
                                   works until it is revoked
-  limand token list               List tokens and when they expire
+  limand token list               List tokens, when they expire and were last used
   limand token revoke <name>      Revoke a token
   limand backup create <dir> [--keep <n>]
                                   Write a copy of the database into <dir> and
@@ -655,9 +655,9 @@ func (d *Daemon) tokenList(ctx context.Context, args []string) int {
 
 	w := tabwriter.NewWriter(d.Stdout, 0, 0, 2, ' ', 0)
 	now := time.Now()
-	fmt.Fprintln(w, "NAME\tSCOPE\tCREATED\tEXPIRES")
+	fmt.Fprintln(w, "NAME\tSCOPE\tCREATED\tEXPIRES\tLAST USED")
 	for _, t := range tokens {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", t.Name, t.Scope, t.CreatedAt.Local().Format("2006-01-02 15:04:05"), describeExpiry(t, now))
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", t.Name, t.Scope, t.CreatedAt.Local().Format("2006-01-02 15:04:05"), describeExpiry(t, now), describeLastUse(t, now))
 	}
 	if err := w.Flush(); err != nil {
 		return d.fail(err)

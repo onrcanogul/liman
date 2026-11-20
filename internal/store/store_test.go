@@ -824,6 +824,52 @@ func TestTokensFromBeforeExpiryNeverExpire(t *testing.T) {
 	}
 }
 
+func TestTouchToken(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	if _, err := s.CreateToken(ctx, "ci"); err != nil {
+		t.Fatal(err)
+	}
+	lastUsed := func() time.Time {
+		t.Helper()
+		tokens, err := s.Tokens(ctx)
+		if err != nil || len(tokens) != 1 {
+			t.Fatalf("Tokens() = %+v, %v", tokens, err)
+		}
+		return tokens[0].LastUsedAt
+	}
+
+	if got := lastUsed(); !got.IsZero() {
+		t.Errorf("LastUsedAt of a new token = %v, want zero", got)
+	}
+	at := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	if err := s.TouchToken(ctx, "ci", at); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastUsed(); !got.Equal(at) {
+		t.Errorf("LastUsedAt = %v, want %v", got, at)
+	}
+	// Requests finish in any order; an earlier one must not move the time
+	// back.
+	if err := s.TouchToken(ctx, "ci", at.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastUsed(); !got.Equal(at) {
+		t.Errorf("LastUsedAt after an earlier touch = %v, want it still %v", got, at)
+	}
+	if err := s.TouchToken(ctx, "ci", at.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if got := lastUsed(); !got.Equal(at.Add(time.Hour)) {
+		t.Errorf("LastUsedAt after a later touch = %v, want %v", got, at.Add(time.Hour))
+	}
+	// A token revoked meanwhile is not an error: the request that used it
+	// was valid when it arrived.
+	if err := s.TouchToken(ctx, "gone", at); err != nil {
+		t.Errorf("TouchToken() of a missing token = %v, want nil", err)
+	}
+}
+
 func TestResealSecretsIsAllOrNothing(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()

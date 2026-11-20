@@ -57,6 +57,21 @@ func describeExpiry(t store.TokenInfo, now time.Time) string {
 	}
 }
 
+// describeLastUse says when a token was last accepted, for listings: "-"
+// when that is not known (never used, or not since the daemon started
+// keeping track), otherwise how long ago. The daemon writes it down at
+// most once a minute, so anything under that is "in the last minute".
+func describeLastUse(t store.TokenInfo, now time.Time) string {
+	if t.LastUsedAt.IsZero() {
+		return "-"
+	}
+	ago := now.Sub(t.LastUsedAt)
+	if ago < time.Minute {
+		return "in the last minute"
+	}
+	return roughly(ago) + " ago"
+}
+
 // roughly gives a duration as a person would say it: "90 days", "47
 // hours", "12 minutes". Days and hours are rounded to the nearest, so that
 // a token created for 5 days is not listed as "in 4 days" a second later;

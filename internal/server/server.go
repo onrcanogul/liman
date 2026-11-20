@@ -134,6 +134,9 @@ type Server struct {
 	// reads keeps repeated successful reads out of the log. Its zero value
 	// is ready to use.
 	reads readLog
+	// used remembers when each token's last use was written to the
+	// database, so that it is written at most once a minute.
+	used readLog
 }
 
 // authFailures returns the failed-authentication limiter.

@@ -100,9 +100,10 @@ func TestTokenCreateExpires(t *testing.T) {
 		t.Fatal(td.stderr.String())
 	}
 	out := td.stdout.String()
-	if !regexp.MustCompile(`(?m)^NAME\s+SCOPE\s+CREATED\s+EXPIRES$`).MatchString(out) ||
-		!regexp.MustCompile(`(?m)^ci\s.*\(in 30 days\)$`).MatchString(out) ||
-		!regexp.MustCompile(`(?m)^laptop\s.*\snever$`).MatchString(out) {
+	// Neither has been used: the daemon has not seen them yet.
+	if !regexp.MustCompile(`(?m)^NAME\s+SCOPE\s+CREATED\s+EXPIRES\s+LAST USED$`).MatchString(out) ||
+		!regexp.MustCompile(`(?m)^ci\s.*\(in 30 days\)\s+-$`).MatchString(out) ||
+		!regexp.MustCompile(`(?m)^laptop\s.*\snever\s+-$`).MatchString(out) {
 		t.Errorf("token list does not show the expiry:\n%s", out)
 	}
 }
@@ -119,5 +120,24 @@ func TestTokenCreateRejectsABadLifetime(t *testing.T) {
 	}
 	if code := td.Run(ctx, []string{"token", "list"}); code != exitOK || !strings.Contains(td.stdout.String(), "No tokens.") {
 		t.Errorf("a token was created although --expires was invalid:\n%s", td.stdout.String())
+	}
+}
+
+func TestDescribeLastUse(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		used time.Time
+		want string
+	}{
+		{time.Time{}, "-"},
+		{now.Add(-20 * time.Second), "in the last minute"},
+		{now.Add(-5 * time.Minute), "5 minutes ago"},
+		{now.Add(-3 * time.Hour), "3 hours ago"},
+		{now.Add(-10 * 24 * time.Hour), "10 days ago"},
+	}
+	for _, tt := range tests {
+		if got := describeLastUse(store.TokenInfo{LastUsedAt: tt.used}, now); got != tt.want {
+			t.Errorf("describeLastUse(%v) = %q, want %q", tt.used, got, tt.want)
+		}
 	}
 }

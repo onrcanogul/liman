@@ -13,8 +13,12 @@ import (
 	"github.com/onrcanogul/liman/internal/store"
 )
 
+// oldSchema is the schema version downgrade leaves behind.
+var oldSchema = store.SchemaVersion() - 1
+
 // downgrade turns the database in home back into what the previous schema
-// version left: the last migration (token expiry) undone.
+// version left: the last migration (token last use) undone. A new
+// migration has to be undone here instead.
 func downgrade(t *testing.T, home string) {
 	t.Helper()
 	ctx := context.Background()
@@ -23,7 +27,7 @@ func downgrade(t *testing.T, home string) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	for _, q := range []string{"ALTER TABLE tokens DROP COLUMN expires_at", "PRAGMA user_version = 4"} {
+	for _, q := range []string{"ALTER TABLE tokens DROP COLUMN last_used_at", fmt.Sprintf("PRAGMA user_version = %d", oldSchema)} {
 		if _, err := db.ExecContext(ctx, q); err != nil {
 			t.Fatalf("%s: %v", q, err)
 		}
@@ -41,7 +45,7 @@ func TestUpgradeBacksUpFirstAndOnlyTheDaemonUpgrades(t *testing.T) {
 	if code := td.Run(ctx, []string{"token", "list"}); code != exitError || !strings.Contains(td.stderr.String(), "start the daemon once") {
 		t.Fatalf("token list on an old database: code %d, stderr %q", code, td.stderr.String())
 	}
-	if v, _ := store.SchemaVersionOf(ctx, dbPath); v != 4 {
+	if v, _ := store.SchemaVersionOf(ctx, dbPath); v != oldSchema {
 		t.Fatalf("a command changed the schema to %d", v)
 	}
 
@@ -54,7 +58,7 @@ func TestUpgradeBacksUpFirstAndOnlyTheDaemonUpgrades(t *testing.T) {
 		t.Errorf("schema after the daemon started = %d, want %d", v, store.SchemaVersion())
 	}
 	log := td.stderr.String()
-	if !strings.Contains(log, "backed up the database before upgrading it") || !strings.Contains(log, `msg="upgraded the database" from_schema=4`) {
+	if !strings.Contains(log, "backed up the database before upgrading it") || !strings.Contains(log, fmt.Sprintf(`msg="upgraded the database" from_schema=%d`, oldSchema)) {
 		t.Errorf("the log does not tell about the backup and the upgrade:\n%s", log)
 	}
 
@@ -65,8 +69,8 @@ func TestUpgradeBacksUpFirstAndOnlyTheDaemonUpgrades(t *testing.T) {
 	}
 	file := filepath.Join(dir, names[0])
 	// The backup is the old database, as it was...
-	if v, _ := store.SchemaVersionOf(ctx, file); v != 4 {
-		t.Errorf("the backup has schema %d, want 4 (taken before the upgrade)", v)
+	if v, _ := store.SchemaVersionOf(ctx, file); v != oldSchema {
+		t.Errorf("the backup has schema %d, want %d (taken before the upgrade)", v, oldSchema)
 	}
 	// ...signed in the format the previous version can check...
 	sig, _ := os.ReadFile(file + backup.SigSuffix)
@@ -100,7 +104,7 @@ func TestUpgradeDoesNotHappenWithoutItsBackup(t *testing.T) {
 	if code := td.Run(context.Background(), nil); code != exitError || !strings.Contains(td.stderr.String(), "backing it up before the upgrade failed, so nothing was changed") {
 		t.Fatalf("serve without a place for the backup: code %d, stderr %q", code, td.stderr.String())
 	}
-	if v, _ := store.SchemaVersionOf(context.Background(), filepath.Join(td.Home, "liman.db")); v != 4 {
+	if v, _ := store.SchemaVersionOf(context.Background(), filepath.Join(td.Home, "liman.db")); v != oldSchema {
 		t.Errorf("the schema changed to %d without a backup", v)
 	}
 }
@@ -116,13 +120,13 @@ func TestVersionShowsTheSchema(t *testing.T) {
 	seed(t, td)
 	downgrade(t, td.Home)
 	before := len(td.stdout.String())
-	if code := td.Run(ctx, []string{"version", "--schema"}); code != exitOK || td.stdout.String()[before:] != fmt.Sprintf("4 %d\n", want) {
+	if code := td.Run(ctx, []string{"version", "--schema"}); code != exitOK || td.stdout.String()[before:] != fmt.Sprintf("%d %d\n", oldSchema, want) {
 		t.Errorf("version --schema with an old database: code %d, %q", code, td.stdout.String()[before:])
 	}
-	if code := td.Run(ctx, []string{"version"}); code != exitOK || !strings.Contains(td.stdout.String(), "schema 4; the daemon backs it up and upgrades it to") {
+	if code := td.Run(ctx, []string{"version"}); code != exitOK || !strings.Contains(td.stdout.String(), fmt.Sprintf("schema %d; the daemon backs it up and upgrades it to", oldSchema)) {
 		t.Errorf("version with an old database:\n%s", td.stdout.String())
 	}
-	if v, _ := store.SchemaVersionOf(ctx, filepath.Join(td.Home, "liman.db")); v != 4 {
+	if v, _ := store.SchemaVersionOf(ctx, filepath.Join(td.Home, "liman.db")); v != oldSchema {
 		t.Errorf("version changed the schema to %d", v)
 	}
 	if code := td.Run(ctx, []string{"version", "--bogus"}); code != exitUsage {

@@ -40,6 +40,9 @@ type TokenInfo struct {
 	// never: that is what every token created before expiry existed has,
 	// and what a token created without --expires gets.
 	ExpiresAt time.Time
+	// LastUsedAt is when the token was last accepted, to within a minute.
+	// The zero time means not since liman started keeping track.
+	LastUsedAt time.Time
 }
 
 // Expired reports whether the token has stopped working at now.
@@ -114,7 +117,7 @@ func (s *Store) LookupToken(ctx context.Context, token string) (info TokenInfo, 
 	}
 	candidate := []byte(hashToken(token))
 
-	rows, err := s.db.QueryContext(ctx, `SELECT hash, name, scope, created_at, expires_at FROM tokens`)
+	rows, err := s.db.QueryContext(ctx, `SELECT hash, name, scope, created_at, expires_at, last_used_at FROM tokens`)
 	if err != nil {
 		return TokenInfo{}, false, fmt.Errorf("read tokens: %w", err)
 	}
@@ -149,7 +152,7 @@ func (s *Store) LookupToken(ctx context.Context, token string) (info TokenInfo, 
 
 // Tokens lists the stored tokens by name.
 func (s *Store) Tokens(ctx context.Context) ([]TokenInfo, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name, scope, created_at, expires_at FROM tokens ORDER BY name`)
+	rows, err := s.db.QueryContext(ctx, `SELECT name, scope, created_at, expires_at, last_used_at FROM tokens ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("read tokens: %w", err)
 	}
@@ -181,7 +184,27 @@ func (s *Store) RevokeToken(ctx context.Context, name string) error {
 	return nil
 }
 
-// scanToken reads a row of name, scope, created_at, expires_at into info.
+// TouchToken records that the token stored under name was used at at. It
+// never moves the time backwards, and a token that has been revoked in the
+// meantime is simply not found: neither is an error.
+//
+// It is a write, and the database has one writer: a caller on the path of
+// every request should not call it for every request (the server does so
+// at most once a minute per token).
+func (s *Store) TouchToken(ctx context.Context, name string, at time.Time) error {
+	stamp := formatTime(at)
+	// Times are stored in one fixed format, so comparing them as strings
+	// compares them as times.
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE tokens SET last_used_at = ? WHERE name = ? AND (last_used_at IS NULL OR last_used_at < ?)`,
+		stamp, name, stamp)
+	if err != nil {
+		return fmt.Errorf("record token use: %w", err)
+	}
+	return nil
+}
+
+// scanToken reads a row of name, scope, created_at, expires_at, last_used_at into info.
 // Columns the query selects before those go into leading.
 func scanToken(rows *sql.Rows, info *TokenInfo, leading ...any) error {
 	var created string
@@ -189,8 +212,8 @@ func scanToken(rows *sql.Rows, info *TokenInfo, leading ...any) error {
 	// expires. Scanning NULL into a plain string is an error in
 	// database/sql: Go has no null for strings, so the "is it there?" bit
 	// has to live somewhere, and NullString is a struct that carries it.
-	var expires sql.NullString
-	dest := append(leading, &info.Name, &info.Scope, &created, &expires)
+	var expires, used sql.NullString
+	dest := append(leading, &info.Name, &info.Scope, &created, &expires, &used)
 	if err := rows.Scan(dest...); err != nil {
 		return fmt.Errorf("read token: %w", err)
 	}
@@ -200,6 +223,11 @@ func scanToken(rows *sql.Rows, info *TokenInfo, leading ...any) error {
 	}
 	if expires.Valid {
 		if info.ExpiresAt, err = parseTime(expires.String); err != nil {
+			return err
+		}
+	}
+	if used.Valid {
+		if info.LastUsedAt, err = parseTime(used.String); err != nil {
 			return err
 		}
 	}

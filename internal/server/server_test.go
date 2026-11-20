@@ -2079,6 +2079,35 @@ func TestInfoSaysWhenTheTokenExpires(t *testing.T) {
 	}
 }
 
+func TestTokenUseIsWrittenAtMostOnceAMinute(t *testing.T) {
+	h := servertest.New(t)
+	lastUsed := func() time.Time {
+		t.Helper()
+		tokens, err := h.Store.Tokens(ctx())
+		if err != nil || len(tokens) != 1 {
+			t.Fatalf("Tokens() = %+v, %v", tokens, err)
+		}
+		return tokens[0].LastUsedAt
+	}
+
+	if _, err := h.Client.Info(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	first := lastUsed()
+	if first.IsZero() {
+		t.Fatal("the first request did not record the token's use")
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := h.Client.Info(ctx()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Later requests within the minute leave the database alone.
+	if got := lastUsed(); !got.Equal(first) {
+		t.Errorf("LastUsedAt after more requests = %v, want it still %v: written more than once a minute", got, first)
+	}
+}
+
 func TestRepeatedReadsAreLoggedOnce(t *testing.T) {
 	var log lockedBuffer
 	h := servertest.New(t, func(s *server.Server) {

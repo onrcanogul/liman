@@ -112,6 +112,7 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 
 		meta := metaOf(r.Context())
 		meta.token, meta.scope, meta.expires = info.Name, info.Scope, info.ExpiresAt
+		s.recordUse(r.Context(), info)
 
 		// A read-only token may look and nothing else. The rule is about
 		// the method, not a list of paths: an endpoint added later is
@@ -124,6 +125,32 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 
 		next.ServeHTTP(w, r)
 	})
+}
+
+// tokenUseInterval is how often a token's last use is written down. Writing
+// it on every request made the slowest requests 60 times slower in a trial:
+// the database has one connection, and every request queues behind a write
+// that waits for the disk. "Used in the last minute" is all anybody needs
+// to know before revoking a token.
+const tokenUseInterval = time.Minute
+
+// recordUse writes down that a token was accepted, at most once per
+// tokenUseInterval. A failure is logged and otherwise ignored: the request
+// itself is fine, and it must not fail over bookkeeping.
+func (s *Server) recordUse(ctx context.Context, info store.TokenInfo) {
+	now := time.Now()
+	// The creation time is part of the key: a token revoked and created
+	// again under the same name is a different token, and its first use
+	// is written at once.
+	key := info.Name + "\x00" + info.CreatedAt.Format(time.RFC3339Nano)
+	if !s.used.firstIn(key, tokenUseInterval, now) {
+		return
+	}
+	// WithoutCancel: a client that hangs up straight away was still
+	// accepted, and its use is still recorded.
+	if err := s.Store.TouchToken(context.WithoutCancel(ctx), info.Name, now); err != nil {
+		s.logger().Warn("could not record token use", "token", info.Name, "err", err)
+	}
 }
 
 // logRequests writes one line per request once it has finished.
