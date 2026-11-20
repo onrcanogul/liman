@@ -28,8 +28,8 @@ release: ## Build for Linux servers into dist/ (amd64 and arm64)
 test: ## Run all tests with the race detector
 	go test -race ./...
 
-test-integration: ## Run tests that need a running Docker daemon
-	go test -race -count=1 -tags integration ./internal/docker
+test-integration: ## Run tests that need a running Docker daemon (and the Pebble image)
+	go test -race -count=1 -tags integration ./internal/docker ./internal/certs
 
 load-test: ## Measure throughput and latency of the daemon (about a minute)
 	go test -count=1 -tags load -run 'TestLoad' -v ./internal/server
