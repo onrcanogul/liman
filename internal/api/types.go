@@ -134,6 +134,24 @@ type Secret struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// Token is one entry of GET /v1/tokens. The token itself is not in it:
+// the daemon keeps only a hash, and could not return it if it wanted to.
+type Token struct {
+	Name string `json:"name"`
+	// Scope is "admin" or "read".
+	Scope     string    `json:"scope"`
+	CreatedAt time.Time `json:"created_at"`
+	// ExpiresAt is absent for a token that never expires. Expired is
+	// judged by the daemon's clock, the one that decides.
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	Expired   bool       `json:"expired"`
+	// LastUsedAt is when the daemon last accepted the token, to within a
+	// minute; absent if it has not since it started keeping track.
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	// Current marks the token this request was made with.
+	Current bool `json:"current"`
+}
+
 // Release is one entry of GET /v1/releases: a deploy and how it ended.
 type Release struct {
 	App     string `json:"app"`

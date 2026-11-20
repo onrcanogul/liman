@@ -134,6 +134,7 @@ type Server struct {
 	// reads keeps repeated successful reads out of the log. Its zero value
 	// is ready to use.
 	reads readLog
+
 	// used remembers when each token's last use was written to the
 	// database, so that it is written at most once a minute.
 	used readLog
@@ -165,6 +166,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/apps/{name}/secrets/{key}", s.handleSecretSet)
 	mux.HandleFunc("DELETE /v1/apps/{name}/secrets/{key}", s.handleSecretDelete)
 	mux.HandleFunc("GET /v1/secrets", s.handleAllSecrets)
+	mux.HandleFunc("GET /v1/tokens", s.handleTokens)
+	mux.HandleFunc("DELETE /v1/tokens/{name}", s.handleTokenRevoke)
 	mux.HandleFunc("GET /v1/history", s.handleHistory)
 	mux.HandleFunc("GET /v1/info", s.handleInfo)
 	mux.HandleFunc("GET /v1/releases", s.handleReleases)
@@ -626,14 +629,10 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	meta := metaOf(r.Context())
-	var expires *time.Time
-	if !meta.expires.IsZero() {
-		expires = &meta.expires
-	}
 	writeJSON(w, http.StatusOK, api.Info{
 		Token:          meta.token,
 		Scope:          meta.scope,
-		TokenExpiresAt: expires,
+		TokenExpiresAt: optionalTime(meta.expires),
 		Version:        buildinfo.Version,
 		Commit:         buildinfo.Commit,
 		Built:          buildinfo.Date,
@@ -960,6 +959,65 @@ func (s *Server) handleAllSecrets(w http.ResponseWriter, r *http.Request) {
 		out = append(out, api.Secret{App: info.App, Name: info.Name, UpdatedAt: info.UpdatedAt})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// handleTokens lists the tokens. Any token may: names, scopes and dates
+// open nothing, and a read-only token is meant to see everything.
+func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request) {
+	tokens, err := s.Store.Tokens(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	self, now := metaOf(r.Context()).token, time.Now()
+	out := make([]api.Token, 0, len(tokens))
+	for _, t := range tokens {
+		out = append(out, api.Token{
+			Name:       t.Name,
+			Scope:      t.Scope,
+			CreatedAt:  t.CreatedAt,
+			ExpiresAt:  optionalTime(t.ExpiresAt),
+			Expired:    t.Expired(now),
+			LastUsedAt: optionalTime(t.LastUsedAt),
+			Current:    t.Name == self,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleTokenRevoke revokes a token. Creating one is deliberately not
+// offered over the API: a stolen admin token could otherwise make itself
+// spares that outlive its own revocation. Closing a door is offered
+// wherever the operator is; opening one takes the server.
+func (s *Server) handleTokenRevoke(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	// Names are at most 64 characters; anything longer cannot exist, and
+	// is not worth a query or a log line.
+	if name == "" || len(name) > 64 {
+		writeError(w, http.StatusNotFound, fmt.Errorf("token %q: %w", truncate(name, 64), store.ErrNotFound))
+		return
+	}
+	err := s.Store.RevokeToken(r.Context(), name)
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, err)
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, err)
+	default:
+		// Who closed which door is worth a line of its own, at a level
+		// that is not filtered out.
+		s.logger().Warn("token revoked", "token", name, "by", metaOf(r.Context()).token)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// optionalTime is nil for the zero time, for fields that are left out of
+// the JSON when there is nothing to say.
+func optionalTime(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
 }
 
 // haveSecrets answers 503 and returns false if the daemon has no vault.

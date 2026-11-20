@@ -1836,7 +1836,7 @@ func TestReadOnlyTokenCanLookAndChangeNothing(t *testing.T) {
 		return resp.StatusCode
 	}
 
-	for _, path := range []string{"/v1/apps", "/v1/history", "/v1/releases", "/v1/info", "/v1/backups", "/v1/apps/web/secrets", "/v1/secrets", "/v1/apps/web/health", "/v1/apps/web/logs"} {
+	for _, path := range []string{"/v1/apps", "/v1/history", "/v1/releases", "/v1/info", "/v1/backups", "/v1/apps/web/secrets", "/v1/secrets", "/v1/tokens", "/v1/apps/web/health", "/v1/apps/web/logs"} {
 		if got := do(http.MethodGet, path); got != http.StatusOK {
 			t.Errorf("GET %s with a read-only token = %d, want 200", path, got)
 		}
@@ -1853,6 +1853,7 @@ func TestReadOnlyTokenCanLookAndChangeNothing(t *testing.T) {
 		{http.MethodDelete, "/v1/apps/web/secrets/KEY"},
 		{http.MethodPost, "/v1/backups"},
 		{http.MethodPost, "/v1/confirmations/abc"},
+		{http.MethodDelete, "/v1/tokens/test"},
 		{http.MethodPost, "/v1/something-added-later"},
 	}
 	for _, c := range changes {
@@ -2076,6 +2077,70 @@ func TestInfoSaysWhenTheTokenExpires(t *testing.T) {
 	_ = resp.Body.Close()
 	if strings.Contains(string(body), "token_expires_at") {
 		t.Errorf("/v1/info for a token that never expires mentions an expiry: %s", body)
+	}
+}
+
+func TestTokensAreListedAndRevoked(t *testing.T) {
+	h := servertest.New(t)
+	expires := time.Now().Add(48 * time.Hour)
+	ci, err := h.Store.CreateScopedToken(ctx(), "ci", store.ScopeRead, expires)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Store.CreateScopedToken(ctx(), "old-laptop", store.ScopeAdmin, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	list, err := h.Client.Tokens(ctx())
+	if err != nil || len(list) != 3 {
+		t.Fatalf("Tokens() = %+v, %v; want ci, old-laptop and test", list, err)
+	}
+	byName := map[string]api.Token{}
+	for _, tok := range list {
+		byName[tok.Name] = tok
+	}
+	if got := byName["ci"]; got.Scope != store.ScopeRead || got.ExpiresAt == nil || !got.ExpiresAt.Equal(expires) || got.Expired || got.Current || got.LastUsedAt != nil {
+		t.Errorf("ci = %+v; want read, expiring, not expired, not current, never used", got)
+	}
+	if got := byName["old-laptop"]; !got.Expired {
+		t.Errorf("old-laptop = %+v; want it marked expired", got)
+	}
+	// The token the request was made with: marked, and its use recorded
+	// by the very request that listed it.
+	if got := byName["test"]; !got.Current || got.ExpiresAt != nil || got.LastUsedAt == nil || got.CreatedAt.IsZero() {
+		t.Errorf("test = %+v; want current, never expiring, used just now", got)
+	}
+
+	// Nothing that could open a door: no token, no hash.
+	resp := request(t, h, http.MethodGet, "/v1/tokens", nil)
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	for _, leak := range []string{ci, ci[len(store.TokenPrefix):], h.Client.Token, "hash"} {
+		if strings.Contains(string(body), leak) {
+			t.Errorf("GET /v1/tokens contains %q", leak)
+		}
+	}
+
+	if err := h.Client.RevokeToken(ctx(), "ci"); err != nil {
+		t.Fatalf("RevokeToken(ci) = %v", err)
+	}
+	if _, err := (&api.Client{BaseURL: h.URL, Token: ci}).Info(ctx()); err == nil {
+		t.Error("a revoked token still works")
+	}
+	var apiErr *api.Error
+	if err := h.Client.RevokeToken(ctx(), "ci"); !errors.As(err, &apiErr) || apiErr.Status != http.StatusNotFound {
+		t.Errorf("RevokeToken(ci) twice = %v, want a 404", err)
+	}
+	if err := h.Client.RevokeToken(ctx(), strings.Repeat("x", 65)); !errors.As(err, &apiErr) || apiErr.Status != http.StatusNotFound {
+		t.Errorf("RevokeToken(a name too long to exist) = %v, want a 404", err)
+	}
+
+	// A client may revoke the token it uses; the next request is refused.
+	if err := h.Client.RevokeToken(ctx(), "test"); err != nil {
+		t.Fatalf("RevokeToken(own token) = %v", err)
+	}
+	if _, err := h.Client.Tokens(ctx()); !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnauthorized {
+		t.Errorf("a request after revoking the own token = %v, want a 401", err)
 	}
 }
 

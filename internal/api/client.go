@@ -321,6 +321,23 @@ func (c *Client) AllSecrets(ctx context.Context) ([]Secret, error) {
 	return out, err
 }
 
+// Tokens lists the API tokens, without the tokens themselves.
+func (c *Client) Tokens(ctx context.Context) ([]Token, error) {
+	var out []Token
+	err := c.getJSON(ctx, "/v1/tokens", nil, &out)
+	return out, err
+}
+
+// RevokeToken revokes the token called name. Revoking the token the
+// client itself uses is allowed; the next request is then refused.
+func (c *Client) RevokeToken(ctx context.Context, name string) error {
+	resp, err := c.do(ctx, http.MethodDelete, "/v1/tokens/"+url.PathEscape(name), nil, "", nil)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
 func secretPath(app, name string) string {
 	return "/v1/apps/" + url.PathEscape(app) + "/secrets/" + url.PathEscape(name)
 }
