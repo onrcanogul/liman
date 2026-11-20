@@ -228,6 +228,34 @@ from someone who can run `docker inspect` on the server, or from the app
 itself: the value is in the container's environment in plain text. There is
 no API to read a secret back.
 
+### Rotating the master key
+
+```
+limand key rotate                  # the daemon must be stopped
+limand key list                    # keys, and the secrets and backups that need each
+limand key retire <id> [--force]   # delete an old key
+```
+
+`key rotate` makes a new master key and seals every secret again with it.
+Every sealed value and every backup signature names the key that made it
+(by a short ID derived from the key, which reveals nothing about it), so
+the old key moves to `master.key.old/<id>.key` and keeps opening what was
+made with it: backups from before the rotation still verify and restore,
+and a restore seals their secrets again with the current key. The steps are
+ordered so that an interruption at any point leaves everything readable;
+running the command again finishes it, and until then the daemon warns.
+
+Rotating does **not** change the secrets themselves. If the old key may
+have leaked together with the database or a backup, the values in them have
+leaked too: change each one where it comes from (the database password, the
+API key) and set it again. Backups made with the old key stay readable to
+anyone who has that key; deleting it here does not change that.
+
+`key retire` deletes an old key once nothing needs it. It refuses while
+secrets in the database are sealed with it, and lists the backups signed
+with it, which only `--force` gives up. After that those backups cannot be
+checked or restored, unless the key file is put back.
+
 ## The panel
 
 While it runs, the daemon serves a web panel at `/ui/` on its listen address (`http://127.0.0.1:7070/ui/` by default):
@@ -284,6 +312,7 @@ monitor disabled those two charts are empty.
 | `config.yaml` | Optional settings, see below |
 | `liman.db` | SQLite database: step and restart history, releases, token hashes, encrypted secrets, seven days of health checks |
 | `master.key` | The key the secrets are encrypted with; created on first start |
+| `master.key.old/` | Keys a rotation replaced, kept for what was made with them |
 | `acme-account.key` | The key of the ACME account, when `acme` is set up; created on first use |
 
 ```yaml
@@ -556,7 +585,8 @@ together when copying backups elsewhere.
 **The master key is not in the backup**, on purpose: a backup that carries
 its own key protects nothing. Copy `master.key` once, by hand, to a place
 that is not where the backups go. Without it the secrets in every backup are
-lost; `verify` and `restore` say so when the key does not match.
+lost; `verify` and `restore` say so, and name the key they need, when the
+server does not have it. After `limand key rotate`, back up the new key too.
 
 On a server installed with `install.sh` a systemd timer takes a backup every
 day into `/var/backups/liman` and keeps the newest 14
