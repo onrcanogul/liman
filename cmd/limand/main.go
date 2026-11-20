@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"log/syslog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -35,6 +36,14 @@ func run() int {
 		Connect: func(ctx context.Context) (engine.Engine, error) {
 			return docker.Connect(ctx)
 		},
+	}
+	// The anchors of audit records added by limand commands go to the
+	// system log, where journald keeps them next to the daemon's own
+	// (journalctl -t limand). Without a system log there are none; the
+	// command still works.
+	if w, err := syslog.New(syslog.LOG_INFO|syslog.LOG_DAEMON, "limand"); err == nil {
+		d.AuditAnchor = w
+		defer func() { _ = w.Close() }()
 	}
 	return d.Run(ctx, os.Args[1:])
 }

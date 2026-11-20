@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/onrcanogul/liman/internal/api"
+	"github.com/onrcanogul/liman/internal/audit"
 	"github.com/onrcanogul/liman/internal/backup"
 	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/deploy"
@@ -90,6 +91,7 @@ func New(t *testing.T, options ...func(*server.Server)) *Harness {
 		Store:   st,
 		Secrets: vault,
 		Backups: &backup.Service{Store: st, Dir: h.BackupDir, KeyPath: keyPath},
+		Audit:   &audit.Recorder{Store: st, Keys: audit.KeysAt(keyPath)},
 		Connect: func(context.Context) (engine.Engine, error) {
 			if h.ConnectErr != nil {
 				return nil, h.ConnectErr

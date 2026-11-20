@@ -224,6 +224,8 @@ func TestBackupVerify(t *testing.T) {
 
 func TestBackupRestoreBringsBackTheStateOfTheBackup(t *testing.T) {
 	td := newTestDaemon(t)
+	anchors := &syncBuffer{}
+	td.AuditAnchor = anchors
 	seed(t, td)
 	dir := t.TempDir()
 	ctx := context.Background()
@@ -261,7 +263,19 @@ func TestBackupRestoreBringsBackTheStateOfTheBackup(t *testing.T) {
 	if n, err := st.CountSecrets(ctx); err != nil || n != 1 {
 		t.Errorf("secrets after restore = %d, %v; want 1", n, err)
 	}
+	// The restored trail is the backup's (which does not hold its own
+	// creation), and the restore is its next record.
+	if rows, err := st.AuditEntries(ctx, nil, 10); err != nil || len(rows) != 1 || rows[0].Action != "backup.restore" ||
+		!strings.Contains(rows[0].Target, filepath.Base(file)) || !strings.Contains(rows[0].Target, "replaced database kept as liman.db.replaced-") {
+		t.Errorf("audit trail after restore = %+v, %v; want the restore", rows, err)
+	}
 	_ = st.Close()
+	// Every record a command added has its anchor line.
+	for _, action := range []string{"backup.create", "token.revoke", "token.create", "backup.restore"} {
+		if !strings.Contains(anchors.String(), "action="+action) {
+			t.Errorf("no anchor line for %s:\n%s", action, anchors.String())
+		}
+	}
 
 	// The database that was replaced is kept, complete, under another name.
 	kept, _ := filepath.Glob(filepath.Join(td.Home, "liman.db.replaced-*"))
@@ -281,6 +295,10 @@ func TestBackupRestoreBringsBackTheStateOfTheBackup(t *testing.T) {
 	defer func() { _ = old.Close() }()
 	if tokens, err := old.Tokens(ctx); err != nil || len(tokens) != 1 || tokens[0].Name != "later" {
 		t.Errorf("tokens in the database set aside = %+v, %v; want only later", tokens, err)
+	}
+	// What was recorded after the backup is in the database set aside.
+	if rows, err := old.AuditEntries(ctx, nil, 10); err != nil || len(rows) != 3 || rows[2].Action != "token.create" {
+		t.Errorf("audit trail of the database set aside = %+v, %v; want the backup, the revoke and the create", rows, err)
 	}
 }
 

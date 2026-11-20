@@ -10,6 +10,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/onrcanogul/liman/internal/api"
+	"github.com/onrcanogul/liman/internal/audit"
 	"github.com/onrcanogul/liman/internal/backup"
 	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/secrets"
@@ -70,6 +71,9 @@ func (d *Daemon) keyRotate(ctx context.Context, cfg config.Config) int {
 		}
 		return d.fail(err)
 	}
+
+	// Signed with the new key: the keyring is read again for the entry.
+	d.auditor(st).Record(ctx, audit.ServerActor(), audit.KeyRotate, "", rot.Old.String()+" -> "+rot.New.String(), nil)
 
 	if rot.Resumed {
 		fmt.Fprintf(d.Stdout, "Finished an interrupted rotation: the master key is now %s (was %s)\n", rot.New, rot.Old)
@@ -293,7 +297,21 @@ func (d *Daemon) keyRetire(ctx context.Context, cfg config.Config, idText string
 	if err := os.Remove(file); err != nil {
 		return d.fail(err)
 	}
+	// Audit entries it signed are not a reason to keep a key: they would
+	// hold on to every key ever used. They can no longer be checked, and
+	// verify says so; the chain after them still is.
+	var signedEntries int64
+	if st, err := d.openStore(ctx); err == nil {
+		if counts, err := st.AuditKeyCounts(ctx); err == nil {
+			signedEntries = counts[id.String()]
+		}
+		d.auditor(st).Record(ctx, audit.ServerActor(), audit.KeyRetire, "", id.String(), nil)
+		_ = st.Close()
+	}
 	fmt.Fprintf(d.Stdout, "Retired key %s: removed %s.\n", id, file)
+	if signedEntries > 0 {
+		fmt.Fprintf(d.Stdout, "%s signed with it can no longer be checked; limand audit verify reports them as unchecked.\n", count(int(signedEntries), "audit record"))
+	}
 	if len(u.backups) > 0 {
 		fmt.Fprintf(d.Stdout, "%s signed with it can no longer be checked or restored.\n", count(len(u.backups), "backup"))
 	}

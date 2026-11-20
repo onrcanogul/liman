@@ -29,6 +29,9 @@ type requestMeta struct {
 	expires time.Time
 	// apps are the apps the token is limited to; nil for every app.
 	apps []string
+	// created is when the token was created: with its name, it tells the
+	// token apart from a later one of the same name, for the audit trail.
+	created time.Time
 }
 
 // metaKey is the context key for *requestMeta. An unexported type of its
@@ -113,7 +116,7 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		}
 
 		meta := metaOf(r.Context())
-		meta.token, meta.scope, meta.expires, meta.apps = info.Name, info.Scope, info.ExpiresAt, info.Apps
+		meta.token, meta.scope, meta.expires, meta.apps, meta.created = info.Name, info.Scope, info.ExpiresAt, info.Apps, info.CreatedAt
 		s.recordUse(r.Context(), info)
 
 		// A read-only token may look and nothing else. The rule is about

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/onrcanogul/liman/internal/audit"
 	"github.com/onrcanogul/liman/internal/backup"
 	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/secrets"
@@ -142,6 +143,9 @@ func (d *Daemon) backupCreate(ctx context.Context, args []string) int {
 		return d.fail(err)
 	}
 	dest, rep, err := backup.Create(ctx, st, dir, d.keyPath(cfg))
+	// Into the live database, after the copy: the backup does not hold
+	// its own entry. The daily timer runs this too, as the liman user.
+	d.auditor(st).Record(ctx, audit.ServerActor(), audit.BackupCreate, "", filepath.Base(dest), err)
 	_ = st.Close()
 	if err != nil {
 		return d.fail(err)
@@ -393,6 +397,15 @@ func (d *Daemon) backupRestore(ctx context.Context, args []string) int {
 	if err != nil {
 		fmt.Fprintf(d.Stderr, "limand: could not remove older set-aside databases: %v\n", err)
 	}
+
+	// The restored database has the trail as it was when the backup was
+	// made; the restore is its next entry. What was recorded after the
+	// backup is in the database that was set aside.
+	restored := filepath.Base(source)
+	if aside != "" {
+		restored += "; replaced database kept as " + filepath.Base(aside)
+	}
+	d.auditor(st).Record(ctx, audit.ServerActor(), audit.BackupRestore, "", restored, nil)
 
 	// A restore turns the clock back for the tokens too: one that was
 	// revoked after the backup was made is valid again. Expiry does not go

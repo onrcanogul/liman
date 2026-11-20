@@ -23,6 +23,7 @@ import (
 	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/app"
 	"github.com/onrcanogul/liman/internal/applock"
+	"github.com/onrcanogul/liman/internal/audit"
 	"github.com/onrcanogul/liman/internal/backup"
 	"github.com/onrcanogul/liman/internal/buildinfo"
 	"github.com/onrcanogul/liman/internal/deploy"
@@ -78,6 +79,10 @@ type Server struct {
 
 	// Log receives one line per request. Nil discards them.
 	Log *slog.Logger
+
+	// Audit receives one entry per change made through the API: who, what,
+	// how it ended. Nil records nothing.
+	Audit *audit.Recorder
 
 	// ConfirmTimeout is how long a step-by-step deploy waits for the client
 	// to answer. Zero means ten minutes.
@@ -442,6 +447,7 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 
 	if !dryRun {
 		s.recordRelease(a, res.Release, started, err)
+		s.record(r, audit.Deploy, a.Name, releaseTarget(res.Release, a.Image), err)
 	}
 
 	// Release the app before telling the client that the deploy is over.
@@ -508,6 +514,9 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res, err := deployer.Rollback(ctx, name, opts)
+	if !dryRun {
+		s.record(r, audit.Rollback, name, res.Release, err)
+	}
 
 	result := &api.DeployResult{
 		OK:        err == nil,
@@ -676,6 +685,10 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result := api.StopResult{Removed: []string{}}
+	// From here on something may change, so whatever happens is recorded,
+	// with what was removed by then.
+	var stopErr error
+	defer func() { s.record(r, audit.Stop, name, strings.Join(result.Removed, ", "), stopErr) }()
 
 	// Take the app out of the proxy first. The other way round there would
 	// be a moment in which Nginx forwards requests to a container that is
@@ -683,6 +696,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	if s.Proxy != nil {
 		removed, err := s.unroute(ctx, name)
 		if err != nil {
+			stopErr = err
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -693,6 +707,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 
 	for _, c := range containers {
 		if err := eng.Remove(ctx, c.Name); err != nil {
+			stopErr = err
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -969,9 +984,11 @@ func (s *Server) handleBackupCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, err)
 		return
 	case err != nil:
+		s.record(r, audit.BackupCreate, "", "", err)
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	s.record(r, audit.BackupCreate, "", entry.Name, nil)
 
 	s.logger().Info("backup created", "name", entry.Name, "bytes", entry.Size, "removed_older", removed)
 	writeJSON(w, http.StatusCreated, api.BackupResult{
@@ -1102,8 +1119,9 @@ func (s *Server) handleSecretSet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	// The value is never logged; that it changed is worth a line.
+	// The value is never logged or recorded; that it changed is.
 	s.logger().Info("secret set", "app", name, "secret", key)
+	s.record(r, audit.SecretSet, name, key, nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1122,9 +1140,11 @@ func (s *Server) handleSecretDelete(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, secrets.ErrNotSet):
 		writeError(w, http.StatusNotFound, err)
 	case err != nil:
+		s.record(r, audit.SecretDelete, name, key, err)
 		writeError(w, http.StatusInternalServerError, err)
 	default:
 		s.logger().Info("secret deleted", "app", name, "secret", key)
+		s.record(r, audit.SecretDelete, name, key, nil)
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -1192,13 +1212,31 @@ func (s *Server) handleTokenRevoke(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, err)
 	case err != nil:
+		s.record(r, audit.TokenRevoke, "", name, err)
 		writeError(w, http.StatusInternalServerError, err)
 	default:
+		s.record(r, audit.TokenRevoke, "", name, nil)
 		// Who closed which door is worth a line of its own, at a level
 		// that is not filtered out.
 		s.logger().Warn("token revoked", "token", name, "by", metaOf(r.Context()).token)
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+// record writes an audit entry for what this request did, in the name of
+// its token.
+func (s *Server) record(r *http.Request, action, app, target string, err error) {
+	m := metaOf(r.Context())
+	s.Audit.Record(r.Context(), audit.TokenActor(m.token, m.created), action, app, target, err)
+}
+
+// releaseTarget describes a deployed release for the audit trail. The
+// release can be empty when a deploy failed before it got one.
+func releaseTarget(release, image string) string {
+	if release == "" {
+		return image
+	}
+	return release + " (" + image + ")"
 }
 
 // optionalTime is nil for the zero time, for fields that are left out of

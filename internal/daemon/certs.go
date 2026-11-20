@@ -11,6 +11,7 @@ import (
 
 	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/applock"
+	"github.com/onrcanogul/liman/internal/audit"
 	"github.com/onrcanogul/liman/internal/certs"
 	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/deploy"
@@ -70,6 +71,8 @@ type certRenewer struct {
 	locks   *applock.Locks
 	log     *slog.Logger
 	now     func() time.Time
+	// audit records the certificates it obtains; nil records nothing.
+	audit *audit.Recorder
 }
 
 // run checks after first and then every every, until ctx is cancelled.
@@ -114,10 +117,12 @@ func (r *certRenewer) check(ctx context.Context) {
 // is not renewed: once the domain points elsewhere every attempt would
 // fail, and each failure counts against the CA's limits.
 func (r *certRenewer) renewDue(ctx context.Context, containers []engine.Container) {
-	inUse := map[string]bool{}
+	// The app each domain is in use by, for the audit trail; a domain no
+	// app uses is not renewed.
+	inUse := map[string]string{}
 	for _, c := range containers {
 		if c.Domain != "" {
-			inUse[c.Domain] = true
+			inUse[c.Domain] = c.App
 		}
 	}
 	list, err := r.store.List()
@@ -127,7 +132,7 @@ func (r *certRenewer) renewDue(ctx context.Context, containers []engine.Containe
 	now := r.now()
 	renewed := 0
 	for _, info := range list {
-		if !info.Due(now) || !inUse[info.Domain] {
+		if !info.Due(now) || inUse[info.Domain] == "" {
 			continue
 		}
 		r.log.Info("certificate: renewing", "domain", info.Domain, "expires", info.NotAfter.UTC().Format(time.RFC3339))
@@ -143,6 +148,9 @@ func (r *certRenewer) renewDue(ctx context.Context, containers []engine.Containe
 			continue
 		}
 		r.log.Info("certificate: renewed", "domain", info.Domain, "expires", got.NotAfter.UTC().Format(time.RFC3339))
+		// Only what changed is recorded: a failed renewal changes nothing
+		// and is tried again at the next check, in the log each time.
+		r.audit.Record(ctx, audit.Renewer, audit.CertObtain, inUse[info.Domain], info.Domain, nil)
 		renewed++
 	}
 	if renewed == 0 {
@@ -199,6 +207,7 @@ func (r *certRenewer) issueFor(ctx context.Context, c engine.Container) {
 		return
 	}
 	r.log.Info("certificate: HTTPS is on", "app", c.App, "domain", c.Domain)
+	r.audit.Record(ctx, audit.Renewer, audit.CertObtain, c.App, c.Domain, nil)
 }
 
 // apply tests the Nginx config on disk and reloads it.

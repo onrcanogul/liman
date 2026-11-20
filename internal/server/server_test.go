@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/onrcanogul/liman/internal/api"
+	"github.com/onrcanogul/liman/internal/audit"
 	"github.com/onrcanogul/liman/internal/engine"
 	"github.com/onrcanogul/liman/internal/panel"
 	"github.com/onrcanogul/liman/internal/secrets"
@@ -2381,8 +2382,18 @@ func TestADomainBelongsToOneApp(t *testing.T) {
 	release()
 	<-done
 
-	if _, err := h.Client.Deploy(ctx(), []byte(definition), api.DeployOptions{}, io.Discard); err != nil {
-		t.Fatal(err)
+	// The client gives up at once; the server finishes the aborted deploy
+	// (records it, releases the app) a moment later.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := h.Client.Deploy(ctx(), []byte(definition), api.DeployOptions{}, io.Discard)
+		if err == nil {
+			break
+		}
+		if !errors.As(err, &apiErr) || apiErr.Status != http.StatusConflict || time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if _, err := h.Client.Deploy(ctx(), []byte(sameDomain), api.DeployOptions{}, io.Discard); !errors.As(err, &apiErr) || apiErr.Status != http.StatusConflict || !strings.Contains(err.Error(), "used by app orders-api") {
 		t.Errorf("Deploy(shop) with orders-api's domain = %v, want a 409 naming orders-api", err)
@@ -2477,6 +2488,97 @@ func TestOnlyTheTokenThatAskedCanAnswer(t *testing.T) {
 			break
 		}
 	}
+}
+
+func TestChangesAreAudited(t *testing.T) {
+	h := servertest.New(t)
+	other, err := h.Store.CreateToken(ctx(), "laptop")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := h.Client.Deploy(ctx(), []byte(definition), api.DeployOptions{}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	// A dry run changes nothing and is not recorded; a refused request
+	// neither (it is in the request log).
+	if _, err := h.Client.Deploy(ctx(), []byte(definition), api.DeployOptions{DryRun: true}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Client.SetSecret(ctx(), "orders-api", "bad name", []byte("v")); err == nil {
+		t.Fatal("an invalid secret name was accepted")
+	}
+	if err := h.Client.SetSecret(ctx(), "orders-api", "API_KEY", []byte("hunter2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&api.Client{BaseURL: h.URL, Token: other}).DeleteSecret(ctx(), "orders-api", "API_KEY"); err != nil {
+		t.Fatal(err)
+	}
+	h.HealthErr = errors.New("503")
+	if _, err := h.Client.Deploy(ctx(), []byte(definition), api.DeployOptions{}, io.Discard); err == nil {
+		t.Fatal("the failing deploy succeeded")
+	}
+	h.HealthErr = nil
+	if _, err := h.Client.Stop(ctx(), "orders-api"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Client.CreateBackup(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Client.RevokeToken(ctx(), "laptop"); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := h.Store.AuditEntries(ctx(), nil, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, e := range rows {
+		got = append(got, fmt.Sprintf("%s %s %s %s %v", strings.SplitN(e.Actor, "@", 2)[0], e.Action, e.App, e.Target, e.OK))
+		if strings.Contains(e.Target+e.Error, "hunter2") {
+			t.Errorf("an audit entry contains a secret value: %+v", e)
+		}
+	}
+	want := []string{
+		"token:test deploy orders-api r1 (ghcr.io/user/orders-api:1.4) true",
+		"token:test secret.set orders-api API_KEY true",
+		"token:laptop secret.delete orders-api API_KEY true",
+		// r2 went to the dry run, which is not recorded.
+		"token:test deploy orders-api r3 (ghcr.io/user/orders-api:1.4) false",
+		"token:test stop orders-api orders-api-r1 true",
+		"token:test backup.create  " + rowsBackupName(t, h) + " true",
+		"token:test token.revoke  laptop true",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("audit trail:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	if !strings.Contains(rows[3].Error, "503") {
+		t.Errorf("the failed deploy's entry = %+v; want its error", rows[3])
+	}
+	// The actor carries the token's creation time: a later token with the
+	// same name is a different actor.
+	if !strings.HasPrefix(rows[0].Actor, "token:test@20") {
+		t.Errorf("actor = %q", rows[0].Actor)
+	}
+
+	keys, err := audit.KeysAt(h.KeyPath)()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep, err := audit.Verify(ctx(), h.Store, keys); err != nil || !rep.Intact() || rep.Entries != int64(len(want)) || rep.Unsigned != 0 {
+		t.Errorf("Verify() = %+v, %v; want every entry intact and signed", rep, err)
+	}
+}
+
+// rowsBackupName is the name of the one backup in the harness's directory.
+func rowsBackupName(t *testing.T, h *servertest.Harness) string {
+	t.Helper()
+	list, err := h.Client.Backups(ctx())
+	if err != nil || len(list.Backups) != 1 {
+		t.Fatalf("Backups() = %+v, %v", list, err)
+	}
+	return list.Backups[0].Name
 }
 
 func TestRepeatedReadsAreLoggedOnce(t *testing.T) {

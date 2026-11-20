@@ -7,6 +7,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/app"
 	"github.com/onrcanogul/liman/internal/applock"
+	"github.com/onrcanogul/liman/internal/audit"
 	"github.com/onrcanogul/liman/internal/backup"
 	"github.com/onrcanogul/liman/internal/buildinfo"
 	"github.com/onrcanogul/liman/internal/config"
@@ -59,6 +61,9 @@ Usage:
                                   nothing about the daemon as a whole
   limand token list               List tokens, when they expire and were last used
   limand token revoke <name>      Revoke a token
+  limand audit verify             Check the audit trail: that no entry was
+                                  changed, removed, inserted or reordered
+                                  since it was written
   limand backup create <dir> [--keep <n>]
                                   Write a copy of the database into <dir> and
                                   check it; with --keep, remove all but the
@@ -118,6 +123,12 @@ type Daemon struct {
 	// once it accepts connections. Tests use it to learn the port.
 	Ready func(addr string)
 
+	// AuditAnchor receives a line for every audit record a limand command
+	// adds (the daemon's own go to its log): the system log in production,
+	// so that journald keeps them next to the daemon's (journalctl -t
+	// limand). Nil writes none; tests leave it nil.
+	AuditAnchor io.Writer
+
 	// rotationUnfinished is set by openVault when a rotation's new key is
 	// lying next to the master key.
 	rotationUnfinished bool
@@ -143,6 +154,8 @@ func (d *Daemon) Run(ctx context.Context, args []string) int {
 		return d.runCert(ctx, args[1:])
 	case "key":
 		return d.runKey(ctx, args[1:])
+	case "audit":
+		return d.runAudit(ctx, args[1:])
 	case "version":
 		return d.version(ctx, args[1:])
 	case "help", "-h", "--help":
@@ -182,7 +195,14 @@ func (d *Daemon) serve(ctx context.Context) int {
 		return d.fail(err)
 	}
 
-	srv := &server.Server{Store: st, Connect: connect, Log: log, Locks: locks, Secrets: vault, Started: time.Now()}
+	recorder := &audit.Recorder{Store: st, Keys: audit.KeysAt(d.keyPath(cfg)), Log: log}
+	// The trail's head as the daemon finds it, in the same form as the
+	// anchor of every record it adds: records written while it was
+	// stopped (a key rotation, a restore) are anchored from here on.
+	if head, err := st.AuditEntries(ctx, nil, 1); err == nil && len(head) == 1 {
+		log.Info("audit", "seq", head[0].Seq, "action", head[0].Action, "mac", hex.EncodeToString(head[0].MAC), "head", true)
+	}
+	srv := &server.Server{Store: st, Connect: connect, Log: log, Locks: locks, Secrets: vault, Started: time.Now(), Audit: recorder}
 	srv.Keys = d.keysForAPI(cfg)
 	srv.KeyRotationUnfinished = d.rotationUnfinished
 	if cfg.Nginx.CertDir != "" {
@@ -222,7 +242,7 @@ func (d *Daemon) serve(ctx context.Context) int {
 		srv.Certs = deployCerts{is: is}
 		renewer := &certRenewer{
 			store: is.Store, obtain: is.Obtain, proxy: proxy,
-			connect: connect, locks: locks, log: log, now: time.Now,
+			connect: connect, locks: locks, log: log, now: time.Now, audit: recorder,
 		}
 		go func() {
 			defer close(certsDone)
@@ -248,7 +268,7 @@ func (d *Daemon) serve(ctx context.Context) int {
 			Interval:         time.Duration(cfg.Monitor.Interval),
 			FailureThreshold: cfg.Monitor.FailureThreshold,
 			Log:              log,
-			OnRestart:        recordRestart(st, log),
+			OnRestart:        recordRestart(st, recorder, log),
 			OnCheck:          recordChecks(st, log, healthRetention),
 		}
 		srv.Monitoring = &api.MonitorInfo{
@@ -409,6 +429,24 @@ func (d *Daemon) openVault(ctx context.Context, cfg config.Config, st *store.Sto
 	return secrets.NewVault(key, st)
 }
 
+// auditor returns the recorder for a limand command run on the server. Its
+// rows are signed like the daemon's. What goes wrong is shown on stderr;
+// the anchor line of each row goes to AuditAnchor, not to the terminal,
+// where nobody would keep it. Without anchors, a record a command added
+// (a token created on the server, say) could be cut off the end of the
+// trail unseen.
+func (d *Daemon) auditor(st *store.Store) *audit.Recorder {
+	keyPath := filepath.Join(d.Home, "master.key")
+	if cfg, err := config.Load(filepath.Join(d.Home, "config.yaml")); err == nil {
+		keyPath = d.keyPath(cfg)
+	}
+	handlers := fanout{slog.NewTextHandler(d.Stderr, &slog.HandlerOptions{Level: slog.LevelError})}
+	if d.AuditAnchor != nil {
+		handlers = append(handlers, slog.NewTextHandler(d.AuditAnchor, nil))
+	}
+	return &audit.Recorder{Store: st, Keys: audit.KeysAt(keyPath), Log: slog.New(handlers)}
+}
+
 // keyPath returns where the master key is kept.
 func (d *Daemon) keyPath(cfg config.Config) string {
 	if cfg.Secrets.KeyFile != "" {
@@ -419,9 +457,9 @@ func (d *Daemon) keyPath(cfg config.Config) string {
 
 // recordRestart returns the callback that writes the monitor's restarts
 // into the history, next to the steps of deploys.
-func recordRestart(st *store.Store, log *slog.Logger) func(monitor.Event) {
+func recordRestart(st *store.Store, rec *audit.Recorder, log *slog.Logger) func(monitor.Event) {
 	return func(ev monitor.Event) {
-		rec := store.Event{
+		ev2 := store.Event{
 			Time:       ev.Started,
 			App:        ev.App,
 			Release:    ev.Release,
@@ -431,14 +469,15 @@ func recordRestart(st *store.Store, log *slog.Logger) func(monitor.Event) {
 			DurationMS: ev.Duration.Milliseconds(),
 		}
 		if ev.Err != nil {
-			rec.Error = ev.Err.Error()
+			ev2.Error = ev.Err.Error()
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := st.AppendEvent(ctx, rec); err != nil {
+		if err := st.AppendEvent(ctx, ev2); err != nil {
 			log.Error("restart not recorded", "app", ev.App, "error", err)
 		}
+		rec.Record(ctx, audit.Monitor, audit.Restart, ev.App, ev.Container, ev.Err)
 	}
 }
 
@@ -621,6 +660,15 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 	if len(apps) > 0 {
 		what += " for " + strings.Join(apps, ", ")
 	}
+	// Recorded with what the token may do, never with the token itself.
+	target := name + " (" + scope
+	if len(apps) > 0 {
+		target += ", " + strings.Join(apps, ", ")
+	}
+	if !expiresAt.IsZero() {
+		target += ", until " + expiresAt.UTC().Format(time.RFC3339)
+	}
+	d.auditor(st).Record(ctx, audit.ServerActor(), audit.TokenCreate, "", target+")", nil)
 	if !expiresAt.IsZero() {
 		what += fmt.Sprintf(" (expires %s)", expiresAt.Local().Format("2006-01-02 15:04"))
 	}
@@ -711,6 +759,7 @@ func (d *Daemon) tokenRevoke(ctx context.Context, args []string) int {
 	if err := st.RevokeToken(ctx, args[0]); err != nil {
 		return d.fail(err)
 	}
+	d.auditor(st).Record(ctx, audit.ServerActor(), audit.TokenRevoke, "", args[0], nil)
 	fmt.Fprintf(d.Stdout, "Revoked token %q\n", args[0])
 	return exitOK
 }
