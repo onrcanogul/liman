@@ -96,7 +96,7 @@ liman deploy --step <file>   # ask before every step; "n" undoes what was done
 liman rollback <app>         # put the previous release back into service
 liman ps                     # containers managed by liman
 liman logs -f <app>          # follow the logs of the newest release
-liman stop <app>             # stop and remove all containers of an app
+liman stop <app>             # stop and remove all containers of an app; its secrets are kept
 liman history [-n N] [app]   # every executed step, with result and duration
 liman status                 # is the daemon reachable, is the token accepted
 ```

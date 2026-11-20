@@ -646,3 +646,26 @@ func TestDeployWithMissingSecretSaysHowToFixIt(t *testing.T) {
 		t.Errorf("stderr = %q, want it to contain %q", h.stderr.String(), want)
 	}
 }
+
+func TestStopSaysTheSecretsAreKept(t *testing.T) {
+	h := newHarness(t, "")
+	h.Engine.Add(engine.Container{Name: "web-r1", App: "web"})
+	for _, key := range []string{"API_KEY", "DATABASE_URL"} {
+		if err := h.Client.SetSecret(context.Background(), "web", key, []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if code := h.run("stop", "web"); code != exitOK {
+		t.Fatalf("exit code = %d, stderr: %s", code, h.stderr.String())
+	}
+	want := "Kept the secrets of web (API_KEY, DATABASE_URL); deploying it again uses them. Remove one with: liman secret rm web <name>\n"
+	if !strings.HasSuffix(h.stdout.String(), want) {
+		t.Errorf("stdout = %q, want it to end with %q", h.stdout.String(), want)
+	}
+
+	// They really are still there.
+	if code := h.run("secret", "list", "web"); code != exitOK || !strings.Contains(h.stdout.String(), "DATABASE_URL") {
+		t.Errorf("secret list after stop: code %d, stdout %q", code, h.stdout.String())
+	}
+}

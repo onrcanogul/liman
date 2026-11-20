@@ -100,6 +100,9 @@ type StopResult struct {
 	Removed []string `json:"removed"`
 	// ProxyConfig is the proxy config file that was removed, if any.
 	ProxyConfig string `json:"proxy_config,omitempty"`
+	// KeptSecrets names the app's secrets, which a stop leaves in place:
+	// deploying the app again needs them.
+	KeptSecrets []string `json:"kept_secrets,omitempty"`
 }
 
 // Health is the answer to GET /v1/health.

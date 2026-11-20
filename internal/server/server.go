@@ -558,6 +558,19 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		}
 		result.Removed = append(result.Removed, c.Name)
 	}
+
+	// Secrets are kept on purpose: deploying the app again needs them, and
+	// a stop must not throw away values that may not exist anywhere else.
+	// The answer names them, so that whoever stopped the app knows they are
+	// still there. The containers are gone by now; a failure to list the
+	// secrets must not turn that success into an error.
+	if kept, err := s.Store.ListSecrets(ctx, name); err != nil {
+		s.logger().Warn("stopped app, but could not list its secrets", "app", name, "error", err.Error())
+	} else {
+		for _, k := range kept {
+			result.KeptSecrets = append(result.KeptSecrets, k.Name)
+		}
+	}
 	unlock()
 	writeJSON(w, http.StatusOK, result)
 }

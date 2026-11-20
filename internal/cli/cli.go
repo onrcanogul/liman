@@ -367,6 +367,10 @@ func (c *CLI) runStop(ctx context.Context, args []string) int {
 	for _, name := range res.Removed {
 		fmt.Fprintf(c.Stdout, "Stopped and removed %s\n", name)
 	}
+	if len(res.KeptSecrets) > 0 {
+		fmt.Fprintf(c.Stdout, "Kept the secrets of %s (%s); deploying it again uses them. Remove one with: liman secret rm %s <name>\n",
+			args[0], strings.Join(res.KeptSecrets, ", "), args[0])
+	}
 	return exitOK
 }
 
