@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -101,5 +102,30 @@ func TestUpgradeDoesNotHappenWithoutItsBackup(t *testing.T) {
 	}
 	if v, _ := store.SchemaVersionOf(context.Background(), filepath.Join(td.Home, "liman.db")); v != 4 {
 		t.Errorf("the schema changed to %d without a backup", v)
+	}
+}
+
+func TestVersionShowsTheSchema(t *testing.T) {
+	td := newTestDaemon(t)
+	ctx := context.Background()
+	want := store.SchemaVersion()
+
+	if code := td.Run(ctx, []string{"version", "--schema"}); code != exitOK || td.stdout.String() != fmt.Sprintf("0 %d\n", want) {
+		t.Errorf("version --schema without a database: code %d, %q", code, td.stdout.String())
+	}
+	seed(t, td)
+	downgrade(t, td.Home)
+	before := len(td.stdout.String())
+	if code := td.Run(ctx, []string{"version", "--schema"}); code != exitOK || td.stdout.String()[before:] != fmt.Sprintf("4 %d\n", want) {
+		t.Errorf("version --schema with an old database: code %d, %q", code, td.stdout.String()[before:])
+	}
+	if code := td.Run(ctx, []string{"version"}); code != exitOK || !strings.Contains(td.stdout.String(), "schema 4; the daemon backs it up and upgrades it to") {
+		t.Errorf("version with an old database:\n%s", td.stdout.String())
+	}
+	if v, _ := store.SchemaVersionOf(ctx, filepath.Join(td.Home, "liman.db")); v != 4 {
+		t.Errorf("version changed the schema to %d", v)
+	}
+	if code := td.Run(ctx, []string{"version", "--bogus"}); code != exitUsage {
+		t.Errorf("version --bogus: code %d, want %d", code, exitUsage)
 	}
 }

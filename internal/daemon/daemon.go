@@ -83,7 +83,9 @@ Usage:
                                   Delete an old key. Refused while secrets
                                   depend on it; backups signed with it are
                                   listed, and only --force retires it anyway
-  limand version                  Print version information
+  limand version [--schema]       Print the version, and the database schema
+                                  this limand uses and liman.db has. With
+                                  --schema just the two numbers: "<db> <limand>"
   limand help                     Show this help
 
 Files are kept in $LIMAN_HOME (default ~/.liman): config.yaml and liman.db.
@@ -135,8 +137,7 @@ func (d *Daemon) Run(ctx context.Context, args []string) int {
 	case "key":
 		return d.runKey(ctx, args[1:])
 	case "version":
-		fmt.Fprintln(d.Stdout, buildinfo.String())
-		return exitOK
+		return d.version(ctx, args[1:])
 	case "help", "-h", "--help":
 		fmt.Fprint(d.Stdout, usage)
 		return exitOK
@@ -676,6 +677,44 @@ func (d *Daemon) tokenRevoke(ctx context.Context, args []string) int {
 		return d.fail(err)
 	}
 	fmt.Fprintf(d.Stdout, "Revoked token %q\n", args[0])
+	return exitOK
+}
+
+// version prints the version and where the database stands. It never
+// changes anything, so it is safe to run with a new binary before it is
+// started.
+func (d *Daemon) version(ctx context.Context, args []string) int {
+	machine := len(args) == 1 && args[0] == "--schema"
+	if len(args) > 0 && !machine {
+		return d.usageError("limand version [--schema]")
+	}
+	want := store.SchemaVersion()
+	path := filepath.Join(d.Home, "liman.db")
+	have, err := store.SchemaVersionOf(ctx, path)
+	if machine {
+		if err != nil {
+			return d.fail(err)
+		}
+		fmt.Fprintf(d.Stdout, "%d %d\n", have, want)
+		return exitOK
+	}
+
+	fmt.Fprintln(d.Stdout, buildinfo.String())
+	fmt.Fprintf(d.Stdout, "database schema %d\n", want)
+	switch {
+	case err != nil:
+		// The version itself is what was asked for; a database that
+		// cannot be read (another user's, say) is only a note.
+		fmt.Fprintf(d.Stdout, "%s: cannot be read (%v)\n", path, err)
+	case have == 0:
+		fmt.Fprintf(d.Stdout, "%s: not created yet\n", path)
+	case have == want:
+		fmt.Fprintf(d.Stdout, "%s: schema %d, up to date\n", path, have)
+	case have < want:
+		fmt.Fprintf(d.Stdout, "%s: schema %d; the daemon backs it up and upgrades it to %d when it starts\n", path, have, want)
+	default:
+		fmt.Fprintf(d.Stdout, "%s: schema %d, written by a newer limand; this one cannot use it\n", path, have)
+	}
 	return exitOK
 }
 
