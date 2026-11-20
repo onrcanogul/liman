@@ -10,9 +10,11 @@
 package docker
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -158,5 +160,69 @@ func TestPullUnknownImage(t *testing.T) {
 
 	if err := c.Pull(ctx, "traefik/whoami:v0.0.0-does-not-exist", io.Discard); err == nil {
 		t.Error("Pull() of an unknown tag succeeded, want an error")
+	}
+}
+
+func TestFilesAreInTheContainerAndNotInItsConfig(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	c, err := Connect(ctx)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	const name = "liman-integration-files"
+	_ = c.Remove(ctx, name)
+	t.Cleanup(func() { _ = c.Remove(context.Background(), name) })
+	if err := c.Pull(ctx, testImage, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+
+	// whoami is built FROM scratch: it has no /run, so the archive's own
+	// directory entries are what make the path.
+	const value = "postgres://user:hunter2@db/app"
+	if _, err := c.Start(ctx, engine.Spec{
+		App: "liman-integration", Name: name, Image: testImage, ContainerPort: 80, HostPort: 39998,
+		Env:   map[string]string{"DATABASE_URL_FILE": "/run/secrets/DATABASE_URL"},
+		Files: []engine.File{{Path: "/run/secrets/DATABASE_URL", Content: []byte(value), Mode: 0o444}},
+	}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	read := func() (string, *tar.Header) {
+		t.Helper()
+		res, err := c.api.CopyFromContainer(ctx, name, client.CopyFromContainerOptions{SourcePath: "/run/secrets/DATABASE_URL"})
+		if err != nil {
+			t.Fatalf("read the file back: %v", err)
+		}
+		defer func() { _ = res.Content.Close() }()
+		tr := tar.NewReader(res.Content)
+		h, err := tr.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(tr)
+		return string(body), h
+	}
+	body, h := read()
+	if body != value || h.Mode&0o777 != 0o444 || h.Uid != 0 {
+		t.Errorf("the file = %q, mode %o, uid %d; want the value, 0444, root", body, h.Mode&0o777, h.Uid)
+	}
+
+	// Not in the container's configuration, which is what docker inspect
+	// shows and what Docker keeps on disk.
+	inspected, err := c.api.ContainerInspect(ctx, name, client.ContainerInspectOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(fmt.Sprint(inspected.Container.Config), "hunter2") {
+		t.Error("the value is in the container's configuration")
+	}
+
+	// A restart keeps it: it is part of the container.
+	if err := c.Restart(ctx, name); err != nil {
+		t.Fatal(err)
+	}
+	if body, _ := read(); body != value {
+		t.Errorf("after a restart the file holds %q", body)
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"time"
 )
 
@@ -60,6 +61,11 @@ type Spec struct {
 
 	Env map[string]string
 
+	// Files are put into the container after it is created and before it
+	// starts, with their directories. They are part of the container from
+	// then on: a restart keeps them.
+	Files []File
+
 	// MemoryBytes and CPUs are limits; zero means unlimited.
 	MemoryBytes int64
 	CPUs        float64
@@ -68,6 +74,14 @@ type Spec struct {
 	Release    string
 	HealthPath string
 	Domain     string
+}
+
+// File is a file to put into a container.
+type File struct {
+	// Path is absolute, inside the container, such as /run/secrets/KEY.
+	Path    string
+	Content []byte
+	Mode    fs.FileMode
 }
 
 // Container is the observed state of a container.

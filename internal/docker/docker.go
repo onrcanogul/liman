@@ -6,10 +6,13 @@
 package docker
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/netip"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -177,6 +180,23 @@ func (c *Client) Start(ctx context.Context, spec engine.Spec) (string, error) {
 		return "", fmt.Errorf("create container %s: %w", spec.Name, err)
 	}
 
+	// Created but not started yet: the files go in now, so that they are
+	// there before the app's first instruction runs.
+	if len(spec.Files) > 0 {
+		archive, err := filesArchive(spec.Files, time.Now())
+		if err == nil {
+			// Unpacked at the root, the archive's own directory entries
+			// create whatever directories the image lacks (not every
+			// image has /run). Docker refuses to replace a directory with
+			// a file or the other way round.
+			_, err = c.api.CopyToContainer(ctx, created.ID, client.CopyToContainerOptions{DestinationPath: "/", Content: bytes.NewReader(archive)})
+		}
+		if err != nil {
+			_, _ = c.api.ContainerRemove(context.WithoutCancel(ctx), created.ID, client.ContainerRemoveOptions{Force: true})
+			return "", fmt.Errorf("put files into container %s: %w", spec.Name, err)
+		}
+	}
+
 	if _, err := c.api.ContainerStart(ctx, created.ID, client.ContainerStartOptions{}); err != nil {
 		// Creating succeeded but starting failed, typically because the
 		// host port is taken. The created container would keep the name
@@ -187,6 +207,48 @@ func (c *Client) Start(ctx context.Context, spec engine.Spec) (string, error) {
 	}
 
 	return created.ID, nil
+}
+
+// filesArchive returns a tar archive of files, to be unpacked at the root
+// of a container: every directory on the way to each file gets an entry of
+// its own (mode 0755), then the file. Everything belongs to root; the
+// files' modes say who may read them.
+//
+// The archive is built in memory: secrets never touch the host's disk on
+// their way into the container.
+func filesArchive(files []engine.File, now time.Time) ([]byte, error) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	dirs := map[string]bool{}
+	for _, f := range files {
+		clean := path.Clean(f.Path)
+		if !path.IsAbs(clean) || clean != f.Path || clean == "/" {
+			return nil, fmt.Errorf("file path %q must be absolute and clean", f.Path)
+		}
+		rel := strings.TrimPrefix(clean, "/")
+		// Parents first, outermost first: "run", then "run/secrets".
+		parts := strings.Split(rel, "/")
+		for i := 1; i < len(parts); i++ {
+			dir := strings.Join(parts[:i], "/")
+			if dirs[dir] {
+				continue
+			}
+			dirs[dir] = true
+			if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: dir + "/", Mode: 0o755, ModTime: now, Format: tar.FormatPAX}); err != nil {
+				return nil, err
+			}
+		}
+		if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: rel, Mode: int64(f.Mode.Perm()), Size: int64(len(f.Content)), ModTime: now, Format: tar.FormatPAX}); err != nil {
+			return nil, err
+		}
+		if _, err := tw.Write(f.Content); err != nil {
+			return nil, err
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // Inspect implements engine.Engine. GET /containers/{ref}/json.
