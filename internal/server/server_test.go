@@ -1813,7 +1813,7 @@ func TestReadOnlyTokenCanLookAndChangeNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	token, err := h.Store.CreateScopedToken(ctx(), "wallboard", store.ScopeRead)
+	token, err := h.Store.CreateScopedToken(ctx(), "wallboard", store.ScopeRead, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"regexp"
@@ -35,17 +36,29 @@ type TokenInfo struct {
 	Name      string
 	Scope     string
 	CreatedAt time.Time
+	// ExpiresAt is when the token stops working. The zero time means
+	// never: that is what every token created before expiry existed has,
+	// and what a token created without --expires gets.
+	ExpiresAt time.Time
+}
+
+// Expired reports whether the token has stopped working at now.
+func (t TokenInfo) Expired(now time.Time) bool {
+	return !t.ExpiresAt.IsZero() && !now.Before(t.ExpiresAt)
 }
 
 // CreateToken generates a new API token, stores its hash under name and
 // returns the token itself. This is the only moment the token is known; it
 // cannot be recovered later.
 func (s *Store) CreateToken(ctx context.Context, name string) (string, error) {
-	return s.CreateScopedToken(ctx, name, ScopeAdmin)
+	return s.CreateScopedToken(ctx, name, ScopeAdmin, time.Time{})
 }
 
-// CreateScopedToken is CreateToken for a token with the given scope.
-func (s *Store) CreateScopedToken(ctx context.Context, name, scope string) (string, error) {
+// CreateScopedToken is CreateToken for a token with the given scope that
+// stops working at expiresAt; the zero time means never. A time that has
+// already passed is accepted (the token is then useless from the start):
+// deciding what a sensible lifetime is belongs to the caller.
+func (s *Store) CreateScopedToken(ctx context.Context, name, scope string, expiresAt time.Time) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("token name must not be empty")
 	}
@@ -68,9 +81,9 @@ func (s *Store) CreateScopedToken(ctx context.Context, name, scope string) (stri
 	token := TokenPrefix + hex.EncodeToString(raw)
 
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO tokens (name, hash, scope, created_at) VALUES (?, ?, ?, ?)
+		`INSERT INTO tokens (name, hash, scope, created_at, expires_at) VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT (name) DO NOTHING`,
-		name, hashToken(token), scope, formatTime(time.Now()))
+		name, hashToken(token), scope, formatTime(time.Now()), formatOptionalTime(expiresAt))
 	if err != nil {
 		return "", fmt.Errorf("store token: %w", err)
 	}
@@ -88,15 +101,20 @@ func (s *Store) VerifyToken(ctx context.Context, token string) (bool, error) {
 	return ok, err
 }
 
-// LookupToken returns the name and scope of token. ok is false if the
-// token is not valid.
+// LookupToken returns what is known about token. ok is false if the token
+// is not valid: unknown, revoked or expired.
+//
+// An expired token is the one case where info is filled in although ok is
+// false, so that the caller can say why it was refused (and whose token it
+// was) instead of a bare "invalid". Code that only wants a yes or no must
+// look at ok and nothing else.
 func (s *Store) LookupToken(ctx context.Context, token string) (info TokenInfo, ok bool, err error) {
 	if !strings.HasPrefix(token, TokenPrefix) {
 		return TokenInfo{}, false, nil
 	}
 	candidate := []byte(hashToken(token))
 
-	rows, err := s.db.QueryContext(ctx, `SELECT hash, name, scope FROM tokens`)
+	rows, err := s.db.QueryContext(ctx, `SELECT hash, name, scope, created_at, expires_at FROM tokens`)
 	if err != nil {
 		return TokenInfo{}, false, fmt.Errorf("read tokens: %w", err)
 	}
@@ -104,9 +122,10 @@ func (s *Store) LookupToken(ctx context.Context, token string) (info TokenInfo, 
 
 	valid := false
 	for rows.Next() {
-		var hash, name, scope string
-		if err := rows.Scan(&hash, &name, &scope); err != nil {
-			return TokenInfo{}, false, fmt.Errorf("read token: %w", err)
+		var hash string
+		var row TokenInfo
+		if err := scanToken(rows, &row, &hash); err != nil {
+			return TokenInfo{}, false, err
 		}
 		// ConstantTimeCompare takes the same time whether the first or the
 		// last byte differs. An ordinary comparison stops at the first
@@ -114,18 +133,23 @@ func (s *Store) LookupToken(ctx context.Context, token string) (info TokenInfo, 
 		// byte by byte. The loop also deliberately does not stop early.
 		if subtle.ConstantTimeCompare(candidate, []byte(hash)) == 1 {
 			valid = true
-			info = TokenInfo{Name: name, Scope: scope}
+			info = row
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return TokenInfo{}, false, fmt.Errorf("read tokens: %w", err)
+	}
+	// The clock is read once, after the loop: whether a token has expired
+	// must not depend on where in the table it happens to be.
+	if valid && info.Expired(time.Now()) {
+		return info, false, nil
 	}
 	return info, valid, nil
 }
 
 // Tokens lists the stored tokens by name.
 func (s *Store) Tokens(ctx context.Context) ([]TokenInfo, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name, scope, created_at FROM tokens ORDER BY name`)
+	rows, err := s.db.QueryContext(ctx, `SELECT name, scope, created_at, expires_at FROM tokens ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("read tokens: %w", err)
 	}
@@ -134,11 +158,7 @@ func (s *Store) Tokens(ctx context.Context) ([]TokenInfo, error) {
 	var tokens []TokenInfo
 	for rows.Next() {
 		var info TokenInfo
-		var created string
-		if err := rows.Scan(&info.Name, &info.Scope, &created); err != nil {
-			return nil, fmt.Errorf("read token: %w", err)
-		}
-		if info.CreatedAt, err = parseTime(created); err != nil {
+		if err := scanToken(rows, &info); err != nil {
 			return nil, err
 		}
 		tokens = append(tokens, info)
@@ -159,6 +179,40 @@ func (s *Store) RevokeToken(ctx context.Context, name string) error {
 		return fmt.Errorf("token %q: %w", name, ErrNotFound)
 	}
 	return nil
+}
+
+// scanToken reads a row of name, scope, created_at, expires_at into info.
+// Columns the query selects before those go into leading.
+func scanToken(rows *sql.Rows, info *TokenInfo, leading ...any) error {
+	var created string
+	// NullString, because expires_at is NULL for a token that never
+	// expires. Scanning NULL into a plain string is an error in
+	// database/sql: Go has no null for strings, so the "is it there?" bit
+	// has to live somewhere, and NullString is a struct that carries it.
+	var expires sql.NullString
+	dest := append(leading, &info.Name, &info.Scope, &created, &expires)
+	if err := rows.Scan(dest...); err != nil {
+		return fmt.Errorf("read token: %w", err)
+	}
+	var err error
+	if info.CreatedAt, err = parseTime(created); err != nil {
+		return err
+	}
+	if expires.Valid {
+		if info.ExpiresAt, err = parseTime(expires.String); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// formatOptionalTime is formatTime for a column where the zero time is
+// stored as NULL.
+func formatOptionalTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return formatTime(t)
 }
 
 // hashToken returns the hex SHA-256 of a token.

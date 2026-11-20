@@ -649,7 +649,7 @@ func TestTokenScopesAndNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := s.CreateScopedToken(ctx, "wall.board-1", ScopeRead)
+	reader, err := s.CreateScopedToken(ctx, "wall.board-1", ScopeRead, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -669,7 +669,7 @@ func TestTokenScopesAndNames(t *testing.T) {
 		t.Errorf("Tokens() = %+v, %v; want laptop (admin) and wall.board-1 (read)", tokens, err)
 	}
 
-	if _, err := s.CreateScopedToken(ctx, "x", "superuser"); err == nil {
+	if _, err := s.CreateScopedToken(ctx, "x", "superuser", time.Time{}); err == nil {
 		t.Error("a token with an unknown scope was created")
 	}
 	// Names end up in log lines and in terminal listings.
@@ -710,5 +710,116 @@ func TestTokensFromBeforeScopesKeepTheirPower(t *testing.T) {
 	defer func() { _ = s.Close() }()
 	if info, ok, err := s.LookupToken(ctx, token); err != nil || !ok || info.Scope != ScopeAdmin {
 		t.Errorf("the old token after migration = %+v, %v, %v; want it valid with scope admin", info, ok, err)
+	}
+}
+
+func TestTokenExpiry(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+
+	soon := time.Now().Add(time.Hour)
+	live, err := s.CreateScopedToken(ctx, "ci", ScopeAdmin, soon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Minute)
+	dead, err := s.CreateScopedToken(ctx, "old-laptop", ScopeRead, past)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forever, err := s.CreateToken(ctx, "laptop")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info, ok, err := s.LookupToken(ctx, live)
+	if err != nil || !ok || !info.ExpiresAt.Equal(soon) {
+		t.Errorf("LookupToken(live) = %+v, %v, %v; want valid, expiring at %v", info, ok, err, soon)
+	}
+
+	// Refused, but still named, so the refusal can say why.
+	info, ok, err = s.LookupToken(ctx, dead)
+	if err != nil || ok || info.Name != "old-laptop" || !info.Expired(time.Now()) {
+		t.Errorf("LookupToken(expired) = %+v, %v, %v; want refused, named old-laptop", info, ok, err)
+	}
+	if ok, _ := s.VerifyToken(ctx, dead); ok {
+		t.Error("VerifyToken accepts an expired token")
+	}
+
+	info, ok, err = s.LookupToken(ctx, forever)
+	if err != nil || !ok || !info.ExpiresAt.IsZero() {
+		t.Errorf("LookupToken(no expiry) = %+v, %v, %v; want valid with a zero ExpiresAt", info, ok, err)
+	}
+
+	// The listing shows all three, expired ones included: they are removed
+	// by revoking them, not by time.
+	tokens, err := s.Tokens(ctx)
+	if err != nil || len(tokens) != 3 {
+		t.Fatalf("Tokens() = %+v, %v; want 3", tokens, err)
+	}
+	byName := map[string]TokenInfo{}
+	for _, tok := range tokens {
+		byName[tok.Name] = tok
+	}
+	if !byName["ci"].ExpiresAt.Equal(soon) || !byName["old-laptop"].ExpiresAt.Equal(past) || !byName["laptop"].ExpiresAt.IsZero() {
+		t.Errorf("Tokens() expiry times = %+v", tokens)
+	}
+}
+
+func TestTokenInfoExpired(t *testing.T) {
+	at := time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		info TokenInfo
+		now  time.Time
+		want bool
+	}{
+		{"never expires", TokenInfo{}, at, false},
+		{"before", TokenInfo{ExpiresAt: at}, at.Add(-time.Nanosecond), false},
+		// The moment itself counts as expired: "valid until T" means
+		// not at T.
+		{"at the moment", TokenInfo{ExpiresAt: at}, at, true},
+		{"after", TokenInfo{ExpiresAt: at}, at.Add(time.Hour), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.info.Expired(tt.now); got != tt.want {
+				t.Errorf("Expired() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTokensFromBeforeExpiryNeverExpire(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "liman.db")
+	ctx := context.Background()
+
+	// A database as schema version 4 left it, with a token in it.
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4; i++ {
+		if _, err := db.ExecContext(ctx, migrations[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA user_version = 4"); err != nil {
+		t.Fatal(err)
+	}
+	token := TokenPrefix + strings.Repeat("cd", 32)
+	if _, err := db.ExecContext(ctx, `INSERT INTO tokens (name, hash, scope, created_at) VALUES ('old', ?, 'read', '2026-01-01T00:00:00.000000000Z')`, hashToken(token)); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	info, ok, err := s.LookupToken(ctx, token)
+	if err != nil || !ok || info.Scope != ScopeRead || !info.ExpiresAt.IsZero() {
+		t.Errorf("the old token after migration = %+v, %v, %v; want it valid, read, never expiring", info, ok, err)
 	}
 }

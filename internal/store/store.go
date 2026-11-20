@@ -96,6 +96,13 @@ var migrations = []string{
 	`
 	ALTER TABLE tokens ADD COLUMN scope TEXT NOT NULL DEFAULT 'admin';
 	`,
+
+	// 5: token expiry. NULL means the token never expires, which is what
+	// every token that already exists keeps: an upgrade must not lock
+	// anybody out.
+	`
+	ALTER TABLE tokens ADD COLUMN expires_at TEXT;
+	`,
 }
 
 // SchemaVersion is the schema version this build reads and writes.

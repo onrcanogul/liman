@@ -509,7 +509,7 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 	if *readOnly {
 		scope = store.ScopeRead
 	}
-	token, err := st.CreateScopedToken(ctx, name, scope)
+	token, err := st.CreateScopedToken(ctx, name, scope, time.Time{})
 	if err != nil {
 		return d.fail(err)
 	}
