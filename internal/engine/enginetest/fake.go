@@ -36,11 +36,16 @@ type Fake struct {
 	// LogOutput is what Logs writes to stdout.
 	LogOutput string
 
-	PullErr    error
-	StartErr   error
-	RemoveErr  error
-	RestartErr error
-	StopErr    error
+	PullErr  error
+	StartErr error
+
+	// Registry holds the image references (repo@digest) the fake's
+	// registry has; ImageExistsErr makes asking it fail.
+	Registry       map[string]bool
+	ImageExistsErr error
+	RemoveErr      error
+	RestartErr     error
+	StopErr        error
 
 	// AfterRestart is the state a container gets when restarted. It
 	// defaults to "running"; "exited" simulates an app that crashes again
@@ -115,6 +120,18 @@ func (f *Fake) Pull(_ context.Context, image string, progress io.Writer) error {
 	}
 	_, _ = fmt.Fprintf(progress, "Status: Downloaded newer image for %s\n", image)
 	return nil
+}
+
+// ImageExists implements engine.Engine.
+func (f *Fake) ImageExists(_ context.Context, ref string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.record("inspect " + ref)
+	if f.ImageExistsErr != nil {
+		return false, f.ImageExistsErr
+	}
+	return f.Registry[ref], nil
 }
 
 // Start implements engine.Engine.

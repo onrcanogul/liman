@@ -251,6 +251,32 @@ func filesArchive(files []engine.File, now time.Time) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// ImageExists implements engine.Engine. GET /distribution/{ref}/json: the
+// daemon asks the registry for the manifest, with the registry's own
+// authentication flow and the manifest types it accepts, and downloads
+// nothing. The credentials are the user's, as for Pull.
+func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
+	opts := client.DistributionInspectOptions{}
+	creds, loggedIn, err := c.creds.lookup(ctx, ref)
+	if err != nil {
+		return false, fmt.Errorf("look up registry credentials for %s: %w", ref, err)
+	}
+	if loggedIn {
+		if opts.EncodedRegistryAuth, err = encodeAuth(creds, ref); err != nil {
+			return false, fmt.Errorf("encode registry credentials for %s: %w", ref, err)
+		}
+	}
+	_, err = c.api.DistributionInspect(ctx, ref, opts)
+	switch {
+	case err == nil:
+		return true, nil
+	case errdefs.IsNotFound(err):
+		return false, nil
+	default:
+		return false, fmt.Errorf("ask the registry for %s: %w", ref, err)
+	}
+}
+
 // Inspect implements engine.Engine. GET /containers/{ref}/json.
 func (c *Client) Inspect(ctx context.Context, ref string) (engine.Container, error) {
 	res, err := c.api.ContainerInspect(ctx, ref, client.ContainerInspectOptions{})

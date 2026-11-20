@@ -8,8 +8,11 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -155,6 +158,45 @@ type Engine interface {
 	// it keeps streaming until the context is cancelled or the container
 	// stops.
 	Logs(ctx context.Context, ref string, follow bool, stdout, stderr io.Writer) error
+
+	// ImageExists asks the image's registry whether ref (a repository and
+	// a digest, repo@sha256:…) is there, without downloading it. False with
+	// a nil error means the registry answered that it is not; an error
+	// means the registry could not be asked.
+	ImageExists(ctx context.Context, ref string) (bool, error)
+}
+
+// digestRe is the form of an image digest liman accepts: SHA-256, the only
+// algorithm registries use in practice.
+var digestRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// ValidDigest reports whether d is an image digest: sha256: and 64
+// lowercase hexadecimal digits. Checked before a registry is asked: a
+// registry answers some malformed digests with a 500, which would read
+// as the registry being down.
+func ValidDigest(d string) bool { return digestRe.MatchString(d) }
+
+// WithDigest returns the image reference image (with a tag, a digest, or
+// neither) pinned to digest: its repository, "@", the digest. The
+// repository is image's, never the caller's: a digest can only select an
+// image of that repository.
+func WithDigest(image, digest string) (string, error) {
+	if !ValidDigest(digest) {
+		return "", fmt.Errorf("invalid digest %q: want sha256: and 64 hexadecimal digits", digest)
+	}
+	repo := image
+	if i := strings.Index(repo, "@"); i >= 0 {
+		repo = repo[:i]
+	}
+	// A tag is a ":" after the last "/": a ":" before it belongs to a
+	// registry's port (localhost:5000/api).
+	if i := strings.LastIndex(repo, ":"); i > strings.LastIndex(repo, "/") {
+		repo = repo[:i]
+	}
+	if repo == "" {
+		return "", fmt.Errorf("image %q has no repository", image)
+	}
+	return repo + "@" + digest, nil
 }
 
 // ForApp returns the containers in list that belong to app, keeping their
