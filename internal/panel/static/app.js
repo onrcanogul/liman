@@ -574,6 +574,9 @@ function signOut(message, keepToken) {
   S.health = new Map(); S.secrets = new Map(); S.logs = emptyLogs();
   S.backups = null; S.backupBusy = false; S.backupNote = null; S.checks = new Map(); S.note = null;
   S.certs = null; S.keys = null; S.allSecrets = null; S.tokens = null;
+  // What the last page showed is not merely hidden behind the sign-in
+  // form: it is taken out of the page.
+  clear($main);
   closeDialog();
   S.pending = token;
   render();
