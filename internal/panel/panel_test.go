@@ -97,8 +97,9 @@ func TestPageNeverTurnsStringsIntoMarkupOrCode(t *testing.T) {
 		"POST '/v1/backups/' + encodeURIComponent(name",
 		"POST appPath(a.name",
 		"DELETE appPath(a.name",
-		"PUT appPath(a.name",
+		"PUT appPath(r.app",
 		"DELETE appPath(a.name",
+		"DELETE '/v1/tokens/' + encodeURIComponent(t.name",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Errorf("requests that change something:\n%s\nwant exactly:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))

@@ -58,6 +58,7 @@ var ICONS = {
   activity: 'M3 12h4l3-8 4 16 3-8h4',
   secrets: 'M7 11V8a5 5 0 0110 0v3M5 11h14v10H5z',
   daemon: 'M4 4h16v6H4zM4 14h16v6H4zM8 7h.01M8 17h.01',
+  tokens: 'M19 9a4 4 0 11-8 0 4 4 0 018 0zM12 12l-9 9M6 18l3 3M9 15l2 2',
   backups: 'M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zM4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6',
   chevron: 'M6 9l6 6 6-6',
   collapse: 'M15 6l-6 6 6 6', expand: 'M9 6l6 6-6 6', menu: 'M4 6h16M4 12h16M4 18h16',
@@ -152,6 +153,8 @@ var S = {
   engineError: '', offlineError: '', updated: 0,
   health: new Map(),     // "app|range" -> { at, hist }
   secrets: new Map(),    // app -> { at, list, error }
+  allSecrets: null,      // { at, list, error }: GET /v1/secrets, every app's
+  tokens: null,          // { at, list, error }: GET /v1/tokens
   logs: { app: '', text: '', error: '', loading: false, cut: false, following: false, ended: false },
   backups: null,         // { at, list, error }
   certs: null,           // { at, data, error }: GET /v1/certs
@@ -382,7 +385,21 @@ function ensureExtras() {
     if (S.tab === 'overview' && monitored) wantHealth(r.name);
     if (S.tab === 'secrets' && vault) wantSecrets(r.name);
   }
-  if (r.view === 'secrets' && vault) names.forEach(wantSecrets);
+  // The Secrets page lists every app's secrets in one request, apps that
+  // are not deployed included: those are the ones nobody would see
+  // otherwise.
+  if (r.view === 'secrets' && vault && !(S.allSecrets && now - S.allSecrets.at < EXTRA_TTL)) {
+    jobs.push(settle(get('/v1/secrets')).then(function (res) {
+      if (!S.token) return;
+      S.allSecrets = { at: Date.now(), list: res.ok ? cleanList(res.value) : null, error: res.ok ? '' : res.error.message };
+    }));
+  }
+  if (r.view === 'tokens' && !(S.tokens && now - S.tokens.at < EXTRA_TTL)) {
+    jobs.push(settle(get('/v1/tokens')).then(function (res) {
+      if (!S.token) return;
+      S.tokens = { at: Date.now(), list: res.ok ? cleanList(res.value) : null, error: res.ok ? '' : res.error.message };
+    }));
+  }
   // Certificates are wanted everywhere: an expired one is a banner on
   // every page. Reading them is cheap. The keys are not (the daemon checks
   // every backup's signature), so only the Daemon page asks for them.
@@ -556,7 +573,7 @@ function signOut(message, keepToken) {
   S.info = null; S.apps = []; S.events = []; S.releases = []; S.engineError = ''; S.offlineError = ''; S.updated = 0;
   S.health = new Map(); S.secrets = new Map(); S.logs = emptyLogs();
   S.backups = null; S.backupBusy = false; S.backupNote = null; S.checks = new Map(); S.note = null;
-  S.certs = null; S.keys = null;
+  S.certs = null; S.keys = null; S.allSecrets = null; S.tokens = null;
   closeDialog();
   S.pending = token;
   render();
@@ -572,7 +589,7 @@ function renderGate() {
     h('p', null, 'The panel reads from the daemon at ', h('code', { text: str(window.location.host, 80) }), ' with an API token, the same kind the command line uses.'),
     h('div', { class: 'field' }, h('label', { for: 'token' }, 'API token'), $in, $err),
     h('button', { class: 'btn primary', type: 'submit', disabled: S.gateBusy }, S.gateBusy ? 'Checking…' : 'Sign in'),
-    h('p', { class: 'hint', id: 'gate-hint' }, 'Create one on the server with ', h('code', { text: 'limand token create panel' }), ', or with ', h('code', { text: '--read-only' }), ' for a panel that can only look. It is kept in this tab only and forgotten when the tab closes. From the panel you can look at everything, roll back or stop an app, manage its secrets and make backups. Deploying a new version is done with the command line.'));
+    h('p', { class: 'hint', id: 'gate-hint' }, 'Create one on the server with ', h('code', { text: 'limand token create panel' }), ', or with ', h('code', { text: '--read-only' }), ' for a panel that can only look. It is kept in this tab only and forgotten when the tab closes. From the panel you can look at everything, roll back or stop an app, manage its secrets, revoke tokens and make backups. Deploying a new version is done with the command line.'));
   $gate.appendChild(form);
   if (!S.gateBusy) { try { $in.focus(); } catch (e) { /* not focusable yet */ } }
 }
@@ -580,7 +597,7 @@ function renderGate() {
 // ---------- routing: plain #name hashes only ----------
 function route() {
   var hash = ''; try { hash = decodeURIComponent((window.location.hash || '').replace(/^#/, '')); } catch (e) { hash = ''; }
-  if (['apps', 'activity', 'secrets', 'daemon', 'backups'].indexOf(hash) !== -1) return { view: hash };
+  if (['apps', 'activity', 'secrets', 'tokens', 'daemon', 'backups'].indexOf(hash) !== -1) return { view: hash };
   if (hash.indexOf('app-') === 0) return { view: 'app', name: hash.slice(4) };
   return { view: 'overview' };
 }
@@ -609,7 +626,7 @@ function renderSide(r) {
     }), list.length > shown.length ? h('a', { class: 'nav muted', href: '#apps' }, h('span', { class: 'lbl', text: 'All ' + list.length + ' apps' })) : null));
   }
   add($nav, [navItem('activity', 'Activity', 'activity', r.view === 'activity'), navItem('secrets', 'Secrets', 'secrets', r.view === 'secrets'),
-    h('div', { class: 'side-label', text: 'System' }), navItem('backups', 'Backups', 'backups', r.view === 'backups'), navItem('daemon', 'Daemon', 'daemon', r.view === 'daemon')]);
+    h('div', { class: 'side-label', text: 'System' }), navItem('tokens', 'Tokens', 'tokens', r.view === 'tokens'), navItem('backups', 'Backups', 'backups', r.view === 'backups'), navItem('daemon', 'Daemon', 'daemon', r.view === 'daemon')]);
   renderFoot();
   $app.className = 'app' + (S.collapsed ? ' collapsed' : '') + (S.drawer ? ' drawer' : '');
 }
@@ -625,7 +642,7 @@ function renderFoot() {
 }
 function renderCrumbs(r) {
   clear($crumbs);
-  var names = { overview: 'Overview', apps: 'Apps', activity: 'Activity', secrets: 'Secrets', daemon: 'Daemon', backups: 'Backups' };
+  var names = { overview: 'Overview', apps: 'Apps', activity: 'Activity', secrets: 'Secrets', tokens: 'Tokens', daemon: 'Daemon', backups: 'Backups' };
   var parts = r.view === 'app' ? [['#apps', 'Apps'], [null, str(r.name, 80)]] : [[null, names[r.view]]];
   add($crumbs, [h('a', { href: '#overview', text: 'liman' })]);
   parts.forEach(function (p) { add($crumbs, [h('span', { class: 'sep', 'aria-hidden': 'true', text: '/' }), p[0] ? h('a', { href: p[0], text: p[1] }) : h('span', { class: 'here trunc', title: p[1], text: p[1] })]); });
@@ -966,7 +983,7 @@ function viewApp(name) {
     out.push(h('div', { class: 'grid' }, panel('Deploys', body, { flush: true })));
     out.push(h('div', { class: 'hint', text: a.previous.length ? 'The previous release is kept stopped; \u201cRoll back\u201d puts it back in service.' : 'No previous release is kept, so there is nothing to roll back to.' }));
   } else if (S.tab === 'secrets') {
-    out.push(h('div', { class: 'grid' }, panel('Secrets', secretTable([a], false), { flush: true,
+    out.push(h('div', { class: 'grid' }, panel('Secrets', appSecretTable(a), { flush: true,
       side: S.info && S.info.secrets ? h('button', { class: 'btn small', id: 'act-secret', disabled: !canAct(), onclick: function () { dlgSecret(a, ''); } }, 'Add secret') : null })));
     out.push(h('div', { class: 'hint' }, 'Names only: values are stored encrypted and no interface can read them back. A new or replaced value takes effect on the next deploy. From a script: ', h('code', { text: 'liman secret set ' + a.name + ' NAME' })));
   } else if (S.tab === 'activity') {
@@ -1006,24 +1023,27 @@ function eventTable(list, withApp) {
         h('td', { class: 'nowrap' }, okPill(typeof e.ok === 'boolean' ? e.ok : null)), h('td', { class: 'nowrap mono', text: took(e.duration_ms) }), h('td', { class: 'detail', text: orDash(e.error, 600) }));
     }))));
 }
-function secretTable(list, withApp) {
+// appSecretTable is the Secrets tab of one app.
+function appSecretTable(a) {
   if (!(S.info && S.info.secrets)) return stateBlock('This daemon has no secret storage', null, null, true);
-  var rows = [], waiting = 0, failed = '';
-  list.forEach(function (a) {
-    var have = S.secrets.get(a.name);
-    if (!have) { waiting++; return; }
-    if (have.list === null) { failed = have.error; return; }
-    have.list.forEach(function (x) { if (str(x.name)) rows.push([a, x]); });
-  });
-  if (rows.length === 0 && waiting) return stateBlock('Reading the secret names…', null, null, true);
-  if (rows.length === 0 && failed) return stateBlock('The secret names could not be read', h('p', { text: str(failed, 300) }), null, true);
-  if (rows.length === 0) return stateBlock(withApp ? 'No secrets are stored for these apps' : 'This app has no secrets', h('p', null, 'Store one with ', h('code', { text: 'liman secret set' }), ', then list its name under ', h('code', { text: 'secrets:' }), ' in app.yaml.'), null, true);
+  var have = S.secrets.get(a.name);
+  if (!have) return stateBlock('Reading the secret names…', null, null, true);
+  if (have.list === null) return stateBlock('The secret names could not be read', h('p', { text: str(have.error, 300) }), null, true);
+  var rows = have.list.filter(function (x) { return str(x.name); }).map(function (x) { return { app: a.name, x: x }; });
+  if (rows.length === 0) return stateBlock('This app has no secrets', h('p', null, 'Store one with ', h('code', { text: 'liman secret set' }), ', then list its name under ', h('code', { text: 'secrets:' }), ' in app.yaml.'), null, true);
+  return secretRows(rows, false);
+}
+// secretRows draws secrets as { app, x } pairs, x being what the daemon
+// listed. With the app column, an app that is not running is said so:
+// its secrets are kept, and wait for its next deploy.
+function secretRows(rows, withApp) {
   return h('div', { class: 'tbl-wrap' }, h('table', null, h('thead', null, h('tr', null, withApp ? h('th', { text: 'App' }) : null, h('th', { text: 'Name' }), h('th', { text: 'Last changed' }), h('th', null, h('span', { class: 'sr', text: 'Actions' })))),
     h('tbody', null, rows.map(function (r) {
-      var a = r[0], x = r[1], name = str(x.name);
-      return h('tr', null, withApp ? h('td', { class: 'name' }, h('a', { href: appHref(a.name), text: a.name })) : null, h('td', { class: 'mono detail', text: str(name, 300) }), h('td', { class: 'nowrap' }, when(x.updated_at)),
-        h('td', { class: 'nowrap right' }, h('button', { class: 'btn small', disabled: !canAct(), onclick: function () { dlgSecret(a, name); } }, 'Replace'), ' ',
-          h('button', { class: 'btn small danger', disabled: !canAct(), onclick: function () { dlgRemoveSecret(a, name); } }, 'Remove')));
+      var app = r.app, x = r.x, name = str(x.name), target = { name: app };
+      return h('tr', null, withApp ? h('td', { class: 'name' }, findApp(app) ? h('a', { href: appHref(app), text: app }) : h('span', { class: 'hstack' }, h('span', { class: 'trunc', text: str(app, 80) }), pill({ key: 'none', label: 'Not running' }))) : null,
+        h('td', { class: 'mono detail', text: str(name, 300) }), h('td', { class: 'nowrap' }, when(x.updated_at)),
+        h('td', { class: 'nowrap right' }, h('button', { class: 'btn small', disabled: !canAct(), onclick: function () { dlgSecret(target, name); } }, 'Replace'), ' ',
+          h('button', { class: 'btn small danger', disabled: !canAct(), onclick: function () { dlgRemoveSecret(target, name); } }, 'Remove')));
     }))));
 }
 
@@ -1093,7 +1113,13 @@ function dlgStop(a) {
   $in.focus();
 }
 var SECRET_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/, SECRET_MAX_BYTES = 64 * 1024;
+// The daemon's rule for app names (app.ValidName); the daemon checks again.
+var APP_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+// dlgSecret stores a secret of app a, or, with a null, of an app named in
+// the dialog: one that need not be deployed yet.
 function dlgSecret(a, fixedName) {
+  var $appErr = h('div', { class: 'err', id: 'sec-app-err', role: 'alert' });
+  var $app = a ? null : h('input', { class: 'input mono', id: 'sec-app', maxlength: '63', autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false', placeholder: 'orders-api', 'aria-describedby': 'sec-app-err', oninput: function () { $appErr.textContent = ''; $app.removeAttribute('aria-invalid'); } });
   var $nameErr = h('div', { class: 'err', id: 'sec-name-err', role: 'alert' }), $valErr = h('div', { class: 'err', id: 'sec-val-err', role: 'alert' }), $size = h('span', { class: 'hint', id: 'sec-size', text: '0 bytes' });
   var $name = h('input', { class: 'input mono', id: 'sec-name', value: fixedName || null, readonly: fixedName ? true : null, maxlength: '128', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false', placeholder: 'DATABASE_URL', 'aria-describedby': 'sec-name-err', oninput: function () { $nameErr.textContent = ''; $name.removeAttribute('aria-invalid'); } });
   // type=password: not shown on screen, and with this autocomplete value
@@ -1105,31 +1131,34 @@ function dlgSecret(a, fixedName) {
   // The same rules the daemon applies; checking here only saves a round
   // trip and gives the message next to the field.
   function check() {
-    var n = $name.value.trim(), bytes = enc.encode($val.value);
+    var app = a ? a.name : $app.value.trim(), n = $name.value.trim(), bytes = enc.encode($val.value);
+    if (!a && app === '') return wrong($app, $appErr, 'Name the app the secret is for.');
+    if (!a && !APP_NAME_RE.test(app)) return wrong($app, $appErr, 'App names use lowercase letters, digits and dashes, up to 63, and start and end with a letter or digit.');
     if (n === '') return wrong($name, $nameErr, 'Give the secret a name.');
     if (!SECRET_NAME_RE.test(n)) return wrong($name, $nameErr, 'Use letters, digits and underscores, and do not start with a digit.');
     if (bytes.length === 0) return wrong($val, $valErr, 'The value is empty.');
     if ($val.value.indexOf('\u0000') !== -1) return wrong($val, $valErr, 'The value contains a NUL character, which cannot be stored.');
     if (bytes.length > SECRET_MAX_BYTES) return wrong($val, $valErr, 'The value is ' + fmtNum(bytes.length) + ' bytes; the limit is ' + fmtNum(SECRET_MAX_BYTES) + '.');
-    return { name: n, bytes: bytes };
+    return { app: app, name: n, bytes: bytes };
   }
-  openDialog((fixedName ? 'Replace secret of ' : 'Add secret to ') + str(a.name, 80),
-    [h('div', { class: 'field' }, h('label', { for: 'sec-name' }, 'Name'), $name, $nameErr),
+  openDialog(a ? (fixedName ? 'Replace secret of ' : 'Add secret to ') + str(a.name, 80) : 'Add a secret',
+    [a ? null : h('div', { class: 'field' }, h('label', { for: 'sec-app' }, 'App'), $app, $appErr, h('span', { class: 'hint', text: 'It need not be deployed yet; its first deploy will find the secret.' })),
+     h('div', { class: 'field' }, h('label', { for: 'sec-name' }, 'Name'), $name, $nameErr),
      h('div', { class: 'field' }, h('label', { for: 'sec-value' }, 'Value'), $val, h('div', { class: 'between' }, $valErr, $size)),
      h('p', { class: 'hint', text: 'The value is sent once, stored encrypted and cannot be shown again. Running containers keep what they have; it takes effect on the next deploy.' })],
     [cancelBtn(), h('button', { type: 'submit', class: 'btn primary', id: 'dlg-go', onclick: function () {
       var r = check(); if (!r) return;
       working('Storing\u2026');
       // The value leaves the page here and is dropped from the field at once.
-      var sending = send('PUT', appPath(a.name, '/secrets/' + encodeURIComponent(r.name)), r.bytes);
+      var sending = send('PUT', appPath(r.app, '/secrets/' + encodeURIComponent(r.name)), r.bytes);
       $val.value = '';
       sending.then(function () {
-        S.secrets.delete(a.name);
-        done('ok', 'Stored secret ' + str(r.name, 60) + ' of ' + str(a.name, 60) + ' (' + fmtNum(r.bytes.length) + ' bytes). It takes effect on the next deploy.');
+        S.secrets.delete(r.app); S.allSecrets = null;
+        done('ok', 'Stored secret ' + str(r.name, 60) + ' of ' + str(r.app, 60) + ' (' + fmtNum(r.bytes.length) + ' bytes). It takes effect on the next deploy.');
         ensureExtras();
       }, function (e) { var msg = failed(e); if (msg === null) return; closeDialog(); S.note = { kind: 'crit', text: 'The secret was not stored. ' + msg }; render(); });
     } }, 'Store secret')]);
-  (fixedName ? $val : $name).focus();
+  (fixedName ? $val : $app || $name).focus();
 }
 function dlgRemoveSecret(a, name) {
   openDialog('Remove secret ' + str(name, 80) + '?',
@@ -1137,7 +1166,7 @@ function dlgRemoveSecret(a, name) {
     [cancelBtn(), h('button', { type: 'submit', class: 'btn danger', id: 'dlg-go', onclick: function () {
       working('Removing\u2026');
       send('DELETE', appPath(a.name, '/secrets/' + encodeURIComponent(name))).then(function () {
-        S.secrets.delete(a.name);
+        S.secrets.delete(a.name); S.allSecrets = null;
         done('ok', 'Removed secret ' + str(name, 60) + ' of ' + str(a.name, 60) + '.');
         ensureExtras();
       }, function (e) { var msg = failed(e); if (msg === null) return; closeDialog(); S.note = { kind: 'crit', text: 'The secret was not removed. ' + msg }; render(); });
@@ -1159,9 +1188,64 @@ function viewActivity() {
     h('div', { class: 'hint' }, 'The latest ' + fmtNum(all.length) + ' steps. For older ones: ', h('code', { text: 'liman history --limit 1000' }))];
 }
 function viewSecrets() {
-  if (S.apps.length === 0) return [h('h1', { text: 'Secrets' }), noApps()];
-  return [h('h1', { text: 'Secrets' }), h('div', { class: 'panel' }, secretTable(S.apps.slice().sort(function (a, b) { return a.name.localeCompare(b.name); }), true)),
-    h('div', { class: 'hint', text: 'Names only, for the apps that are deployed. Values are stored encrypted and no interface can read them back.' })];
+  var vault = !!(S.info && S.info.secrets);
+  var head = h('div', { class: 'head' }, h('div', { class: 'grow' }, h('h1', { text: 'Secrets' })),
+    vault ? h('button', { class: 'btn primary', id: 'add-secret', disabled: !canAct(), title: readOnly() ? 'This token is read-only' : null, onclick: function () { dlgSecret(null, ''); } }, 'Add secret') : null);
+  if (!vault) return [head, fullState('This daemon has no secret storage', h('p', { text: 'Apps that name secrets cannot be deployed until it has a master key.' }))];
+  var have = S.allSecrets, body;
+  if (!have) body = stateBlock('Reading the secret names…', null, null, true);
+  else if (have.list === null) body = stateBlock('The secret names could not be read', h('p', { text: str(have.error, 300) }), h('button', { class: 'btn', onclick: function () { S.allSecrets = null; render(); ensureExtras(); } }, 'Try again'), true);
+  else {
+    var rows = have.list.filter(function (x) { return str(x.app) && str(x.name); }).map(function (x) { return { app: str(x.app), x: x }; });
+    body = rows.length ? secretRows(rows, true) : stateBlock('No secrets are stored', h('p', null, 'Add one here or with ', h('code', { text: 'liman secret set' }), ', then list its name under ', h('code', { text: 'secrets:' }), ' in app.yaml.'), null, true);
+  }
+  return [head, h('div', { class: 'panel' }, body),
+    h('div', { class: 'hint', text: 'Names only, for every app: one that is not deployed yet, or was stopped, keeps its secrets for its next deploy. Values are stored encrypted and no interface can read them back.' })];
+}
+// viewTokens lists the API tokens. The daemon keeps only their hashes, so
+// there is nothing here that opens anything. Revoking is offered; creating
+// is not, on purpose: a stolen admin token must not be able to make itself
+// spares that outlive its revocation.
+function viewTokens() {
+  var have = S.tokens, out = [h('h1', { text: 'Tokens' })];
+  if (!have) { out.push(h('div', { class: 'panel' }, stateBlock('Reading the tokens…', null, null, true))); return out; }
+  if (have.list === null) { out.push(fullState('The tokens could not be listed', h('p', { text: str(have.error, 300) }), h('button', { class: 'btn', onclick: function () { S.tokens = null; render(); ensureExtras(); } }, 'Try again'))); return out; }
+  var list = have.list.filter(function (t) { return str(t.name); });
+  var now = S.info ? time(S.info.now) : null;
+  out.push(panel('Tokens', h('div', { class: 'tbl-wrap' }, h('table', null,
+    h('thead', null, h('tr', null, h('th', { text: 'Name' }), h('th', { text: 'Can' }), h('th', { text: 'Created' }), h('th', { text: 'Expires' }), h('th', { text: 'Last used' }), h('th', null, h('span', { class: 'sr', text: 'Actions' })))),
+    h('tbody', null, list.map(function (t) {
+      var end = time(t.expires_at), expires;
+      if (t.expired === true) expires = h('span', { title: abs(t.expires_at) }, pill({ key: 'crit', label: 'Expired' }));
+      else if (end === null) expires = h('span', { class: 'muted', text: 'Never' });
+      else expires = h('span', { title: abs(t.expires_at), text: now === null ? abs(t.expires_at) : 'in ' + roughly(Math.max(end - now, 0)) });
+      return h('tr', null,
+        h('td', { class: 'name' }, h('span', { class: 'hstack' }, h('span', { class: 'mono trunc', text: str(t.name, 64) }), t.current === true ? pill({ key: 'info', label: 'This panel' }) : null)),
+        h('td', { class: 'nowrap' }, t.scope === 'admin' ? pill({ key: 'warn', label: 'Change things' }) : pill({ key: 'none', label: 'Look only' })),
+        h('td', { class: 'nowrap' }, when(t.created_at)),
+        h('td', { class: 'nowrap' }, expires),
+        h('td', { class: 'nowrap' }, time(t.last_used_at) === null ? h('span', { class: 'muted', title: 'Not used since the daemon started keeping track', text: DASH }) : when(t.last_used_at)),
+        h('td', { class: 'nowrap right' }, h('button', { class: 'btn small danger', disabled: !canAct(), title: readOnly() ? 'This token is read-only' : null, onclick: function () { dlgRevokeToken(t); } }, 'Revoke')));
+    })))), { flush: true }));
+  out.push(h('div', { class: 'hint' }, '“Last used” is written down at most once a minute. Tokens are created on the server, never here: ',
+    h('code', { text: 'limand token create <name>' }), ', with ', h('code', { text: '--read-only' }), ' for one that can only look and ', h('code', { text: '--expires 30d' }), ' for one that stops working by itself.'));
+  return out;
+}
+function dlgRevokeToken(t) {
+  var name = str(t.name, 64), own = t.current === true, $err = h('div', { class: 'err', role: 'alert' });
+  openDialog('Revoke token ' + name + '?',
+    [h('p', { text: 'Every client that uses it is refused from its next request on. A revoked token cannot be brought back; a new one is created on the server with limand token create.' }),
+     own ? h('div', { class: 'banner warn', role: 'note' }, h('div', { class: 'grow', text: 'This is the token this panel is signed in with. The panel signs out as soon as it is revoked.' })) : null,
+     time(t.last_used_at) !== null ? h('p', { class: 'hint', text: 'Last used ' + ago(t.last_used_at) + '.' }) : null, $err],
+    [cancelBtn(), h('button', { type: 'submit', class: 'btn danger', id: 'dlg-go', onclick: function () {
+      working('Revoking…');
+      send('DELETE', '/v1/tokens/' + encodeURIComponent(t.name)).then(function () {
+        if (own) { signOut('You revoked the token this panel was signed in with (' + name + ').'); return; }
+        S.tokens = null;
+        done('ok', 'Revoked token ' + name + '. Clients that used it are refused from now on.');
+        ensureExtras();
+      }, function (e) { var msg = failed(e); if (msg === null) return; closeDialog(); S.note = { kind: 'crit', text: 'The token was not revoked. ' + msg }; render(); });
+    } }, own ? 'Revoke and sign out' : 'Revoke')]);
 }
 function viewBackups() {
   var out = [h('div', { class: 'head' }, h('div', { class: 'grow' }, h('h1', { text: 'Backups' })),
@@ -1264,11 +1348,11 @@ function viewDaemon() {
     panel('Access', h('dl', { class: 'kv' },
       h('dt', { text: 'This panel' }), h('dd', null, 'Signed in as ', h('code', { text: orDash(d.token, 64) }), readOnly()
         ? ', a read-only token: this panel can look at everything and change nothing. The token is kept in this browser tab only.'
-        : ', a token that can change things: this panel offers rollback, stop, secrets and backups, and asks before anything that removes something. The token is kept in this browser tab only.'),
+        : ', a token that can change things: this panel offers rollback, stop, secrets, revoking tokens and backups, and asks before anything that removes something. The token is kept in this browser tab only.'),
       h('dt', { text: 'Expires' }), h('dd', null, tokenLeft() === null ? 'Never: this token works until it is revoked.'
         : h('span', null, abs(d.token_expires_at), h('span', { class: 'muted', text: ' · in ' + roughly(Math.max(tokenLeft(), 0)) }))),
       h('dt', { text: 'Signing out' }), h('dd', null, 'By hand, by closing the tab, or by itself after ' + Math.round(IDLE_LIMIT / 60000) + ' minutes without a click or a key press.'),
-      h('dt', { text: 'Tokens' }), h('dd', null, 'Created and revoked on the server: ', h('code', { text: 'limand token list' }), '. For a panel that should only look: ', h('code', { text: 'limand token create panel --read-only' }), '; for one that stops working by itself, add ', h('code', { text: '--expires 30d' }), '. Revoking a token signs its panel out at the next refresh.')),
+      h('dt', { text: 'Tokens' }), h('dd', null, 'Listed and revoked on the ', h('a', { href: '#tokens', text: 'Tokens' }), ' page; created on the server only. For a panel that should only look: ', h('code', { text: 'limand token create panel --read-only' }), '; for one that stops working by itself, add ', h('code', { text: '--expires 30d' }), '. Revoking a token signs its panel out at the next refresh.')),
       { span: 'c12', side: h('button', { class: 'btn small', onclick: function () { signOut(''); } }, 'Sign out') }))];
 }
 
@@ -1291,7 +1375,7 @@ function render() {
     var page = h('div', { class: 'page' }); $main.appendChild(page);
     if (!S.info) { add(page, skeleton()); return; }
     add(page, banners());
-    add(page, r.view === 'app' ? viewApp(r.name) : r.view === 'apps' ? viewApps() : r.view === 'activity' ? viewActivity() : r.view === 'secrets' ? viewSecrets() : r.view === 'daemon' ? viewDaemon() : r.view === 'backups' ? viewBackups() : viewOverview());
+    add(page, r.view === 'app' ? viewApp(r.name) : r.view === 'apps' ? viewApps() : r.view === 'activity' ? viewActivity() : r.view === 'secrets' ? viewSecrets() : r.view === 'tokens' ? viewTokens() : r.view === 'daemon' ? viewDaemon() : r.view === 'backups' ? viewBackups() : viewOverview());
     afterMount.forEach(function (fn) { try { fn(); } catch (e) { /* one broken chart must not take the page down */ } });
 
     $main.scrollTop = pageScroll;

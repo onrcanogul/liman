@@ -294,8 +294,11 @@ While it runs, the daemon serves a web panel at `/ui/` on its listen address (`h
   app the health history, the response time of its health check, its
   deploys, the names of its secrets, its activity and its logs, which
   can be followed as they are written.
-- **Activity**, **Secrets** (names only) and **Daemon** (version, which
-  parts are switched on, the certificates with their expiry, and the
+- **Activity**, **Secrets** (names only, for every app: one that is not
+  deployed yet, or was stopped, keeps its secrets and is listed as not
+  running), **Tokens** (name, scope, expiry and when each was last used;
+  the one the panel is signed in with is marked) and **Daemon** (version,
+  which parts are switched on, the certificates with their expiry, and the
   master keys by ID with the secrets and backups that depend on each).
 - A banner on every page when a certificate an app uses has expired or
   keeps failing to renew, and when a key rotation did not finish.
@@ -312,8 +315,9 @@ to:
 |---|---|---|
 | Roll back | App page | A dialog shows the release in service and the one that replaces it; progress is shown step by step |
 | Stop and remove | App page | The app's name has to be typed |
-| Add or replace a secret | App page, Secrets | The value is typed into a hidden field, sent once and never shown again |
+| Add or replace a secret | App page, Secrets | The value is typed into a hidden field, sent once and never shown again. On Secrets the app can be one that is not deployed yet |
 | Remove a secret | App page, Secrets | A dialog says what stops working |
+| Revoke a token | Tokens | A dialog says that clients using it are refused from their next request; revoking the panel's own token signs it out |
 | Back up now, check a backup | Backups | Nothing to confirm: neither can lose data |
 
 Deploying a new version and restoring a backup stay with the command line:
@@ -368,7 +372,7 @@ Every request except `GET /v1/health` needs a token.
 limand token create <name>                         # prints the token once
 limand token create <name> --write-client <file>   # writes a client.yaml instead
 limand token create <name> --expires 90d           # stops working after 90 days (or 12h)
-limand token list                                  # with scope and expiry
+limand token list                                  # with scope, expiry and last use
 limand token revoke <name>
 ```
 
@@ -383,6 +387,20 @@ in `token list` until it is revoked. There is no renewing: create a new
 token and revoke the old one, so that a value that may have leaked is
 replaced as well. `GET /v1/info` reports `token_expires_at`, and the panel
 warns from 14 days before the end.
+
+The daemon writes down when each token was last accepted, at most once a
+minute per token: writing on every request made the slowest requests about
+60 times slower in a trial, because the database has a single connection
+and every request would queue behind a write that waits for the disk. A
+dash in `token list` means not used since this was added. "Used a minute
+ago" is the question to answer before revoking a token that may still be
+in use.
+
+Tokens can be listed and revoked over the API (and in the panel), but not
+created: a stolen admin token could otherwise make itself spares that
+outlive its own revocation. Closing a door works from wherever you are;
+opening one needs a shell on the server. Every revocation is logged as
+`token revoked` with the token and the token that revoked it.
 
 ### The client side
 
@@ -411,6 +429,9 @@ The environment variables `LIMAN_URL` and `LIMAN_TOKEN` take precedence.
 | `GET /v1/apps/{name}/secrets` | Names of an app's secrets, never values |
 | `PUT /v1/apps/{name}/secrets/{key}` | Body: the value. Stores it encrypted |
 | `DELETE /v1/apps/{name}/secrets/{key}` | Removes a secret |
+| `GET /v1/secrets` | Names of every app's secrets, apps that are not deployed included |
+| `GET /v1/tokens` | Tokens by name with scope, expiry and last use; never the tokens or their hashes |
+| `DELETE /v1/tokens/{name}` | Revoke a token, the caller's own included |
 | `GET /v1/info` | Version, start time and which parts of the daemon are switched on |
 | `GET /v1/releases[?app=][&limit=]` | Deploys and how they ended, newest first |
 | `GET /v1/apps/{name}/health[?range=6h\|24h\|7d]` | Health checks of an app, summarised in 48 buckets |
