@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -667,5 +669,40 @@ func TestStopSaysTheSecretsAreKept(t *testing.T) {
 	// They really are still there.
 	if code := h.run("secret", "list", "web"); code != exitOK || !strings.Contains(h.stdout.String(), "DATABASE_URL") {
 		t.Errorf("secret list after stop: code %d, stdout %q", code, h.stdout.String())
+	}
+}
+
+func TestStatusNotesAVersionDifference(t *testing.T) {
+	// A daemon that only answers what status asks.
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/health":
+			_, _ = w.Write([]byte(`{"status":"ok","version":"v1.3.0"}`))
+		case "/v1/apps":
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer daemon.Close()
+
+	for _, tt := range []struct {
+		mine string
+		note bool
+	}{
+		{"v1.4.0", true},
+		{"v1.3.0", false},
+		{"dev", false}, // a build from source says nothing about versions
+	} {
+		var out, errOut bytes.Buffer
+		c := &CLI{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errOut, API: &api.Client{BaseURL: daemon.URL, Token: "liman_x"}, Version: tt.mine}
+		if code := c.Run(context.Background(), []string{"status"}); code != exitOK {
+			t.Fatalf("status as %s: code %d, stderr %q", tt.mine, code, errOut.String())
+		}
+		got := strings.Contains(out.String(), "Note: this liman is "+tt.mine+" and the daemon is v1.3.0")
+		if got != tt.note {
+			t.Errorf("status as %s: note shown %v, want %v\n%s", tt.mine, got, tt.note, out.String())
+		}
 	}
 }

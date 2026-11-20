@@ -75,6 +75,10 @@ type CLI struct {
 
 	// API is the connection to the daemon.
 	API *api.Client
+
+	// Version is this CLI's version, compared with the daemon's by status.
+	// Empty means buildinfo.Version.
+	Version string
 }
 
 // Run executes the CLI with the given arguments (without the program name)
@@ -539,6 +543,15 @@ func (c *CLI) runStatus(ctx context.Context, args []string) int {
 		return c.fail(err)
 	}
 	fmt.Fprintf(c.Stdout, "Daemon at %s is up (version %s)\n", c.API.BaseURL, health.Version)
+	// The two are released together. Apart, a command one of them knows
+	// and the other does not fails, often only once it is used.
+	mine := c.Version
+	if mine == "" {
+		mine = buildinfo.Version
+	}
+	if mine != health.Version && mine != "dev" && health.Version != "dev" {
+		fmt.Fprintf(c.Stdout, "Note: this liman is %s and the daemon is %s; use the same version on both sides\n", mine, health.Version)
+	}
 
 	if _, err := c.API.Apps(ctx); err != nil {
 		var apiErr *api.Error
