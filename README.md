@@ -18,8 +18,8 @@ liman (CLI)  ──HTTP + token──>  limand (daemon)  ──>  Docker, Nginx
 - `liman` is a client: it sends commands to the daemon and prints the progress
   the daemon streams back.
 
-For now both run on one machine; installing the daemon on a server is the next
-stage.
+They can run on one machine (see the quick start) or on two: the daemon on a
+server, the CLI on your own machine (see Installing on a server).
 
 ## Requirements
 
@@ -366,6 +366,92 @@ Known limits: no TLS of its own, no scopes (every token can do everything),
 tokens do not expire, and the failed-attempt limit is per address and kept in
 memory.
 
+## Installing on a server
+
+What the server needs: Ubuntu or Debian with systemd, Docker, Nginx, and a
+private network between it and your machine (WireGuard below). The installer
+adds no packages.
+
+**1. Build for Linux** (on your machine; no cross-compiler is needed):
+
+```
+make release        # dist/limand-linux-amd64, dist/limand-linux-arm64, and the CLI
+```
+
+**2. A private network.** The API is unencrypted and the daemon refuses to
+listen on a public address, so the two machines need a private one. With
+WireGuard, on the server (`/etc/wireguard/wg0.conf`):
+
+```ini
+[Interface]
+Address = 10.8.0.1/24
+ListenPort = 51820
+PrivateKey = <server private key>
+
+[Peer]
+PublicKey = <your machine's public key>
+AllowedIPs = 10.8.0.2/32
+```
+
+and on your machine the mirror image, with `Address = 10.8.0.2/24`, the
+server's public key, `Endpoint = <server's public IP>:51820` and
+`AllowedIPs = 10.8.0.1/32`. Keys come from `wg genkey | tee private.key | wg
+pubkey`. Open UDP port 51820 in the server's firewall, then
+`systemctl enable --now wg-quick@wg0`.
+
+**3. Install** (copy `deploy/` and the binary to the server first):
+
+```
+sudo ./install.sh --binary ./limand-linux-amd64 --listen 10.8.0.1:7070
+```
+
+The script creates a system user `liman` (member of the `docker` group),
+installs the binary and the systemd unit, writes
+`/var/lib/liman/config.yaml`, creates `/etc/nginx/liman.d` with one include
+line in `/etc/nginx/conf.d/liman.conf`, and allows the `liman` user exactly
+two commands through sudo: `nginx -t` and `systemctl reload nginx`. Existing
+Nginx configuration is not touched. Running it again upgrades the binary and
+leaves everything else as it is.
+
+**4. A token, and the client:**
+
+```
+sudo -u liman env LIMAN_HOME=/var/lib/liman limand token create laptop
+```
+
+```yaml
+# ~/.liman/client.yaml on your machine
+url: http://10.8.0.1:7070
+token: liman_...
+```
+
+The panel is then at `http://10.8.0.1:7070/ui/`.
+
+**Operating it:**
+
+```
+systemctl status limand          # running? last log lines
+journalctl -u limand -f          # follow the log
+systemctl restart limand         # waits for running deploys, up to two minutes
+```
+
+The unit restarts the daemon if it crashes and starts it at boot, after
+Docker and WireGuard. It is sandboxed: `/usr` and `/etc` are read-only for
+it (except `/etc/nginx/liman.d`), `/home` is hidden and it has a `/tmp` of
+its own. Membership of the `docker` group is still equivalent to root; the
+dedicated user limits accidents, not a compromised daemon.
+
+Back up `/var/lib/liman/master.key` and, separately, `liman.db`.
+
+For private images, log in as the daemon's user:
+`sudo -u liman -H docker login ghcr.io`.
+
+### Practising on a throwaway server
+
+`make lab-server` boots an Ubuntu 24.04 container that runs systemd, Docker
+and Nginx like a small server would, copies the installer into it and prints
+what to type. `make lab-server-stop` removes it.
+
 ## Private images
 
 The daemon keeps no registry credentials of its own. It uses the ones `docker
@@ -522,5 +608,6 @@ internal/applock/    per-app lock shared by the API and the monitor
 internal/textdiff/   line diff used to preview config changes
 internal/loadtest/   small load generator used by the load tests
 internal/buildinfo/  version metadata injected at build time
+deploy/              systemd unit and the server install script
 scripts/             local development helpers
 ```
