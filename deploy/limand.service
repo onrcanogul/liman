@@ -1,0 +1,72 @@
+# systemd unit for the liman daemon. Installed by deploy/install.sh as
+# /etc/systemd/system/limand.service.
+#
+#   systemctl status limand        is it running, and its last log lines
+#   journalctl -u limand -f        follow its log
+#   systemctl restart limand       running deploys finish first (see below)
+
+[Unit]
+Description=liman daemon (deploys containers behind Nginx)
+Documentation=https://github.com/onrcanogul/liman
+
+# Ordering only: start after these if they are being started too. The
+# WireGuard unit is named here because the daemon usually listens on the
+# WireGuard address, which does not exist before the interface is up. A
+# unit that does not exist on this machine is ignored.
+After=network-online.target docker.service nginx.service wg-quick@wg0.service
+# Wants pulls a unit in without tying this one's life to it. Requires would
+# stop the daemon whenever Docker is restarted; the daemon copes with that
+# on its own and reports "cannot reach Docker" in the meantime.
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/limand
+
+# A user of its own, so the daemon's files belong to nobody else and nothing
+# else's files belong to it. Membership of the docker group is what lets it
+# start containers. That membership is equivalent to root (anyone who can
+# talk to Docker can mount the host's disk); the separate user protects
+# against accidents, not against a compromised daemon.
+User=liman
+Group=liman
+SupplementaryGroups=docker
+
+# The database, the master key and config.yaml live here. systemd creates
+# /var/lib/liman with these permissions before the first start.
+Environment=LIMAN_HOME=/var/lib/liman
+StateDirectory=liman
+StateDirectoryMode=0700
+
+# If the daemon exits with an error it is started again. That also covers
+# a boot where the WireGuard address was not there yet.
+Restart=on-failure
+RestartSec=5s
+
+# "systemctl stop" sends SIGTERM. The daemon then waits up to two minutes
+# for running deploys to finish or roll back; systemd must wait longer than
+# that before it resorts to SIGKILL (the default would be 90 seconds).
+KillSignal=SIGTERM
+TimeoutStopSec=150s
+
+# Sandboxing. Each line takes away something the daemon has no use for.
+#
+# /usr, /boot and /etc are read-only for the daemon, except the one
+# directory it writes Nginx config into.
+ProtectSystem=full
+ReadWritePaths=-/etc/nginx/liman.d
+# /home and /root do not exist for it.
+ProtectHome=true
+# A /tmp of its own, removed when it stops.
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+# NoNewPrivileges is deliberately absent: the daemon runs "sudo nginx -t"
+# and "sudo systemctl reload nginx", which is the one thing that option
+# forbids. What it may run through sudo is limited to exactly those two
+# commands (see /etc/sudoers.d/liman).
+
+[Install]
+# Start at boot.
+WantedBy=multi-user.target
