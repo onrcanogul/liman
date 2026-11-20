@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -495,5 +496,219 @@ func TestHealthSamples(t *testing.T) {
 	got, err = s.HealthBuckets(ctx, "web", start, start.Add(3*time.Minute), time.Minute)
 	if err != nil || len(got) != 1 || got[0].Failed != 2 {
 		t.Errorf("after pruning HealthBuckets() = %+v, %v; want only the third minute", got, err)
+	}
+}
+
+func TestSnapshotIsACompleteCopyTakenWhileTheDatabaseIsInUse(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	if _, err := s.CreateToken(ctx, "laptop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutSecret(ctx, "web", "KEY", []byte("sealed")); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 20 {
+		if err := s.AppendEvent(ctx, Event{Time: time.Now(), App: "web", Release: "r1", Step: fmt.Sprintf("step %d", i), Action: "run", OK: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dest := filepath.Join(dir, "backup.db")
+	if err := s.Snapshot(ctx, dest); err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+
+	// Written after the snapshot: must not be in it.
+	if err := s.AppendEvent(ctx, Event{Time: time.Now(), App: "web", Release: "r1", Step: "later", Action: "run", OK: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("backup mode = %o, want 600", perm)
+	}
+	// One file, and nothing left behind next to it.
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Errorf("backup directory holds %d entries, want only the backup", len(entries))
+	}
+
+	b, err := OpenReadOnly(ctx, dest)
+	if err != nil {
+		t.Fatalf("OpenReadOnly() error = %v", err)
+	}
+	defer func() { _ = b.Close() }()
+
+	sum, err := b.Inspect(ctx)
+	if err != nil {
+		t.Fatalf("Inspect() error = %v", err)
+	}
+	if sum.SchemaVersion != len(migrations) || sum.Rows["events"] != 20 || sum.Rows["tokens"] != 1 || sum.Rows["secrets"] != 1 {
+		t.Errorf("Inspect() = %+v, want the current schema, 20 events, 1 token, 1 secret", sum)
+	}
+	refs, err := b.SecretRefs(ctx)
+	if err != nil || len(refs) != 1 || refs[0] != (SecretRef{App: "web", Name: "KEY"}) {
+		t.Errorf("SecretRefs() = %+v, %v", refs, err)
+	}
+	if sealed, found, err := b.GetSecret(ctx, "web", "KEY"); err != nil || !found || string(sealed) != "sealed" {
+		t.Errorf("GetSecret() from the backup = %q, %v, %v", sealed, found, err)
+	}
+
+	// A backup opened for inspection cannot be changed.
+	if err := b.PutSecret(ctx, "web", "OTHER", []byte("x")); err == nil {
+		t.Error("writing to a database opened read-only succeeded")
+	}
+
+	// A second backup under the same name is refused, and the first stays.
+	if err := s.Snapshot(ctx, dest); err == nil {
+		t.Error("Snapshot() over an existing file succeeded, want an error")
+	}
+	if after, err := os.Stat(dest); err != nil || after.Size() != info.Size() {
+		t.Errorf("the existing backup changed: %v, %v", after, err)
+	}
+}
+
+func TestOpenReadOnlyRejectsWhatIsNotALimanDatabase(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+
+	if _, err := OpenReadOnly(ctx, filepath.Join(dir, "missing.db")); err == nil {
+		t.Error("OpenReadOnly() of a missing file succeeded")
+	}
+
+	text := filepath.Join(dir, "notes.db")
+	if err := os.WriteFile(text, []byte("this is not a database, just some text\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenReadOnly(ctx, text); err == nil {
+		t.Error("OpenReadOnly() of a text file succeeded")
+	}
+
+	// An empty SQLite database is a database, but not one of ours.
+	empty := filepath.Join(dir, "empty.db")
+	db, err := sql.Open("sqlite", "file:"+empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, "CREATE TABLE x (y)"); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+	if _, err := OpenReadOnly(ctx, empty); err == nil {
+		t.Error("OpenReadOnly() of a foreign database succeeded")
+	}
+}
+
+func TestInspectFindsDamage(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	for i := range 400 {
+		if err := s.AppendEvent(ctx, Event{Time: time.Now(), App: "web", Release: "r1", Step: fmt.Sprintf("a long step description number %d", i), Action: "run", OK: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dest := filepath.Join(t.TempDir(), "backup.db")
+	if err := s.Snapshot(ctx, dest); err != nil {
+		t.Fatal(err)
+	}
+
+	// Overwrite a stretch in the middle of the file, as a failing disk or a
+	// cut-off transfer would.
+	data, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := len(data) / 2; i < len(data)/2+4096 && i < len(data); i++ {
+		data[i] = 0xff
+	}
+	if err := os.WriteFile(dest, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := OpenReadOnly(ctx, dest)
+	if err != nil {
+		return // refused at the door: also fine
+	}
+	defer func() { _ = b.Close() }()
+	if _, err := b.Inspect(ctx); err == nil {
+		t.Error("Inspect() of a damaged file reported no problem")
+	}
+}
+
+func TestTokenScopesAndNames(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+
+	admin, err := s.CreateToken(ctx, "laptop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := s.CreateScopedToken(ctx, "wall.board-1", ScopeRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if info, ok, err := s.LookupToken(ctx, admin); err != nil || !ok || info.Name != "laptop" || info.Scope != ScopeAdmin {
+		t.Errorf("LookupToken(admin) = %+v, %v, %v", info, ok, err)
+	}
+	if info, ok, err := s.LookupToken(ctx, reader); err != nil || !ok || info.Name != "wall.board-1" || info.Scope != ScopeRead {
+		t.Errorf("LookupToken(reader) = %+v, %v, %v", info, ok, err)
+	}
+	if info, ok, _ := s.LookupToken(ctx, TokenPrefix+strings.Repeat("0", 64)); ok || info.Name != "" {
+		t.Errorf("LookupToken(unknown) = %+v, %v; want nothing", info, ok)
+	}
+
+	tokens, err := s.Tokens(ctx)
+	if err != nil || len(tokens) != 2 || tokens[0].Scope != ScopeAdmin || tokens[1].Scope != ScopeRead {
+		t.Errorf("Tokens() = %+v, %v; want laptop (admin) and wall.board-1 (read)", tokens, err)
+	}
+
+	if _, err := s.CreateScopedToken(ctx, "x", "superuser"); err == nil {
+		t.Error("a token with an unknown scope was created")
+	}
+	// Names end up in log lines and in terminal listings.
+	for _, name := range []string{"two words", "line\nbreak", "esc\x1b[31m", "token=admin", "-dash", strings.Repeat("a", 65), "tür"} {
+		if _, err := s.CreateToken(ctx, name); err == nil {
+			t.Errorf("a token named %q was created", name)
+		}
+	}
+}
+
+func TestTokensFromBeforeScopesKeepTheirPower(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "liman.db")
+	ctx := context.Background()
+
+	// A database as schema version 3 left it, with a token in it.
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := db.ExecContext(ctx, migrations[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA user_version = 3"); err != nil {
+		t.Fatal(err)
+	}
+	token := TokenPrefix + strings.Repeat("ab", 32)
+	if _, err := db.ExecContext(ctx, `INSERT INTO tokens (name, hash, created_at) VALUES ('old', ?, '2026-01-01T00:00:00.000000000Z')`, hashToken(token)); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Close() }()
+	if info, ok, err := s.LookupToken(ctx, token); err != nil || !ok || info.Scope != ScopeAdmin {
+		t.Errorf("the old token after migration = %+v, %v, %v; want it valid with scope admin", info, ok, err)
 	}
 }

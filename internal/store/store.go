@@ -90,7 +90,16 @@ var migrations = []string{
 	CREATE INDEX health_samples_app ON health_samples (app, at);
 	CREATE INDEX health_samples_at ON health_samples (at);
 	`,
+
+	// 4: token scopes. Every token that already exists keeps the power it
+	// had: before this migration there was only one kind.
+	`
+	ALTER TABLE tokens ADD COLUMN scope TEXT NOT NULL DEFAULT 'admin';
+	`,
 }
+
+// SchemaVersion is the schema version this build reads and writes.
+func SchemaVersion() int { return len(migrations) }
 
 // Open opens the database at path, creating it and its directory if
 // needed, and brings the schema up to date.
