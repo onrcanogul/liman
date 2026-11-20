@@ -238,3 +238,13 @@ code { font-family: var(--mono); font-size: 12.5px; background: var(--panel-2); 
 .gate-card p { margin: 0; color: var(--fg-2) }
 .gate-brand { display: flex; align-items: center; gap: 10px }
 body.gated { overflow: auto }
+
+/* ---------- dialogs ---------- */
+dialog { border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); color: var(--fg); padding: 0; width: min(520px, calc(100vw - 32px)); max-height: calc(100vh - 32px); box-shadow: var(--shadow) }
+dialog::backdrop { background: rgba(8, 12, 18, .55) }
+.dlg { display: flex; flex-direction: column; gap: 14px; padding: 18px; min-width: 0 }
+.dlg h3 { margin: 0; font-size: 16px; font-weight: 600; overflow-wrap: anywhere } .dlg p { margin: 0; color: var(--fg-2); overflow-wrap: anywhere }
+.dlg .acts { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 8px; min-height: 34px }
+.dlg-out { max-height: 220px; border: 1px solid var(--line); border-radius: var(--r) }
+.swap { display: grid; grid-template-columns: 48px minmax(0, 1fr); gap: 6px 12px; padding: 10px 12px; background: var(--panel-2); border-radius: var(--r) }
+.between { display: flex; justify-content: space-between; gap: 12px }

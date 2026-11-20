@@ -83,10 +83,36 @@ func TestPageNeverTurnsStringsIntoMarkupOrCode(t *testing.T) {
 			t.Errorf("app.js uses %s", bad)
 		}
 	}
-	// Read-only also means: no request that could change anything.
-	for _, bad := range []string{"method:", "'POST'", "'PUT'", "'DELETE'"} {
+	// Every request that changes something goes through send() or
+	// stream(), with the method as the first argument. The list below is
+	// everything the panel may do; a new use shows up here and has to be
+	// thought about (does it need a confirmation? can it lose data?).
+	calls := regexp.MustCompile(`\b(?:send|stream)\('([A-Z]+)', ([^,)]+)`).FindAllStringSubmatch(script, -1)
+	var got []string
+	for _, c := range calls {
+		got = append(got, c[1]+" "+c[2])
+	}
+	want := []string{
+		"POST '/v1/backups'",
+		"POST '/v1/backups/' + encodeURIComponent(name",
+		"POST appPath(a.name",
+		"DELETE appPath(a.name",
+		"PUT appPath(a.name",
+		"DELETE appPath(a.name",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("requests that change something:\n%s\nwant exactly:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	// And nothing goes around them.
+	for _, verb := range []string{"'POST'", "'PUT'", "'DELETE'", "'PATCH'"} {
+		if n := strings.Count(script, verb); n != len(regexp.MustCompile(`(?:send|stream)\(`+verb).FindAllString(script, -1)) {
+			t.Errorf("app.js names %s outside a send() or stream() call", verb)
+		}
+	}
+	// A secret's value must not be kept anywhere but the request.
+	for _, bad := range []string{"localStorage.setItem('liman-secret", "console.log"} {
 		if strings.Contains(script, bad) {
-			t.Errorf("app.js contains %s; the panel must only send GET requests", bad)
+			t.Errorf("app.js contains %s", bad)
 		}
 	}
 

@@ -1,4 +1,6 @@
-// The liman panel: a read-only view of what the daemon knows.
+// The liman panel: what the daemon knows, and what it can be asked to do
+// from a browser. Anything that can lose something (rolling back, stopping
+// an app, removing a secret) is confirmed in a dialog first.
 //
 // Three rules hold everywhere in this file:
 //
@@ -56,6 +58,7 @@ var ICONS = {
   activity: 'M3 12h4l3-8 4 16 3-8h4',
   secrets: 'M7 11V8a5 5 0 0110 0v3M5 11h14v10H5z',
   daemon: 'M4 4h16v6H4zM4 14h16v6H4zM8 7h.01M8 17h.01',
+  backups: 'M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zM4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6',
   chevron: 'M6 9l6 6 6-6',
   collapse: 'M15 6l-6 6 6 6', expand: 'M9 6l6 6-6 6', menu: 'M4 6h16M4 12h16M4 18h16',
   signout: 'M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10'
@@ -98,6 +101,12 @@ function took(ms) {
   if (n < 1000) return n + ' ms';
   if (n < 60000) return (Math.round(n / 100) / 10) + ' s';
   return Math.floor(n / 60000) + 'm ' + Math.round((n % 60000) / 1000) + 's';
+}
+function size(bytes) {
+  var n = num(bytes); if (n === null) return DASH;
+  if (n >= 1048576) return (Math.round(n / 104857.6) / 10) + ' MiB';
+  if (n >= 1024) return Math.round(n / 1024) + ' KiB';
+  return n + ' bytes';
 }
 function span(seconds) {
   var n = num(seconds); if (n === null || n === 0) return DASH;
@@ -144,6 +153,10 @@ var S = {
   health: new Map(),     // "app|range" -> { at, hist }
   secrets: new Map(),    // app -> { at, list, error }
   logs: { app: '', text: '', error: '', loading: false, cut: false },
+  backups: null,         // { at, list, error }
+  backupBusy: false, backupNote: null,   // note: { kind, text }
+  note: null,            // { kind, text }: the outcome of the last action
+  checks: new Map(),     // backup name -> { busy, report, error }
   q: '', only: 'all', actApp: '', actResult: '', tab: 'overview', range: '24h', every: 10, collapsed: false, drawer: false
 };
 // Maps, not plain objects, wherever a key comes from the server: an app
@@ -161,16 +174,21 @@ function loadToken() { try { return str(window.sessionStorage.getItem(TOKEN_KEY)
 function saveToken(t) { try { if (t) window.sessionStorage.setItem(TOKEN_KEY, t); else window.sessionStorage.removeItem(TOKEN_KEY); } catch (e) { /* memory only */ } }
 
 var $ = function (id) { return document.getElementById(id); };
-var $app = $('app'), $gate = $('gate'), $main = $('main'), $nav = $('nav'), $foot = $('foot'), $crumbs = $('crumbs'), $tip = $('tip');
+var $app = $('app'), $gate = $('gate'), $main = $('main'), $nav = $('nav'), $foot = $('foot'), $crumbs = $('crumbs'), $tip = $('tip'), $dlg = $('dialog');
 var afterMount = [];
 
 // ---------- talking to the daemon ----------
-// Every request is a same-origin GET with the token in a header. Nothing
-// here can change anything on the server: the panel is read-only.
+// Every request goes to the daemon the page came from, with the token in a
+// header. Almost all of them are GETs; the exceptions are listed where
+// send() is called, and each is something that cannot lose data.
 function fail(status, message) { return { apiError: true, status: status, message: message }; }
-function request(path, timeoutMs) {
+function request(path, timeoutMs, verb, body) {
   var ctl = new AbortController(), timer = setTimeout(function () { ctl.abort(); }, timeoutMs || 15000);
-  return fetch(path, { headers: { Authorization: 'Bearer ' + S.token }, cache: 'no-store', credentials: 'omit', redirect: 'error', signal: ctl.signal })
+  var opts = { method: verb || 'GET', headers: { Authorization: 'Bearer ' + S.token }, cache: 'no-store', credentials: 'omit', redirect: 'error', signal: ctl.signal };
+  // A body is only ever a secret's value. It goes out as raw bytes and is
+  // held nowhere else.
+  if (body !== undefined && body !== null) { opts.body = body; opts.headers['Content-Type'] = 'application/octet-stream'; }
+  return fetch(path, opts)
     .then(function (res) { return { res: res, done: function () { clearTimeout(timer); }, abort: function () { ctl.abort(); } }; },
       function () { clearTimeout(timer); throw fail(0, ctl.signal.aborted ? 'The daemon took too long to answer.' : 'The daemon cannot be reached.'); });
 }
@@ -182,6 +200,48 @@ function get(path) {
   return request(path).then(function (r) {
     if (!r.res.ok) return errorOf(r.res).then(function (e) { r.done(); throw e; });
     return r.res.json().then(function (v) { r.done(); return v; }, function () { r.done(); throw fail(0, 'The daemon sent an answer that could not be read.'); });
+  });
+}
+// send asks the daemon to do something. The browser adds an Origin header
+// to such a request by itself; the daemon accepts it only from its own
+// pages. Every request that changes anything goes through here or through
+// stream(), and a test counts the places that call them.
+function send(verb, path, body, timeoutMs) {
+  return request(path, timeoutMs || 60000, verb, body).then(function (r) {
+    if (!r.res.ok) return errorOf(r.res).then(function (e) { r.done(); throw e; });
+    // 204 has no body to read.
+    if (r.res.status === 204) { r.done(); return null; }
+    return r.res.json().then(function (v) { r.done(); return v; }, function () { r.done(); throw fail(0, 'The daemon sent an answer that could not be read.'); });
+  });
+}
+// stream sends a request whose answer arrives line by line while the work
+// is going on (a rollback). onText gets each piece of progress output; the
+// promise resolves with the final result.
+function stream(verb, path, onText) {
+  return request(path, 600000, verb).then(function (r) {
+    if (!r.res.ok) return errorOf(r.res).then(function (e) { r.done(); throw e; });
+    if (!r.res.body || !r.res.body.getReader) { r.done(); throw fail(0, 'This browser cannot follow the progress of the operation.'); }
+    var reader = r.res.body.getReader(), dec = new TextDecoder(), buf = '', result = null;
+    function take(line) {
+      if (line.trim() === '') return;
+      var ev; try { ev = JSON.parse(line); } catch (e) { return; }
+      if (!ev || typeof ev !== 'object') return;
+      if (ev.type === 'output' && typeof ev.text === 'string') onText(ev.text);
+      if (ev.type === 'result' && ev.result && typeof ev.result === 'object') result = ev.result;
+    }
+    function pump() {
+      return reader.read().then(function (chunk) {
+        if (chunk.done) {
+          take(buf); r.done();
+          if (!result) throw fail(0, 'The connection ended before the daemon reported the outcome. Look at the app to see where it stands.');
+          return result;
+        }
+        buf += dec.decode(chunk.value, { stream: true });
+        var at; while ((at = buf.indexOf('\n')) !== -1) { take(buf.slice(0, at)); buf = buf.slice(at + 1); }
+        return pump();
+      }, function () { r.done(); throw fail(0, 'The connection was lost while the operation was running. Look at the app to see where it stands.'); });
+    }
+    return pump();
   });
 }
 // settle turns a promise into one that never rejects, so several requests
@@ -293,9 +353,54 @@ function ensureExtras() {
     if (S.tab === 'secrets' && vault) wantSecrets(r.name);
   }
   if (r.view === 'secrets' && vault) names.forEach(wantSecrets);
+  if (r.view === 'backups' && S.info && S.info.backups && !(S.backups && now - S.backups.at < EXTRA_TTL)) {
+    jobs.push(settle(get('/v1/backups')).then(function (res) {
+      if (!S.token) return;
+      S.backups = { at: Date.now(), list: res.ok && res.value && typeof res.value === 'object' ? res.value : null, error: res.ok ? '' : res.error.message };
+    }));
+  }
 
   if (jobs.length === 0) return Promise.resolve();
   return Promise.all(jobs).then(function () { if (S.token) render(); });
+}
+
+// ---------- backups: the two things the panel can ask the daemon to do ----------
+function reportText(rep) {
+  var sig = str(rep && rep.signature);
+  if (sig === 'invalid') return 'its signature does not match: the file was changed after it was written, or it belongs to another master key. Do not restore it';
+  return (sig === 'valid' ? 'signed, ' : sig === 'missing' ? 'not signed, ' : sig === 'unchecked' ? 'signature not checked, ' : '') + contentText(rep);
+}
+function contentText(rep) {
+  var n = num(rep && rep.secrets) || 0, bad = Array.isArray(rep && rep.undecryptable) ? rep.undecryptable : [];
+  if (bad.length) return bad.length + ' of ' + n + ' secrets cannot be decrypted with the server\u2019s master key: ' + bad.map(function (x) { return str(x, 80); }).slice(0, 5).join(', ');
+  if (n > 0 && !(rep && rep.key_checked)) return 'intact, but its ' + n + ' secrets were not tested: the server has no master key';
+  return 'intact' + (n === 1 ? '; its secret can be decrypted' : n > 1 ? '; all ' + n + ' secrets can be decrypted' : '');
+}
+function backUpNow() {
+  if (S.backupBusy) return;
+  S.backupBusy = true; S.backupNote = null; render();
+  send('POST', '/v1/backups', null, 120000).then(function (res) {
+    var rep = res && res.report, b = (res && res.backup) || {};
+    var removed = num(res && res.removed) || 0;
+    S.backupNote = { kind: rep && rep.ok ? 'ok' : 'warn', text: 'Wrote ' + orDash(b.name, 80) + ' (' + size(b.size_bytes) + '): ' + reportText(rep) + '.' + (removed ? ' Removed ' + removed + ' older ' + (removed === 1 ? 'backup.' : 'backups.') : '') };
+    if (b.name && rep) S.checks.set(str(b.name), { busy: false, report: rep, error: '' });
+  }, function (e) {
+    if (e && e.status === 401) { signOut('The daemon rejected this token. It may have been revoked.'); return; }
+    S.backupNote = { kind: 'crit', text: 'No backup was made. ' + str(e && e.message, 300) };
+  }).then(function () {
+    S.backupBusy = false; S.backups = null;
+    if (!S.token) return;
+    render(); return ensureExtras();
+  });
+}
+function checkBackup(name) {
+  S.checks.set(name, { busy: true, report: null, error: '' }); render();
+  send('POST', '/v1/backups/' + encodeURIComponent(name) + '/verify', null, 120000).then(function (rep) {
+    S.checks.set(name, { busy: false, report: rep, error: '' });
+  }, function (e) {
+    if (e && e.status === 401) { signOut('The daemon rejected this token. It may have been revoked.'); return; }
+    S.checks.set(name, { busy: false, report: null, error: str(e && e.message, 300) || 'The check failed.' });
+  }).then(function () { if (S.token) render(); });
 }
 
 // Logs are read on demand. The daemon sends the whole output of the
@@ -335,6 +440,7 @@ function scrollLogsToEnd() { var el = $('logs'); if (el) el.scrollTop = el.scrol
 
 // ---------- signing in and out ----------
 function signIn(token) {
+  lastActive = Date.now();
   token = str(token);
   if (token === '') { S.gateError = 'Paste a token first.'; renderGate(); return; }
   // A header value cannot contain these; refusing here gives a clear
@@ -355,6 +461,8 @@ function signOut(message, keepToken) {
   S.token = ''; S.mode = 'signin'; S.gateError = str(message, 300); S.gateBusy = false;
   S.info = null; S.apps = []; S.events = []; S.releases = []; S.engineError = ''; S.offlineError = ''; S.updated = 0;
   S.health = new Map(); S.secrets = new Map(); S.logs = { app: '', text: '', error: '', loading: false, cut: false };
+  S.backups = null; S.backupBusy = false; S.backupNote = null; S.checks = new Map(); S.note = null;
+  closeDialog();
   S.pending = token;
   render();
 }
@@ -369,7 +477,7 @@ function renderGate() {
     h('p', null, 'The panel reads from the daemon at ', h('code', { text: str(window.location.host, 80) }), ' with an API token, the same kind the command line uses.'),
     h('div', { class: 'field' }, h('label', { for: 'token' }, 'API token'), $in, $err),
     h('button', { class: 'btn primary', type: 'submit', disabled: S.gateBusy }, S.gateBusy ? 'Checking…' : 'Sign in'),
-    h('p', { class: 'hint', id: 'gate-hint' }, 'Create one on the server with ', h('code', { text: 'limand token create panel' }), '. It is kept in this tab only and forgotten when the tab closes. The panel cannot change anything.'));
+    h('p', { class: 'hint', id: 'gate-hint' }, 'Create one on the server with ', h('code', { text: 'limand token create panel' }), ', or with ', h('code', { text: '--read-only' }), ' for a panel that can only look. It is kept in this tab only and forgotten when the tab closes. From the panel you can look at everything, roll back or stop an app, manage its secrets and make backups. Deploying a new version is done with the command line.'));
   $gate.appendChild(form);
   if (!S.gateBusy) { try { $in.focus(); } catch (e) { /* not focusable yet */ } }
 }
@@ -377,7 +485,7 @@ function renderGate() {
 // ---------- routing: plain #name hashes only ----------
 function route() {
   var hash = ''; try { hash = decodeURIComponent((window.location.hash || '').replace(/^#/, '')); } catch (e) { hash = ''; }
-  if (['apps', 'activity', 'secrets', 'daemon'].indexOf(hash) !== -1) return { view: hash };
+  if (['apps', 'activity', 'secrets', 'daemon', 'backups'].indexOf(hash) !== -1) return { view: hash };
   if (hash.indexOf('app-') === 0) return { view: 'app', name: hash.slice(4) };
   return { view: 'overview' };
 }
@@ -406,13 +514,13 @@ function renderSide(r) {
     }), list.length > shown.length ? h('a', { class: 'nav muted', href: '#apps' }, h('span', { class: 'lbl', text: 'All ' + list.length + ' apps' })) : null));
   }
   add($nav, [navItem('activity', 'Activity', 'activity', r.view === 'activity'), navItem('secrets', 'Secrets', 'secrets', r.view === 'secrets'),
-    h('div', { class: 'side-label', text: 'System' }), navItem('daemon', 'Daemon', 'daemon', r.view === 'daemon')]);
+    h('div', { class: 'side-label', text: 'System' }), navItem('backups', 'Backups', 'backups', r.view === 'backups'), navItem('daemon', 'Daemon', 'daemon', r.view === 'daemon')]);
   renderFoot();
   $app.className = 'app' + (S.collapsed ? ' collapsed' : '') + (S.drawer ? ' drawer' : '');
 }
 function renderFoot() {
   clear($foot);
-  var p = S.mode === 'offline' ? ['crit', 'Unreachable'] : S.mode === 'loading' ? ['info', 'Connecting'] : ['ok', 'Connected'];
+  var p = S.mode === 'offline' ? ['crit', 'Unreachable'] : S.mode === 'loading' ? ['info', 'Connecting'] : ['ok', readOnly() ? 'Connected, read-only' : 'Connected'];
   add($foot, [h('div', { class: 'conn', title: p[1] + ' · ' + str(window.location.host, 80) }, h('i', { class: 'dot ' + p[0], 'aria-hidden': 'true' }),
       h('span', { class: 'lbl trunc' }, p[1], S.updated ? h('span', { class: 'muted', id: 'updated', text: ' · updated ' + ago(S.updated) }) : null)),
     h('button', { class: 'nav', id: 'signout', title: S.collapsed ? 'Sign out' : null, onclick: function () { signOut(''); } }, icon('signout'), h('span', { class: 'lbl', text: 'Sign out' })),
@@ -422,7 +530,7 @@ function renderFoot() {
 }
 function renderCrumbs(r) {
   clear($crumbs);
-  var names = { overview: 'Overview', apps: 'Apps', activity: 'Activity', secrets: 'Secrets', daemon: 'Daemon' };
+  var names = { overview: 'Overview', apps: 'Apps', activity: 'Activity', secrets: 'Secrets', daemon: 'Daemon', backups: 'Backups' };
   var parts = r.view === 'app' ? [['#apps', 'Apps'], [null, str(r.name, 80)]] : [[null, names[r.view]]];
   add($crumbs, [h('a', { href: '#overview', text: 'liman' })]);
   parts.forEach(function (p) { add($crumbs, [h('span', { class: 'sep', 'aria-hidden': 'true', text: '/' }), p[0] ? h('a', { href: p[0], text: p[1] }) : h('span', { class: 'here trunc', title: p[1], text: p[1] })]); });
@@ -441,6 +549,8 @@ function stateBlock(title, body, action, tight) { return h('div', { class: 'stat
 function fullState(title, body, action) { return h('div', { class: 'panel' }, stateBlock(title, body, action)); }
 function banners() {
   var out = [];
+  if (S.note) out.push(h('div', { class: 'banner ' + (S.note.kind === 'ok' ? 'info' : 'crit'), role: 'status' }, h('div', { class: 'grow wrap-any', text: S.note.text }),
+    h('button', { class: 'btn small', onclick: function () { S.note = null; render(); } }, 'Dismiss')));
   if (S.mode === 'offline') out.push(h('div', { class: 'banner crit', role: 'alert' }, h('div', { class: 'grow' }, h('b', { text: 'The daemon is not answering. ' }),
     'This is the status from ' + clock(S.updated, true) + ' and may be out of date. ' + str(S.offlineError, 200)),
     h('button', { class: 'btn small', onclick: function () { refresh(); } }, 'Try again')));
@@ -702,7 +812,9 @@ function viewApp(name) {
   var st = status(a);
   if (!TABS.some(function (t) { return t[0] === S.tab; })) S.tab = 'overview';
   var out = [h('div', { class: 'head' },
-    h('div', { class: 'grow' }, h('h1', { text: a.name }), h('div', { class: 'hstack' }, pill(st), h('span', { class: 'mono wrap-any muted', text: orDash(a.domain) }))))];
+    h('div', { class: 'grow' }, h('h1', { text: a.name }), h('div', { class: 'hstack' }, pill(st), h('span', { class: 'mono wrap-any muted', text: orDash(a.domain) }))),
+    h('button', { class: 'btn', id: 'act-rollback', disabled: !canAct() || a.previous.length === 0, title: a.previous.length ? null : 'No previous release is kept for this app', onclick: function () { dlgRollback(a); } }, 'Roll back'),
+    h('button', { class: 'btn danger', id: 'act-stop', disabled: !canAct(), onclick: function () { dlgStop(a); } }, 'Stop and remove'))];
   if (str(a.note)) out.push(h('div', { class: 'banner ' + (st.key === 'crit' || st.key === 'warn' ? st.key : 'info') }, h('div', { class: 'grow wrap-any', text: str(a.note, 500) })));
   out.push(h('div', { class: 'tabs', role: 'tablist', 'aria-label': 'App sections' }, TABS.map(function (t) {
     return h('button', { role: 'tab', id: 'tab-' + t[0], 'aria-selected': S.tab === t[0] ? 'true' : 'false', onclick: function () { setTab(t[0]); } }, t[1]);
@@ -737,10 +849,11 @@ function viewApp(name) {
           h('td', { class: 'detail', text: orDash(r.error, 600) }));
       })))) : stateBlock('No deploys are recorded for this app', null, null, true);
     out.push(h('div', { class: 'grid' }, panel('Deploys', body, { flush: true })));
-    out.push(h('div', { class: 'hint' }, a.previous.length ? 'The previous release is kept stopped; ' : 'No previous release is kept. ', a.previous.length ? h('code', { text: 'liman rollback ' + a.name }) : null, a.previous.length ? ' puts it back in service.' : null));
+    out.push(h('div', { class: 'hint', text: a.previous.length ? 'The previous release is kept stopped; \u201cRoll back\u201d puts it back in service.' : 'No previous release is kept, so there is nothing to roll back to.' }));
   } else if (S.tab === 'secrets') {
-    out.push(h('div', { class: 'grid' }, panel('Secrets', secretTable([a], false), { flush: true })));
-    out.push(h('div', { class: 'hint' }, 'Names only: values are stored encrypted and no interface can read them back. Set one with ', h('code', { text: 'liman secret set ' + a.name + ' NAME' }), '; it takes effect on the next deploy.'));
+    out.push(h('div', { class: 'grid' }, panel('Secrets', secretTable([a], false), { flush: true,
+      side: S.info && S.info.secrets ? h('button', { class: 'btn small', id: 'act-secret', disabled: !canAct(), onclick: function () { dlgSecret(a, ''); } }, 'Add secret') : null })));
+    out.push(h('div', { class: 'hint' }, 'Names only: values are stored encrypted and no interface can read them back. A new or replaced value takes effect on the next deploy. From a script: ', h('code', { text: 'liman secret set ' + a.name + ' NAME' })));
   } else if (S.tab === 'activity') {
     var ev = sortedEvents().filter(function (e) { return str(e.app) === a.name; });
     out.push(h('div', { class: 'grid' }, panel('Activity', ev.length ? eventTable(ev, false) : stateBlock('Nothing recorded for this app in the latest ' + S.events.length + ' steps', null, null, true), { flush: true })));
@@ -784,11 +897,130 @@ function secretTable(list, withApp) {
   if (rows.length === 0 && waiting) return stateBlock('Reading the secret names…', null, null, true);
   if (rows.length === 0 && failed) return stateBlock('The secret names could not be read', h('p', { text: str(failed, 300) }), null, true);
   if (rows.length === 0) return stateBlock(withApp ? 'No secrets are stored for these apps' : 'This app has no secrets', h('p', null, 'Store one with ', h('code', { text: 'liman secret set' }), ', then list its name under ', h('code', { text: 'secrets:' }), ' in app.yaml.'), null, true);
-  return h('div', { class: 'tbl-wrap' }, h('table', null, h('thead', null, h('tr', null, withApp ? h('th', { text: 'App' }) : null, h('th', { text: 'Name' }), h('th', { text: 'Last changed' }))),
+  return h('div', { class: 'tbl-wrap' }, h('table', null, h('thead', null, h('tr', null, withApp ? h('th', { text: 'App' }) : null, h('th', { text: 'Name' }), h('th', { text: 'Last changed' }), h('th', null, h('span', { class: 'sr', text: 'Actions' })))),
     h('tbody', null, rows.map(function (r) {
-      var a = r[0], x = r[1];
-      return h('tr', null, withApp ? h('td', { class: 'name' }, h('a', { href: appHref(a.name), text: a.name })) : null, h('td', { class: 'mono detail', text: str(x.name, 300) }), h('td', { class: 'nowrap' }, when(x.updated_at)));
+      var a = r[0], x = r[1], name = str(x.name);
+      return h('tr', null, withApp ? h('td', { class: 'name' }, h('a', { href: appHref(a.name), text: a.name })) : null, h('td', { class: 'mono detail', text: str(name, 300) }), h('td', { class: 'nowrap' }, when(x.updated_at)),
+        h('td', { class: 'nowrap right' }, h('button', { class: 'btn small', disabled: !canAct(), onclick: function () { dlgSecret(a, name); } }, 'Replace'), ' ',
+          h('button', { class: 'btn small danger', disabled: !canAct(), onclick: function () { dlgRemoveSecret(a, name); } }, 'Remove')));
     }))));
+}
+
+// ---------- actions: everything that changes something is confirmed first ----------
+// Actions are offered only to a token that may perform them. This is a
+// courtesy to the user, not the protection: the daemon refuses a read-only
+// token whatever this page shows.
+function readOnly() { return !(S.info && S.info.scope === 'admin'); }
+function canAct() { return S.mode === 'ready' && !readOnly(); }
+function openDialog(title, body, actions) {
+  clear($dlg);
+  $dlg.appendChild(h('form', { class: 'dlg', novalidate: true, onsubmit: function (e) { e.preventDefault(); } }, h('h3', { id: 'dlg-title', text: title }), body, h('div', { class: 'acts' }, actions)));
+  if (typeof $dlg.showModal === 'function') { if (!$dlg.open) $dlg.showModal(); } else $dlg.setAttribute('open', '');
+}
+function closeDialog() { if (!$dlg) return; if ($dlg.open && typeof $dlg.close === 'function') $dlg.close(); else $dlg.removeAttribute('open'); clear($dlg); }
+function cancelBtn(label) { return h('button', { type: 'button', class: 'btn', onclick: closeDialog }, label || 'Cancel'); }
+// failed turns an error into what the user reads. A rejected token ends
+// the session; everything else is shown where the action was started.
+function failed(e) {
+  if (e && e.status === 401) { signOut('The daemon rejected this token. It may have been revoked.'); return null; }
+  if (e && e.status === 409) return str(e.message, 300) || 'Another operation on this app is in progress. Try again when it has finished.';
+  return str(e && e.message, 400) || 'The request failed.';
+}
+// working swaps a dialog's buttons for a note while the request is out, so
+// nothing can be sent twice.
+function working(text) { var acts = $dlg.querySelector('.acts'); if (acts) { clear(acts); acts.appendChild(h('span', { class: 'muted', text: text })); } }
+function done(kind, text) { S.note = { kind: kind, text: text }; closeDialog(); render(); refresh(); }
+
+function dlgRollback(a) {
+  var prev = a.previous[a.previous.length - 1] || {};
+  var $out = h('pre', { class: 'logs dlg-out', hidden: true, tabindex: '0', 'aria-label': 'Progress' }), $err = h('div', { class: 'err', role: 'alert' });
+  openDialog('Roll back ' + str(a.name, 80) + '?',
+    [h('p', { text: 'The previous release is started again and, once it passes its health check, requests are sent to it. The current release is then removed; to get it back you deploy it again.' }),
+     h('div', { class: 'swap' }, h('span', { class: 'muted', text: 'From' }), h('span', { class: 'mono wrap-any', text: orDash(a.container) }), h('span', { class: 'muted', text: 'To' }), h('span', { class: 'mono wrap-any', text: orDash(prev.container) + '  ' + str(prev.image, 200) })),
+     $out, $err],
+    [cancelBtn(), h('button', { type: 'submit', class: 'btn primary', id: 'dlg-go', onclick: function () {
+      working('Rolling back\u2026 keep this page open.'); $out.hidden = false;
+      stream('POST', appPath(a.name, '/rollback'), function (text) {
+        // Progress output is shown as it comes, as text.
+        $out.textContent += text.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, ''); $out.scrollTop = $out.scrollHeight;
+      }).then(function (res) {
+        if (res.ok) { done('ok', 'Rolled back ' + str(a.name, 60) + ' to release ' + orDash(res.release, 60) + '.'); return; }
+        // A failed rollback undoes itself; say so, and leave the output up.
+        $err.textContent = 'The rollback failed and was undone: ' + str(res.error, 400);
+        working(''); var acts = $dlg.querySelector('.acts'); clear(acts); acts.appendChild(cancelBtn('Close')); refresh();
+      }, function (e) {
+        var msg = failed(e); if (msg === null) return;
+        $err.textContent = msg; var acts = $dlg.querySelector('.acts'); clear(acts); acts.appendChild(cancelBtn('Close')); refresh();
+      });
+    } }, 'Roll back')]);
+}
+function dlgStop(a) {
+  var $err = h('div', { class: 'err', id: 'stop-err', role: 'alert' });
+  var $in = h('input', { class: 'input mono', id: 'stop-confirm', autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false', maxlength: '100', 'aria-describedby': 'stop-err', oninput: function () { $err.textContent = ''; $in.removeAttribute('aria-invalid'); } });
+  openDialog('Stop and remove ' + str(a.name, 80) + '?',
+    [h('p', { text: 'Its containers are removed, the previous release included, and ' + orDash(a.domain, 120) + ' stops answering. Its secrets and its history are kept. To bring it back you deploy it again.' }),
+     h('div', { class: 'field' }, h('label', { for: 'stop-confirm' }, 'Type the app name to confirm'), $in, $err)],
+    [cancelBtn(), h('button', { type: 'submit', class: 'btn danger', id: 'dlg-go', onclick: function () {
+      if ($in.value.trim() !== a.name) { $err.textContent = 'That does not match. The name is ' + a.name + '.'; $in.setAttribute('aria-invalid', 'true'); $in.focus(); return; }
+      working('Stopping\u2026');
+      send('DELETE', appPath(a.name, ''), null, 120000).then(function (res) {
+        var n = res && Array.isArray(res.removed) ? res.removed.length : 0;
+        window.location.hash = 'apps';
+        done('ok', 'Stopped ' + str(a.name, 60) + ' and removed ' + n + (n === 1 ? ' container.' : ' containers.'));
+      }, function (e) { var msg = failed(e); if (msg === null) return; closeDialog(); S.note = { kind: 'crit', text: str(a.name, 60) + ' was not stopped. ' + msg }; render(); refresh(); });
+    } }, 'Stop and remove')]);
+  $in.focus();
+}
+var SECRET_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/, SECRET_MAX_BYTES = 64 * 1024;
+function dlgSecret(a, fixedName) {
+  var $nameErr = h('div', { class: 'err', id: 'sec-name-err', role: 'alert' }), $valErr = h('div', { class: 'err', id: 'sec-val-err', role: 'alert' }), $size = h('span', { class: 'hint', id: 'sec-size', text: '0 bytes' });
+  var $name = h('input', { class: 'input mono', id: 'sec-name', value: fixedName || null, readonly: fixedName ? true : null, maxlength: '128', autocomplete: 'off', autocapitalize: 'characters', spellcheck: 'false', placeholder: 'DATABASE_URL', 'aria-describedby': 'sec-name-err', oninput: function () { $nameErr.textContent = ''; $name.removeAttribute('aria-invalid'); } });
+  // type=password: not shown on screen, and with this autocomplete value
+  // the browser does not offer to remember it.
+  var $val = h('input', { class: 'input mono', id: 'sec-value', type: 'password', autocomplete: 'new-password', spellcheck: 'false', 'aria-describedby': 'sec-val-err sec-size' });
+  var enc = new TextEncoder();
+  $val.addEventListener('input', function () { $valErr.textContent = ''; $val.removeAttribute('aria-invalid'); $size.textContent = fmtNum(enc.encode($val.value).length) + ' bytes'; });
+  function wrong($el, $e, msg) { $e.textContent = msg; $el.setAttribute('aria-invalid', 'true'); $el.focus(); return null; }
+  // The same rules the daemon applies; checking here only saves a round
+  // trip and gives the message next to the field.
+  function check() {
+    var n = $name.value.trim(), bytes = enc.encode($val.value);
+    if (n === '') return wrong($name, $nameErr, 'Give the secret a name.');
+    if (!SECRET_NAME_RE.test(n)) return wrong($name, $nameErr, 'Use letters, digits and underscores, and do not start with a digit.');
+    if (bytes.length === 0) return wrong($val, $valErr, 'The value is empty.');
+    if ($val.value.indexOf('\u0000') !== -1) return wrong($val, $valErr, 'The value contains a NUL character, which cannot be stored.');
+    if (bytes.length > SECRET_MAX_BYTES) return wrong($val, $valErr, 'The value is ' + fmtNum(bytes.length) + ' bytes; the limit is ' + fmtNum(SECRET_MAX_BYTES) + '.');
+    return { name: n, bytes: bytes };
+  }
+  openDialog((fixedName ? 'Replace secret of ' : 'Add secret to ') + str(a.name, 80),
+    [h('div', { class: 'field' }, h('label', { for: 'sec-name' }, 'Name'), $name, $nameErr),
+     h('div', { class: 'field' }, h('label', { for: 'sec-value' }, 'Value'), $val, h('div', { class: 'between' }, $valErr, $size)),
+     h('p', { class: 'hint', text: 'The value is sent once, stored encrypted and cannot be shown again. Running containers keep what they have; it takes effect on the next deploy.' })],
+    [cancelBtn(), h('button', { type: 'submit', class: 'btn primary', id: 'dlg-go', onclick: function () {
+      var r = check(); if (!r) return;
+      working('Storing\u2026');
+      // The value leaves the page here and is dropped from the field at once.
+      var sending = send('PUT', appPath(a.name, '/secrets/' + encodeURIComponent(r.name)), r.bytes);
+      $val.value = '';
+      sending.then(function () {
+        S.secrets.delete(a.name);
+        done('ok', 'Stored secret ' + str(r.name, 60) + ' of ' + str(a.name, 60) + ' (' + fmtNum(r.bytes.length) + ' bytes). It takes effect on the next deploy.');
+        ensureExtras();
+      }, function (e) { var msg = failed(e); if (msg === null) return; closeDialog(); S.note = { kind: 'crit', text: 'The secret was not stored. ' + msg }; render(); });
+    } }, 'Store secret')]);
+  (fixedName ? $val : $name).focus();
+}
+function dlgRemoveSecret(a, name) {
+  openDialog('Remove secret ' + str(name, 80) + '?',
+    [h('p', { text: 'It is removed from ' + str(a.name, 80) + ' for good; the value cannot be recovered from here. Running containers keep it until the next deploy, and a deploy whose app.yaml still lists it will be refused.' })],
+    [cancelBtn(), h('button', { type: 'submit', class: 'btn danger', id: 'dlg-go', onclick: function () {
+      working('Removing\u2026');
+      send('DELETE', appPath(a.name, '/secrets/' + encodeURIComponent(name))).then(function () {
+        S.secrets.delete(a.name);
+        done('ok', 'Removed secret ' + str(name, 60) + ' of ' + str(a.name, 60) + '.');
+        ensureExtras();
+      }, function (e) { var msg = failed(e); if (msg === null) return; closeDialog(); S.note = { kind: 'crit', text: 'The secret was not removed. ' + msg }; render(); });
+    } }, 'Remove')]);
 }
 
 // ---------- views: activity, secrets, daemon ----------
@@ -810,6 +1042,41 @@ function viewSecrets() {
   return [h('h1', { text: 'Secrets' }), h('div', { class: 'panel' }, secretTable(S.apps.slice().sort(function (a, b) { return a.name.localeCompare(b.name); }), true)),
     h('div', { class: 'hint', text: 'Names only, for the apps that are deployed. Values are stored encrypted and no interface can read them back.' })];
 }
+function viewBackups() {
+  var out = [h('div', { class: 'head' }, h('div', { class: 'grow' }, h('h1', { text: 'Backups' })),
+    S.info && S.info.backups ? h('button', { class: 'btn primary', id: 'backup-now', disabled: S.backupBusy || !canAct(), title: readOnly() ? 'This token is read-only' : null, onclick: backUpNow }, S.backupBusy ? 'Backing up\u2026' : 'Back up now') : null)];
+  if (!(S.info && S.info.backups)) { out.push(fullState('This daemon does not offer backups', h('p', null, 'On the server, ', h('code', { text: 'limand backup create <dir>' }), ' still works.'))); return out; }
+  if (S.backupNote) out.push(h('div', { class: 'banner ' + (S.backupNote.kind === 'ok' ? 'info' : S.backupNote.kind), role: 'status' }, h('div', { class: 'grow wrap-any', text: S.backupNote.text })));
+
+  var have = S.backups;
+  if (!have) { out.push(h('div', { class: 'panel' }, stateBlock('Reading the list of backups\u2026', null, null, true))); return out; }
+  if (!have.list) { out.push(fullState('The backups could not be listed', h('p', { text: str(have.error, 300) }), h('button', { class: 'btn', onclick: function () { S.backups = null; render(); ensureExtras(); } }, 'Try again'))); return out; }
+
+  var list = cleanList(have.list.backups), keep = num(have.list.keep) || 0, total = 0;
+  list.forEach(function (b) { total += num(b.size_bytes) || 0; });
+  var newest = list[0], age = newest ? time(newest.created_at) : null, stale = age !== null && Date.now() - age > 2 * DAY;
+  out.push(h('div', { class: 'grid' },
+    stat('Latest backup', newest ? ago(newest.created_at) : 'none', newest ? abs(newest.created_at) : 'nothing has been backed up yet', { small: true, tone: !newest || stale ? 'crit' : '' }),
+    stat('Kept', fmtNum(list.length), keep ? 'the newest ' + keep + ' are kept' : 'none are removed automatically'),
+    stat('Size on disk', size(total), 'all backups together', { small: true }),
+    stat('Where', orDash(have.list.dir, 60), 'on the server\u2019s own disk', { small: true }),
+    panel('Backups', list.length ? h('div', { class: 'tbl-wrap' }, h('table', null,
+      h('thead', null, h('tr', null, h('th', { text: 'File' }), h('th', { text: 'Made' }), h('th', { text: 'Size' }), h('th', { text: 'Check' }))),
+      h('tbody', null, list.map(function (b) {
+        var name = str(b.name), c = S.checks.get(name), cell;
+        if (c && c.busy) cell = h('span', { class: 'muted', text: 'Checking\u2026' });
+        else if (c && c.report) cell = h('div', { class: 'hstack' }, pill(c.report.ok ? { key: 'ok', label: 'Good' } : { key: 'crit', label: 'Not usable' }), h('span', { class: 'muted wrap-any', text: reportText(c.report) }));
+        else if (c && c.error) cell = h('div', { class: 'hstack' }, pill({ key: 'crit', label: 'Damaged' }), h('span', { class: 'muted wrap-any', text: c.error }));
+        else cell = h('button', { class: 'btn small', disabled: !canAct(), onclick: function () { checkBackup(name); } }, 'Check');
+        return h('tr', null, h('td', { class: 'mono nowrap', text: orDash(name, 60) }), h('td', { class: 'nowrap' }, when(b.created_at)), h('td', { class: 'nowrap mono', text: size(b.size_bytes) }), h('td', { class: 'detail' }, cell));
+      })))) : stateBlock('No backups yet', h('p', null, 'Make the first one with the button above. On a server installed with ', h('code', { text: 'install.sh' }), ' one is also made every night.'), null, true), { flush: true }),
+    panel('What a backup is, and is not', h('dl', { class: 'kv' },
+      h('dt', { text: 'In it' }), h('dd', null, 'The daemon\u2019s database: tokens, secrets (still encrypted), deploy history. Made while everything keeps running.'),
+      h('dt', { text: 'Not in it' }), h('dd', null, 'The master key. Keep a copy of ', h('code', { text: 'master.key' }), ' somewhere else; without it the secrets in every backup are lost. \u201cCheck\u201d tells you whether the server\u2019s key opens a backup.'),
+      h('dt', { text: 'Restoring' }), h('dd', null, 'Not from here: it replaces the database the daemon is using, so the daemon has to be stopped. On the server: ', h('code', { text: 'limand backup restore <file>' }), '.'),
+      h('dt', { text: 'Off the server' }), h('dd', null, 'These files are on the same disk as the data they protect. Copy them elsewhere regularly, or they are lost together with the server.')), { span: 'c12' })));
+  return out;
+}
 function viewDaemon() {
   var d = S.info || {}, m = d.monitor && typeof d.monitor === 'object' ? d.monitor : null;
   function part(label, key, word, text) { return [h('dt', { text: label }), h('dd', { class: 'hstack' }, pill({ key: key, label: word }), h('span', { class: 'muted wrap-any', text: text }))]; }
@@ -827,8 +1094,11 @@ function viewDaemon() {
       h('dt', { text: 'Running since' }), h('dd', null, when(d.started_at), h('span', { class: 'muted', text: time(d.started_at) === null ? '' : ' · ' + abs(d.started_at) })),
       h('dt', { text: 'Panel address' }), h('dd', { class: 'mono', text: str(window.location.host, 120) })), { span: 'c6' }),
     panel('Access', h('dl', { class: 'kv' },
-      h('dt', { text: 'This panel' }), h('dd', null, 'Signed in with an API token that is kept in this browser tab only. It can read; it cannot deploy, stop or change anything.'),
-      h('dt', { text: 'Tokens' }), h('dd', null, 'Created and revoked on the server: ', h('code', { text: 'limand token list' }), '. Revoking the token signs this panel out at its next refresh.')),
+      h('dt', { text: 'This panel' }), h('dd', null, 'Signed in as ', h('code', { text: orDash(d.token, 64) }), readOnly()
+        ? ', a read-only token: this panel can look at everything and change nothing. The token is kept in this browser tab only.'
+        : ', a token that can change things: this panel offers rollback, stop, secrets and backups, and asks before anything that removes something. The token is kept in this browser tab only.'),
+      h('dt', { text: 'Signing out' }), h('dd', null, 'By hand, by closing the tab, or by itself after ' + Math.round(IDLE_LIMIT / 60000) + ' minutes without a click or a key press.'),
+      h('dt', { text: 'Tokens' }), h('dd', null, 'Created and revoked on the server: ', h('code', { text: 'limand token list' }), '. For a panel that should only look: ', h('code', { text: 'limand token create panel --read-only' }), '. Revoking a token signs its panel out at the next refresh.')),
       { span: 'c12', side: h('button', { class: 'btn small', onclick: function () { signOut(''); } }, 'Sign out') }))];
 }
 
@@ -851,7 +1121,7 @@ function render() {
     var page = h('div', { class: 'page' }); $main.appendChild(page);
     if (!S.info) { add(page, skeleton()); return; }
     add(page, banners());
-    add(page, r.view === 'app' ? viewApp(r.name) : r.view === 'apps' ? viewApps() : r.view === 'activity' ? viewActivity() : r.view === 'secrets' ? viewSecrets() : r.view === 'daemon' ? viewDaemon() : viewOverview());
+    add(page, r.view === 'app' ? viewApp(r.name) : r.view === 'apps' ? viewApps() : r.view === 'activity' ? viewActivity() : r.view === 'secrets' ? viewSecrets() : r.view === 'daemon' ? viewDaemon() : r.view === 'backups' ? viewBackups() : viewOverview());
     afterMount.forEach(function (fn) { try { fn(); } catch (e) { /* one broken chart must not take the page down */ } });
 
     $main.scrollTop = pageScroll;
@@ -885,11 +1155,19 @@ $('every').addEventListener('change', function (e) { S.every = num(e.target.valu
 $('refresh').addEventListener('click', function () { refresh(); });
 window.addEventListener('error', function (e) { crash(e.error || e); });
 window.addEventListener('hashchange', function () {
+  // A dialog belongs to the page it was opened on, unless it is busy.
+  if ($dlg.open && $dlg.querySelector('#dlg-go')) closeDialog();
   S.drawer = false; S.tab = 'overview'; render(); $main.scrollTop = 0; ensureExtras();
 });
 document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && S.drawer) setDrawer(false); });
 var lastW = window.innerWidth, resizeTimer = null;
 window.addEventListener('resize', function () { if (window.innerWidth === lastW) return; lastW = window.innerWidth; clearTimeout(resizeTimer); resizeTimer = setTimeout(render, 150); });
+
+// A signed-in panel left alone signs itself out: the token of an admin can
+// stop every app, and a forgotten tab on a shared screen should not hold it
+// forever. Any click or key press counts as activity.
+var IDLE_LIMIT = 30 * 60000, lastActive = Date.now();
+['pointerdown', 'keydown'].forEach(function (ev) { document.addEventListener(ev, function () { lastActive = Date.now(); }, true); });
 
 // One timer drives both the "updated 12s ago" text and the automatic
 // refresh. A tab nobody is looking at does not ask the daemon for anything.
@@ -897,7 +1175,9 @@ var tick = 0;
 setInterval(function () {
   var el = $('updated'); if (el && S.updated) el.textContent = ' · updated ' + ago(S.updated);
   tick++;
-  if (S.every > 0 && tick % S.every === 0 && (S.mode === 'ready' || S.mode === 'offline') && !document.hidden) refresh();
+  if (S.token && S.mode !== 'signin' && Date.now() - lastActive > IDLE_LIMIT && !$dlg.open) { signOut('Signed out after ' + Math.round(IDLE_LIMIT / 60000) + ' minutes without activity.'); return; }
+  // Not while a dialog is open: the page behind it should hold still.
+  if (S.every > 0 && tick % S.every === 0 && (S.mode === 'ready' || S.mode === 'offline') && !document.hidden && !$dlg.open) refresh();
 }, 1000);
 // Coming back to the tab after a while: show fresh data at once.
 document.addEventListener('visibilitychange', function () {
@@ -905,7 +1185,7 @@ document.addEventListener('visibilitychange', function () {
 });
 
 // ---------- start ----------
-var saved = loadToken();
+var saved = loadToken(); lastActive = Date.now();
 if (saved) { S.token = saved; S.mode = 'loading'; S.gateBusy = true; render(); refresh().then(function () { S.gateBusy = false; render(); }); }
 else render();
 })();

@@ -35,8 +35,16 @@ var files embed.FS
 //	form-action 'none'      no form may be submitted anywhere
 //	frame-ancestors 'none'  no other page may show the panel in a frame and
 //	                        trick the user into clicking on it
+//	require-trusted-types-for 'script'
+//	                        the browser itself refuses to turn a string into
+//	                        markup or code (innerHTML, eval and their
+//	                        relatives throw). The page never does that; this
+//	                        makes the browser enforce it, so a mistake in a
+//	                        later change fails loudly instead of opening a
+//	                        hole. Browsers without the feature ignore it.
 const contentSecurityPolicy = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; " +
-	"connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+	"connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; " +
+	"require-trusted-types-for 'script'"
 
 // Handler serves the panel's files. Mount it with http.StripPrefix.
 func Handler() http.Handler {
@@ -63,6 +71,12 @@ func Handler() http.Handler {
 		// The address of the panel says where the daemon is; it is not sent
 		// along when a link leads elsewhere.
 		h.Set("Referrer-Policy", "no-referrer")
+		// A window opened by, or opening, another site gets no handle on
+		// this one.
+		h.Set("Cross-Origin-Opener-Policy", "same-origin")
+		// The page needs none of the device features a browser can offer;
+		// saying so means injected code could not ask for them either.
+		h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=(), clipboard-read=()")
 
 		fileServer.ServeHTTP(w, r)
 	})
