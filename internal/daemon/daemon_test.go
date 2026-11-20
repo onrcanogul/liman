@@ -154,6 +154,8 @@ func TestUsageErrors(t *testing.T) {
 		{"revoke without name", []string{"token", "revoke"}, "usage: limand token revoke"},
 		{"deploy key without app", []string{"token", "create", "ci", "--deploy"}, "needs --app"},
 		{"deploy key read-only", []string{"token", "create", "ci", "--deploy", "--read-only", "--app", "web"}, "cannot be combined"},
+		{"preview key deploy", []string{"token", "create", "ci", "--deploy", "--preview", "--app", "web"}, "cannot be combined"},
+		{"preview key without app", []string{"token", "create", "ci", "--preview"}, "needs --app"},
 		{"serve with arguments", []string{"serve", "extra"}, "usage: limand serve"},
 	}
 
@@ -718,6 +720,12 @@ func TestRegisteredAppIsDeployedFromItsPipelineOnly(t *testing.T) {
 	}
 	if out := td.stdout.String(); !strings.Contains(out, `deploy key "web-ci" for web`) || !strings.Contains(out, "Registered web") {
 		t.Errorf("app create says: %q", out)
+	}
+	if code := td.Run(ctx, []string{"token", "create", "web-pr", "--preview", "--app", "web"}); code != exitOK || !strings.Contains(td.stdout.String(), `preview key "web-pr" for web`) || !strings.Contains(td.stdout.String(), "pull request") {
+		t.Errorf("token create --preview: %s %s", td.stdout.String(), td.stderr.String())
+	}
+	if code := td.Run(ctx, []string{"token", "list"}); code != exitOK || !regexp.MustCompile(`(?m)^web-pr\s+preview\s+web\s`).MatchString(td.stdout.String()) {
+		t.Errorf("token list does not show the preview key:\n%s", td.stdout.String())
 	}
 	if code := td.Run(ctx, []string{"token", "list"}); code != exitOK || !regexp.MustCompile(`(?m)^web-ci\s+deploy\s+web\s`).MatchString(td.stdout.String()) {
 		t.Errorf("token list does not show the deploy key:\n%s", td.stdout.String())

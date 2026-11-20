@@ -101,7 +101,7 @@ func (d *Daemon) appCreate(ctx context.Context, args []string) int {
 
 	code := d.handOver(ctx, st, newToken{
 		name: *keyName, token: token, what: fmt.Sprintf("deploy key %q for %s", *keyName, name),
-		writeClient: *writeClient, url: *url, deployKey: true,
+		writeClient: *writeClient, url: *url, scope: store.ScopeDeploy,
 	})
 	if code != exitOK {
 		_ = st.Unregister(ctx, name)

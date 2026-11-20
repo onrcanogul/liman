@@ -48,7 +48,8 @@ liman CLI asks for.
 
 Usage:
   limand                          Serve the API (same as "limand serve")
-  limand token create <name> [--read-only | --deploy] [--expires <90d|12h>]
+  limand token create <name> [--read-only | --deploy | --preview]
+                      [--expires <90d|12h>]
                       [--app <app>]... [--write-client <file>] [--url <url>]
                                   Create an API token. It is printed once, or
                                   with --write-client written to a client.yaml
@@ -62,7 +63,9 @@ Usage:
                                   --deploy token (a deploy key, for a CI
                                   pipeline) needs --app and can do one
                                   thing: trigger deploys of those apps on
-                                  the hooks.listen endpoint
+                                  the hooks.listen endpoint. A --preview
+                                  token, for pull requests, can only ask
+                                  what a deploy would change
   limand app create <name> --repo <repository> --domain <domain>
                       [--key <name>] [--write-client <file>] [--url <url>]
                                   Register an app for deploys from CI: its
@@ -659,7 +662,7 @@ func (d *Daemon) runToken(ctx context.Context, args []string) int {
 }
 
 func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
-	const synopsis = "limand token create <name> [--read-only | --deploy] [--expires <90d|12h>] [--app <app>]... [--write-client <file>] [--url <url>]"
+	const synopsis = "limand token create <name> [--read-only | --deploy | --preview] [--expires <90d|12h>] [--app <app>]... [--write-client <file>] [--url <url>]"
 
 	fs := flag.NewFlagSet("token create", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -667,6 +670,7 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 	url := fs.String("url", "", "daemon URL to put into the client.yaml")
 	readOnly := fs.Bool("read-only", false, "the token can look at everything and change nothing")
 	deployKey := fs.Bool("deploy", false, "the token can only trigger deploys of its apps, from a pipeline")
+	previewKey := fs.Bool("preview", false, "the token can only preview deploys of its apps, from a pull request's pipeline")
 	expires := fs.String("expires", "", "the token stops working after this long: 90d, 12h")
 	var apps appList
 	fs.Var(&apps, "app", "limit the token to this app; repeat for more")
@@ -684,12 +688,12 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 		fmt.Fprintln(d.Stderr, "limand: --url only makes sense together with --write-client")
 		return exitUsage
 	}
-	if *deployKey && *readOnly {
-		fmt.Fprintln(d.Stderr, "limand: --deploy and --read-only cannot be combined; a deploy key can neither read nor change anything but its deploys")
+	if n := btoi(*readOnly) + btoi(*deployKey) + btoi(*previewKey); n > 1 {
+		fmt.Fprintln(d.Stderr, "limand: --read-only, --deploy and --preview cannot be combined: a token has one scope")
 		return exitUsage
 	}
-	if *deployKey && len(apps) == 0 {
-		fmt.Fprintln(d.Stderr, "limand: a --deploy token needs --app: a deploy key for every app would deploy anything from anywhere")
+	if (*deployKey || *previewKey) && len(apps) == 0 {
+		fmt.Fprintln(d.Stderr, "limand: a --deploy or --preview token needs --app: a key for every app would reach anything from anywhere")
 		return exitUsage
 	}
 	for _, a := range apps {
@@ -724,14 +728,16 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 		scope = store.ScopeRead
 	case *deployKey:
 		scope = store.ScopeDeploy
+	case *previewKey:
+		scope = store.ScopePreview
 	}
 	token, err := st.CreateScopedToken(ctx, name, scope, expiresAt, apps...)
 	if err != nil {
 		return d.fail(err)
 	}
 	what := fmt.Sprintf("token %q", name)
-	if *deployKey {
-		what = fmt.Sprintf("deploy key %q", name)
+	if *deployKey || *previewKey {
+		what = fmt.Sprintf("%s key %q", scope, name)
 	}
 	if len(apps) > 0 {
 		what += " for " + strings.Join(apps, ", ")
@@ -749,7 +755,14 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 		what += fmt.Sprintf(" (expires %s)", expiresAt.Local().Format("2006-01-02 15:04"))
 	}
 
-	return d.handOver(ctx, st, newToken{name: name, token: token, what: what, writeClient: *writeClient, url: *url, deployKey: *deployKey})
+	return d.handOver(ctx, st, newToken{name: name, token: token, what: what, writeClient: *writeClient, url: *url, scope: scope})
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // newToken is a token just created, to be handed to its user.
@@ -759,7 +772,13 @@ type newToken struct {
 	what string
 	// writeClient and url are the flags of the same names.
 	writeClient, url string
-	deployKey        bool
+	// scope is the token's; deploy and preview keys go to the hooks
+	// listener.
+	scope string
+}
+
+func (t newToken) forHooks() bool {
+	return t.scope == store.ScopeDeploy || t.scope == store.ScopePreview
 }
 
 // handOver prints a new token once, or writes it into a client.yaml. A
@@ -775,8 +794,8 @@ func (d *Daemon) handOver(ctx context.Context, st *store.Store, t newToken) int 
 				return d.fail(err)
 			}
 			client.URL = "http://" + cfg.Daemon.Listen
-			// A deploy key works on the trigger endpoint only.
-			if t.deployKey {
+			// Deploy and preview keys work on the hooks listener only.
+			if t.forHooks() {
 				if !cfg.Hooks.Enabled() {
 					_ = st.RevokeToken(ctx, t.name)
 					return d.fail(errors.New("hooks.listen is not set, so there is no trigger endpoint to write into the file; set it, or give --url"))
@@ -794,8 +813,12 @@ func (d *Daemon) handOver(ctx context.Context, st *store.Store, t newToken) int 
 	}
 
 	fmt.Fprintf(d.Stdout, "Created %s. It is shown only this once:\n\n  %s\n\n", t.what, t.token)
-	if t.deployKey {
+	switch t.scope {
+	case store.ScopeDeploy:
 		fmt.Fprintln(d.Stdout, "Store it as a secret variable of your CI (LIMAN_TOKEN), next to LIMAN_URL: the public address of the trigger endpoint.")
+		return exitOK
+	case store.ScopePreview:
+		fmt.Fprintln(d.Stdout, "Store it as the LIMAN_TOKEN of your pull request pipeline: it can preview deploys and nothing else.")
 		return exitOK
 	}
 	fmt.Fprintln(d.Stdout, "Put it into client.yaml (token: ...) or the LIMAN_TOKEN variable on the machine you run liman from.")
