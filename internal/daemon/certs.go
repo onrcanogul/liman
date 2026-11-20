@@ -9,6 +9,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/applock"
 	"github.com/onrcanogul/liman/internal/certs"
 	"github.com/onrcanogul/liman/internal/config"
@@ -115,7 +116,9 @@ func (r *certRenewer) check(ctx context.Context) {
 func (r *certRenewer) renewDue(ctx context.Context, containers []engine.Container) {
 	inUse := map[string]bool{}
 	for _, c := range containers {
-		inUse[c.Domain] = true
+		if c.Domain != "" {
+			inUse[c.Domain] = true
+		}
 	}
 	list, err := r.store.List()
 	if err != nil {
@@ -247,12 +250,9 @@ func (d *Daemon) certList(cfg config.Config) int {
 	w := tabwriter.NewWriter(d.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "DOMAIN\tISSUER\tEXPIRES\tSTATUS")
 	for _, c := range list {
-		status := "ok"
-		switch {
-		case c.Expired(now):
+		status := certStatus(c, now)
+		if status == "expired" {
 			status = "EXPIRED"
-		case c.Due(now):
-			status = "renewal due"
 		}
 		expires := c.NotAfter.Local().Format("2006-01-02 15:04")
 		if !c.Expired(now) {
@@ -267,6 +267,71 @@ func (d *Daemon) certList(cfg config.Config) int {
 		return exitError
 	}
 	return exitOK
+}
+
+// certStatus is "ok", "renewal due" or "expired", as in api.Certificate.
+func certStatus(c certs.Info, now time.Time) string {
+	switch {
+	case c.Expired(now):
+		return "expired"
+	case c.Due(now):
+		return "renewal due"
+	default:
+		return "ok"
+	}
+}
+
+// certificatesForAPI is GET /v1/certs.
+func certificatesForAPI(cfg config.Config, connect func(context.Context) (engine.Engine, error)) func(context.Context) (api.Certificates, error) {
+	store := certs.Store{Dir: cfg.Nginx.CertDir}
+	return func(ctx context.Context) (api.Certificates, error) {
+		out := api.Certificates{ACME: cfg.ACME.Enabled(), Directory: cfg.ACME.Directory, Certificates: []api.Certificate{}}
+		list, err := store.List()
+		// A certificate that cannot be read is reported, not fatal: the
+		// others are still worth showing.
+		if err != nil {
+			out.Errors = append(out.Errors, err.Error())
+		}
+		// Which domains an app has decides what the renewer looks after.
+		// Without Docker that is unknown; every certificate then counts as
+		// used, so that a warning is shown rather than hidden.
+		inUse, known := map[string]bool{}, true
+		if domains, err := appDomains(ctx, connect); err != nil {
+			known = false
+			out.Errors = append(out.Errors, "which apps use which certificate is unknown: "+err.Error())
+		} else {
+			inUse = domains
+		}
+		now := time.Now()
+		for _, c := range list {
+			out.Certificates = append(out.Certificates, api.Certificate{
+				Domain: c.Domain, Names: c.Names, Issuer: c.Issuer,
+				NotBefore: c.NotBefore, NotAfter: c.NotAfter, Status: certStatus(c, now),
+				InUse: !known || inUse[c.Domain],
+			})
+		}
+		return out, nil
+	}
+}
+
+// appDomains returns the domains of every app container, running or not:
+// the same set the renewer counts as in use.
+func appDomains(ctx context.Context, connect func(context.Context) (engine.Engine, error)) (map[string]bool, error) {
+	eng, err := connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	containers, err := eng.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	domains := map[string]bool{}
+	for _, c := range containers {
+		if c.Domain != "" {
+			domains[c.Domain] = true
+		}
+	}
+	return domains, nil
 }
 
 func (d *Daemon) certRenew(ctx context.Context, cfg config.Config, domain string) int {

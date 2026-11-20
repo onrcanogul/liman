@@ -5,9 +5,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/onrcanogul/liman/internal/api"
+	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/secrets"
 	"github.com/onrcanogul/liman/internal/store"
 )
@@ -175,5 +178,31 @@ func TestKeyRetireRefusesWhileSecretsNeedIt(t *testing.T) {
 
 	if code := td.Run(ctx, []string{"key", "retire", oldID.String(), "--force"}); code != exitError || !strings.Contains(td.stderr.String(), "1 secret in the database is still sealed with") {
 		t.Errorf("retire a key secrets need: code %d, stderr %q", code, td.stderr.String())
+	}
+}
+
+func TestKeysForAPI(t *testing.T) {
+	td := newTestDaemon(t)
+	seed(t, td)
+	ctx := context.Background()
+	if code := td.Run(ctx, []string{"backup", "create", filepath.Join(td.Home, "backups")}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	oldKey, _ := secrets.LoadKey(filepath.Join(td.Home, "master.key"))
+	if code := td.Run(ctx, []string{"key", "rotate"}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	newKey, _ := secrets.LoadKey(filepath.Join(td.Home, "master.key"))
+
+	keys, err := td.keysForAPI(config.Config{})(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []api.Key{
+		{ID: secrets.IDOf(newKey).String(), Role: "primary", Secrets: 1},
+		{ID: secrets.IDOf(oldKey).String(), Role: "old", Backups: 1},
+	}
+	if !slices.Equal(keys.Keys, want) {
+		t.Errorf("keys = %+v, want %+v", keys.Keys, want)
 	}
 }

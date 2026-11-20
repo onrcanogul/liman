@@ -94,6 +94,15 @@ type Server struct {
 	// pointer so that "not set" and "zero: do not wait" can be told apart.
 	Drain *time.Duration
 
+	// Certificates, when set, lists the certificates in nginx.cert_dir,
+	// for GET /v1/certs.
+	Certificates func(ctx context.Context) (api.Certificates, error)
+	// Keys, when set, lists the master keys and what depends on each, for
+	// GET /v1/keys. It reads every backup, so it is not cheap.
+	Keys func(ctx context.Context) (api.Keys, error)
+	// KeyRotationUnfinished is reported by GET /v1/info.
+	KeyRotationUnfinished bool
+
 	// Certs obtains a certificate after a deploy for a domain that has
 	// none. Nil means HTTPS only comes from certificates already on disk.
 	Certs deploy.Certs
@@ -159,6 +168,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/backups", s.handleBackupList)
 	mux.HandleFunc("POST /v1/backups", s.handleBackupCreate)
 	mux.HandleFunc("POST /v1/backups/{name}/verify", s.handleBackupVerify)
+	mux.HandleFunc("GET /v1/certs", s.handleCertificates)
+	mux.HandleFunc("GET /v1/keys", s.handleKeys)
 
 	// Middleware wraps the handler from the inside out; a request passes
 	// through the list below from top to bottom. The order is deliberate:
@@ -626,7 +637,11 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		Proxy:          s.Proxy != nil,
 		Secrets:        s.Secrets != nil,
 		Backups:        s.Backups != nil,
-		Monitor:        s.Monitoring,
+		Certificates:   s.Certificates != nil,
+		ACME:           s.Certs != nil,
+
+		KeyRotationUnfinished: s.KeyRotationUnfinished,
+		Monitor:               s.Monitoring,
 	})
 }
 
@@ -792,6 +807,32 @@ func (s *Server) handleBackupVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, backupReport(rep))
+}
+
+func (s *Server) handleCertificates(w http.ResponseWriter, r *http.Request) {
+	if s.Certificates == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("this daemon has no certificate directory (nginx.cert_dir)"))
+		return
+	}
+	out, err := s.Certificates(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
+	if s.Keys == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("this daemon has no secret storage"))
+		return
+	}
+	out, err := s.Keys(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // haveBackups answers 503 and returns false if the daemon offers no backups.

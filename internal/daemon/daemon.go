@@ -108,6 +108,10 @@ type Daemon struct {
 	// Ready, when set, is called with the address the server listens on
 	// once it accepts connections. Tests use it to learn the port.
 	Ready func(addr string)
+
+	// rotationUnfinished is set by openVault when a rotation's new key is
+	// lying next to the master key.
+	rotationUnfinished bool
 }
 
 // Run executes limand with the given arguments and returns the exit code.
@@ -171,6 +175,11 @@ func (d *Daemon) serve(ctx context.Context) int {
 	}
 
 	srv := &server.Server{Store: st, Connect: connect, Log: log, Locks: locks, Secrets: vault, Started: time.Now()}
+	srv.Keys = d.keysForAPI(cfg)
+	srv.KeyRotationUnfinished = d.rotationUnfinished
+	if cfg.Nginx.CertDir != "" {
+		srv.Certificates = certificatesForAPI(cfg, connect)
+	}
 	if !cfg.Panel.Disabled {
 		srv.Panel = panel.Handler()
 	}
@@ -361,6 +370,7 @@ func (d *Daemon) openVault(ctx context.Context, cfg config.Config, st *store.Sto
 			return nil, err
 		}
 		if id, pending := ring.Pending(); pending {
+			d.rotationUnfinished = true
 			log.Warn("a key rotation did not finish; everything still opens, but finish it with: limand key rotate (daemon stopped)",
 				"pending_key", id.String(), "file", secrets.PendingKeyPath(path))
 		}

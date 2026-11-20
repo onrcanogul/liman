@@ -198,6 +198,14 @@ type Info struct {
 	Secrets bool `json:"secrets"`
 	Backups bool `json:"backups"`
 
+	// Certificates says whether GET /v1/certs answers (nginx.cert_dir is
+	// set), ACME whether the daemon obtains certificates itself.
+	Certificates bool `json:"certificates"`
+	ACME         bool `json:"acme"`
+	// KeyRotationUnfinished is true when the daemon started with the new
+	// key of an interrupted rotation lying next to the master key.
+	KeyRotationUnfinished bool `json:"key_rotation_unfinished,omitempty"`
+
 	// Monitor describes the health monitor; it is absent when the monitor
 	// is turned off.
 	Monitor *MonitorInfo `json:"monitor,omitempty"`
@@ -209,6 +217,55 @@ type MonitorInfo struct {
 	FailureThreshold int `json:"failure_threshold"`
 	// RetentionSeconds is how long health checks are kept.
 	RetentionSeconds int `json:"retention_seconds"`
+}
+
+// Certificate describes a certificate in nginx.cert_dir.
+type Certificate struct {
+	Domain    string    `json:"domain"`
+	Names     []string  `json:"names"`
+	Issuer    string    `json:"issuer"`
+	NotBefore time.Time `json:"not_before"`
+	NotAfter  time.Time `json:"not_after"`
+	// Status is "ok", "renewal due" (less than a third of its lifetime
+	// left; the daemon renews such a certificate, so one that stays due
+	// means renewing fails) or "expired".
+	Status string `json:"status"`
+	// InUse is true when an app has this domain. Only those are renewed:
+	// the certificate of a stopped app stays for a later deploy, but
+	// nothing is done with it, and its expiry harms nobody.
+	InUse bool `json:"in_use"`
+}
+
+// Certificates is the answer to GET /v1/certs.
+type Certificates struct {
+	// ACME is true when the daemon obtains and renews certificates itself;
+	// Directory is then the CA it uses.
+	ACME      bool   `json:"acme"`
+	Directory string `json:"directory,omitempty"`
+	// Certificates are ordered by domain.
+	Certificates []Certificate `json:"certificates"`
+	// Errors names certificates that could not be read.
+	Errors []string `json:"errors,omitempty"`
+}
+
+// Key describes one master key, by ID only.
+type Key struct {
+	ID string `json:"id"`
+	// Role is "primary" (seals everything new), "old" (only opens what was
+	// made with it), "unfinished rotation" or "missing" (something names
+	// it, but the server does not have it).
+	Role string `json:"role"`
+	// Secrets and Backups count what depends on the key: secrets in the
+	// database sealed with it and backups in the backup directory signed
+	// with it.
+	Secrets int `json:"secrets"`
+	Backups int `json:"backups"`
+}
+
+// Keys is the answer to GET /v1/keys.
+type Keys struct {
+	// Keys lists the primary key first.
+	Keys []Key `json:"keys"`
 }
 
 // Backup describes one backup file of the daemon's database.

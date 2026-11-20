@@ -227,6 +227,24 @@ func (c *Client) Info(ctx context.Context) (*Info, error) {
 	return &out, nil
 }
 
+// Certificates lists the certificates in the server's nginx.cert_dir.
+func (c *Client) Certificates(ctx context.Context) (*Certificates, error) {
+	var out Certificates
+	if err := c.getJSON(ctx, "/v1/certs", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Keys lists the server's master keys and what depends on each.
+func (c *Client) Keys(ctx context.Context) (*Keys, error) {
+	var out Keys
+	if err := c.getJSON(ctx, "/v1/keys", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // Backups lists the backups on the server, newest first.
 func (c *Client) Backups(ctx context.Context) (*BackupList, error) {
 	var out BackupList

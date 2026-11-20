@@ -386,6 +386,8 @@ The environment variables `LIMAN_URL` and `LIMAN_TOKEN` take precedence.
 | `GET /v1/backups` | Backups on the server, newest first |
 | `POST /v1/backups` | Make a backup now and check it |
 | `POST /v1/backups/{name}/verify` | Check a backup: intact, and can its secrets be decrypted |
+| `GET /v1/certs` | Certificates in `nginx.cert_dir`, their expiry and status |
+| `GET /v1/keys` | Master keys by ID, their role, and the secrets and backups that depend on each |
 | `GET /ui/` | The panel's files; no token needed, they contain no data |
 
 ## Security

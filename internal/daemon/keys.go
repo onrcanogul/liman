@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"text/tabwriter"
 
+	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/backup"
 	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/secrets"
@@ -172,36 +174,76 @@ func (d *Daemon) keyList(ctx context.Context, cfg config.Config) int {
 		return d.fail(err)
 	}
 
-	pending, hasPending := ring.Pending()
-	ids := ring.IDs()
-	for id := range uses {
-		if !ring.Has(id) {
-			ids = append(ids, id)
-		}
-	}
 	w := tabwriter.NewWriter(d.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "KEY\tROLE\tSECRETS\tBACKUPS")
-	for _, id := range ids {
-		role := "old (opens only)"
+	for _, k := range keyRows(ring, uses) {
+		role := k.Role
+		switch role {
+		case "old":
+			role = "old (opens only)"
+		case "missing":
+			role = "MISSING"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%d\t%d\n", k.ID, role, k.Secrets, k.Backups)
+	}
+	if err := w.Flush(); err != nil {
+		return d.fail(err)
+	}
+	fmt.Fprintf(d.Stdout, "\nBackups counted in %s; old keys are in %s.\n", d.backupDir(cfg), secrets.OldKeysDir(path))
+	if _, hasPending := ring.Pending(); hasPending {
+		fmt.Fprintln(d.Stdout, "A rotation did not finish; finish it with: limand key rotate (daemon stopped)")
+	}
+	return exitOK
+}
+
+// keyRows describes every key: those in the keyring, the primary first,
+// then any that something names and the keyring lacks. Roles are as in
+// api.Key.
+func keyRows(ring *secrets.Keyring, uses map[secrets.KeyID]*keyUse) []api.Key {
+	pending, hasPending := ring.Pending()
+	ids := ring.IDs()
+	var missing []secrets.KeyID
+	for id := range uses {
+		if !ring.Has(id) {
+			missing = append(missing, id)
+		}
+	}
+	sort.Slice(missing, func(i, j int) bool { return missing[i].String() < missing[j].String() })
+
+	var rows []api.Key
+	for _, id := range append(ids, missing...) {
+		role := "old"
 		switch {
 		case id == ring.Primary():
 			role = "primary"
 		case hasPending && id == pending:
 			role = "unfinished rotation"
 		case !ring.Has(id):
-			role = "MISSING"
+			role = "missing"
 		}
-		u := uses[id]
-		fmt.Fprintf(w, "%s\t%s\t%d\t%d\n", id, role, u.secrets, len(u.backups))
+		row := api.Key{ID: id.String(), Role: role}
+		if u := uses[id]; u != nil {
+			row.Secrets, row.Backups = u.secrets, len(u.backups)
+		}
+		rows = append(rows, row)
 	}
-	if err := w.Flush(); err != nil {
-		return d.fail(err)
+	return rows
+}
+
+// keysForAPI is GET /v1/keys: the keyring as it is on disk now, with what
+// depends on each key.
+func (d *Daemon) keysForAPI(cfg config.Config) func(ctx context.Context) (api.Keys, error) {
+	return func(ctx context.Context) (api.Keys, error) {
+		ring, err := secrets.LoadKeyring(d.keyPath(cfg))
+		if err != nil {
+			return api.Keys{}, err
+		}
+		uses, err := d.keyUses(ctx, cfg, ring)
+		if err != nil {
+			return api.Keys{}, err
+		}
+		return api.Keys{Keys: keyRows(ring, uses)}, nil
 	}
-	fmt.Fprintf(d.Stdout, "\nBackups counted in %s; old keys are in %s.\n", d.backupDir(cfg), secrets.OldKeysDir(path))
-	if hasPending {
-		fmt.Fprintln(d.Stdout, "A rotation did not finish; finish it with: limand key rotate (daemon stopped)")
-	}
-	return exitOK
 }
 
 // keyRetire deletes an old key. What still depends on it is said first:

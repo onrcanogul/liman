@@ -21,7 +21,9 @@ import (
 
 	"github.com/onrcanogul/liman/internal/applock"
 	"github.com/onrcanogul/liman/internal/certs"
+	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/engine"
+	"github.com/onrcanogul/liman/internal/engine/enginetest"
 )
 
 // saveCert puts a self-signed certificate for domain into the store.
@@ -260,5 +262,45 @@ func TestCertRenewNeedsACME(t *testing.T) {
 	}
 	if code := td.Run(context.Background(), []string{"cert"}); code != exitUsage {
 		t.Errorf("cert without a subcommand: code %d, want %d", code, exitUsage)
+	}
+}
+
+func TestCertificatesForAPI(t *testing.T) {
+	dir := t.TempDir()
+	store := certs.Store{Dir: dir}
+	now := time.Now()
+	saveCert(t, store, "a.example.com", now.Add(-time.Hour), now.Add(90*24*time.Hour))
+	saveCert(t, store, "b.example.com", now.Add(-80*24*time.Hour), now.Add(10*24*time.Hour))
+	saveCert(t, store, "c.example.com", now.Add(-91*24*time.Hour), now.Add(-time.Hour))
+
+	// a and b belong to apps (b's only container is stopped); c to none.
+	fake := enginetest.New()
+	fake.Add(engine.Container{Name: "a-r1", App: "a", State: "running", Domain: "a.example.com"})
+	fake.Add(engine.Container{Name: "b-r1", App: "b", State: "exited", Domain: "b.example.com"})
+	connect := func(context.Context) (engine.Engine, error) { return fake, nil }
+
+	cfg := config.Config{Nginx: config.Nginx{CertDir: dir}, ACME: config.ACME{Directory: "https://ca.example/dir"}}
+	out, err := certificatesForAPI(cfg, connect)(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, c := range out.Certificates {
+		got = append(got, fmt.Sprintf("%s %s %v", c.Domain, c.Status, c.InUse))
+	}
+	if want := []string{"a.example.com ok true", "b.example.com renewal due true", "c.example.com expired false"}; !slices.Equal(got, want) || !out.ACME || out.Directory != "https://ca.example/dir" || len(out.Errors) != 0 {
+		t.Errorf("certificates = %v (acme %v, %q), want %v", got, out.ACME, out.Directory, want)
+	}
+}
+
+func TestCertificatesForAPIWithoutDocker(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	saveCert(t, certs.Store{Dir: dir}, "a.example.com", now.Add(-91*24*time.Hour), now.Add(-time.Hour))
+	connect := func(context.Context) (engine.Engine, error) { return nil, errors.New("docker is down") }
+
+	out, err := certificatesForAPI(config.Config{Nginx: config.Nginx{CertDir: dir}}, connect)(context.Background())
+	if err != nil || len(out.Certificates) != 1 || !out.Certificates[0].InUse || len(out.Errors) != 1 {
+		t.Errorf("certificates without Docker = %+v, %v; want the certificate counted as used, and the reason", out, err)
 	}
 }

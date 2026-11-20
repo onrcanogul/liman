@@ -2113,3 +2113,57 @@ func TestRepeatedReadsAreLoggedOnce(t *testing.T) {
 		}
 	}
 }
+
+// --- certificates and keys -------------------------------------------------------
+
+func TestCertificatesAndKeysEndpoints(t *testing.T) {
+	at := time.Date(2027, 2, 18, 12, 0, 0, 0, time.UTC)
+	h := servertest.New(t, func(s *server.Server) {
+		s.Certificates = func(context.Context) (api.Certificates, error) {
+			return api.Certificates{ACME: true, Directory: "https://ca.example/dir", Certificates: []api.Certificate{
+				{Domain: "web.example.com", Names: []string{"web.example.com"}, Issuer: "R11", NotAfter: at, Status: "ok"},
+			}}, nil
+		}
+		s.Keys = func(context.Context) (api.Keys, error) {
+			return api.Keys{Keys: []api.Key{{ID: "06f4218e2610e653", Role: "primary", Secrets: 2}, {ID: "1ed8240c9c922171", Role: "old", Backups: 3}}}, nil
+		}
+		s.KeyRotationUnfinished = true
+	})
+
+	certs, err := h.Client.Certificates(ctx())
+	if err != nil || !certs.ACME || len(certs.Certificates) != 1 || certs.Certificates[0].Domain != "web.example.com" || !certs.Certificates[0].NotAfter.Equal(at) {
+		t.Errorf("Certificates() = %+v, %v", certs, err)
+	}
+	keys, err := h.Client.Keys(ctx())
+	if err != nil || len(keys.Keys) != 2 || keys.Keys[0].Role != "primary" || keys.Keys[1].Backups != 3 {
+		t.Errorf("Keys() = %+v, %v", keys, err)
+	}
+	info, err := h.Client.Info(ctx())
+	if err != nil || !info.Certificates || !info.KeyRotationUnfinished {
+		t.Errorf("Info() = %+v, %v; want certificates and an unfinished rotation", info, err)
+	}
+
+	// Both are for looking: a read-only token may.
+	token, err := h.Store.CreateScopedToken(ctx(), "wallboard", store.ScopeRead, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &api.Client{BaseURL: h.URL, Token: token}
+	if _, err := reader.Certificates(ctx()); err != nil {
+		t.Errorf("Certificates() with a read-only token: %v", err)
+	}
+	if _, err := reader.Keys(ctx()); err != nil {
+		t.Errorf("Keys() with a read-only token: %v", err)
+	}
+}
+
+func TestCertificatesAndKeysWhenNotOffered(t *testing.T) {
+	h := servertest.New(t)
+	var apiErr *api.Error
+	if _, err := h.Client.Certificates(ctx()); !errors.As(err, &apiErr) || apiErr.Status != http.StatusServiceUnavailable {
+		t.Errorf("Certificates() without a cert_dir = %v, want 503", err)
+	}
+	if info, err := h.Client.Info(ctx()); err != nil || info.Certificates || info.ACME {
+		t.Errorf("Info() = %+v, %v; want no certificates, no acme", info, err)
+	}
+}
