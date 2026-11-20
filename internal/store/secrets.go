@@ -48,7 +48,21 @@ func (s *Store) GetSecret(ctx context.Context, app, name string) (sealed []byte,
 // ListSecrets returns the names of the secrets of app, sorted.
 func (s *Store) ListSecrets(ctx context.Context, app string) ([]secrets.Info, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT name, updated_at FROM secrets WHERE app = ? ORDER BY name`, app)
+		`SELECT '', name, updated_at FROM secrets WHERE app = ? ORDER BY name`, app)
+	return scanSecretInfos(rows, err)
+}
+
+// ListAllSecrets returns the names of the secrets of every app, sorted by
+// app and name.
+func (s *Store) ListAllSecrets(ctx context.Context) ([]secrets.Info, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT app, name, updated_at FROM secrets ORDER BY app, name`)
+	return scanSecretInfos(rows, err)
+}
+
+// scanSecretInfos reads rows of app, name, updated_at. It takes the
+// query's error too, so that each caller stays one statement.
+func scanSecretInfos(rows *sql.Rows, err error) ([]secrets.Info, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list secrets: %w", err)
 	}
@@ -58,7 +72,7 @@ func (s *Store) ListSecrets(ctx context.Context, app string) ([]secrets.Info, er
 	for rows.Next() {
 		var info secrets.Info
 		var updated string
-		if err := rows.Scan(&info.Name, &updated); err != nil {
+		if err := rows.Scan(&info.App, &info.Name, &updated); err != nil {
 			return nil, fmt.Errorf("list secrets: %w", err)
 		}
 		if info.UpdatedAt, err = parseTime(updated); err != nil {

@@ -164,6 +164,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/apps/{name}/secrets", s.handleSecretList)
 	mux.HandleFunc("PUT /v1/apps/{name}/secrets/{key}", s.handleSecretSet)
 	mux.HandleFunc("DELETE /v1/apps/{name}/secrets/{key}", s.handleSecretDelete)
+	mux.HandleFunc("GET /v1/secrets", s.handleAllSecrets)
 	mux.HandleFunc("GET /v1/history", s.handleHistory)
 	mux.HandleFunc("GET /v1/info", s.handleInfo)
 	mux.HandleFunc("GET /v1/releases", s.handleReleases)
@@ -940,6 +941,25 @@ func (s *Server) handleSecretDelete(w http.ResponseWriter, r *http.Request) {
 		s.logger().Info("secret deleted", "app", name, "secret", key)
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+// handleAllSecrets lists the secrets of every app. The per-app listing
+// only helps somebody who knows the app's name; a secret stored before the
+// first deploy, or kept after the app was stopped, shows up only here.
+func (s *Server) handleAllSecrets(w http.ResponseWriter, r *http.Request) {
+	if !s.haveSecrets(w) {
+		return
+	}
+	infos, err := s.Secrets.ListAll(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	out := make([]api.Secret, 0, len(infos))
+	for _, info := range infos {
+		out = append(out, api.Secret{App: info.App, Name: info.Name, UpdatedAt: info.UpdatedAt})
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // haveSecrets answers 503 and returns false if the daemon has no vault.

@@ -29,6 +29,8 @@ func ValidName(name string) bool {
 
 // Info describes a secret without revealing it.
 type Info struct {
+	// App is filled in only by a listing that spans every app.
+	App       string    `json:"app,omitempty"`
 	Name      string    `json:"name"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -40,6 +42,9 @@ type Storage interface {
 	PutSecret(ctx context.Context, app, name string, sealed []byte) error
 	GetSecret(ctx context.Context, app, name string) (sealed []byte, found bool, err error)
 	ListSecrets(ctx context.Context, app string) ([]Info, error)
+	// ListAllSecrets lists the secrets of every app, App filled in,
+	// including apps that are not deployed (yet, or any more).
+	ListAllSecrets(ctx context.Context) ([]Info, error)
 	DeleteSecret(ctx context.Context, app, name string) (found bool, err error)
 }
 
@@ -140,6 +145,13 @@ func (v *Vault) Get(ctx context.Context, app, name string) ([]byte, error) {
 // List returns the names of the secrets of app, never their values.
 func (v *Vault) List(ctx context.Context, app string) ([]Info, error) {
 	return v.storage.ListSecrets(ctx, app)
+}
+
+// ListAll returns the names of the secrets of every app, sorted by app and
+// name. A secret stays when its app is stopped, and can be stored before
+// the app's first deploy: this is the one listing in which those show up.
+func (v *Vault) ListAll(ctx context.Context) ([]Info, error) {
+	return v.storage.ListAllSecrets(ctx)
 }
 
 // Delete removes the secret name of app.

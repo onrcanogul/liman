@@ -313,6 +313,14 @@ func (c *Client) DeleteSecret(ctx context.Context, app, name string) error {
 	return resp.Body.Close()
 }
 
+// AllSecrets lists the secrets of every app by name, apps that are not
+// deployed included.
+func (c *Client) AllSecrets(ctx context.Context) ([]Secret, error) {
+	var out []Secret
+	err := c.getJSON(ctx, "/v1/secrets", nil, &out)
+	return out, err
+}
+
 func secretPath(app, name string) string {
 	return "/v1/apps/" + url.PathEscape(app) + "/secrets/" + url.PathEscape(name)
 }

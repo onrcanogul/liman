@@ -378,6 +378,18 @@ func TestSecretsStorage(t *testing.T) {
 	if n, err := s.CountSecrets(ctx); err != nil || n != 3 {
 		t.Errorf("CountSecrets() = %d, %v; want 3", n, err)
 	}
+	// Across apps: every secret, with its app, whether or not that app
+	// has ever been deployed. ListSecrets leaves App empty.
+	all, err := s.ListAllSecrets(ctx)
+	if err != nil || len(all) != 3 ||
+		all[0].App != "api" || all[0].Name != "KEY" ||
+		all[1].App != "web" || all[1].Name != "ANOTHER" ||
+		all[2].App != "web" || all[2].Name != "KEY" || all[2].UpdatedAt.IsZero() {
+		t.Errorf("ListAllSecrets() = %+v, %v; want api/KEY, web/ANOTHER, web/KEY", all, err)
+	}
+	if infos[0].App != "" {
+		t.Errorf("ListSecrets() fills in App = %q; it is only for listings across apps", infos[0].App)
+	}
 
 	if found, err := s.DeleteSecret(ctx, "web", "KEY"); err != nil || !found {
 		t.Errorf("DeleteSecret() = %v, %v; want found", found, err)

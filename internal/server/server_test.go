@@ -1836,7 +1836,7 @@ func TestReadOnlyTokenCanLookAndChangeNothing(t *testing.T) {
 		return resp.StatusCode
 	}
 
-	for _, path := range []string{"/v1/apps", "/v1/history", "/v1/releases", "/v1/info", "/v1/backups", "/v1/apps/web/secrets", "/v1/apps/web/health", "/v1/apps/web/logs"} {
+	for _, path := range []string{"/v1/apps", "/v1/history", "/v1/releases", "/v1/info", "/v1/backups", "/v1/apps/web/secrets", "/v1/secrets", "/v1/apps/web/health", "/v1/apps/web/logs"} {
 		if got := do(http.MethodGet, path); got != http.StatusOK {
 			t.Errorf("GET %s with a read-only token = %d, want 200", path, got)
 		}
@@ -2105,6 +2105,39 @@ func TestTokenUseIsWrittenAtMostOnceAMinute(t *testing.T) {
 	// Later requests within the minute leave the database alone.
 	if got := lastUsed(); !got.Equal(first) {
 		t.Errorf("LastUsedAt after more requests = %v, want it still %v: written more than once a minute", got, first)
+	}
+}
+
+func TestAllSecretsIncludeAppsThatAreNotDeployed(t *testing.T) {
+	h := servertest.New(t)
+	// Nothing is deployed: one app has not been yet, the other was
+	// stopped. Both keep their secrets.
+	for _, s := range []struct{ app, name, value string }{
+		{"ghost-app", "API_KEY", "value-one"},
+		{"stopped-app", "DATABASE_URL", "value-two"},
+		{"stopped-app", "TOKEN", "value-three"},
+	} {
+		if err := h.Client.SetSecret(ctx(), s.app, s.name, []byte(s.value)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	list, err := h.Client.AllSecrets(ctx())
+	if err != nil || len(list) != 3 ||
+		list[0].App != "ghost-app" || list[0].Name != "API_KEY" ||
+		list[1].App != "stopped-app" || list[1].Name != "DATABASE_URL" ||
+		list[2].App != "stopped-app" || list[2].Name != "TOKEN" || list[2].UpdatedAt.IsZero() {
+		t.Fatalf("AllSecrets() = %+v, %v; want the three, with their apps", list, err)
+	}
+	resp := request(t, h, http.MethodGet, "/v1/secrets", nil)
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if strings.Contains(string(body), "value-") {
+		t.Errorf("GET /v1/secrets returned a secret value: %s", body)
+	}
+	// The per-app listing still leaves the app out: it is in the path.
+	if per, _ := h.Client.Secrets(ctx(), "ghost-app"); len(per) != 1 || per[0].App != "" {
+		t.Errorf("Secrets(ghost-app) = %+v; want one, without app", per)
 	}
 }
 

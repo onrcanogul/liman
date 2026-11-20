@@ -128,6 +128,8 @@ type Event struct {
 // Secret describes a stored secret. There is deliberately no field for the
 // value: the API accepts secret values but never returns them.
 type Secret struct {
+	// App is set in GET /v1/secrets, which lists every app's secrets.
+	App       string    `json:"app,omitempty"`
 	Name      string    `json:"name"`
 	UpdatedAt time.Time `json:"updated_at"`
 }

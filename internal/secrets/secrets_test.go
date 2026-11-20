@@ -2,6 +2,7 @@ package secrets
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -247,6 +248,18 @@ func (m *memoryStorage) ListSecrets(_ context.Context, app string) ([]Info, erro
 		}
 	}
 	slices.SortFunc(out, func(a, b Info) int { return strings.Compare(a.Name, b.Name) })
+	return out, nil
+}
+
+func (m *memoryStorage) ListAllSecrets(_ context.Context) ([]Info, error) {
+	var out []Info
+	for key, at := range m.times {
+		app, name, _ := strings.Cut(key, "/")
+		out = append(out, Info{App: app, Name: name, UpdatedAt: at})
+	}
+	slices.SortFunc(out, func(a, b Info) int {
+		return cmp.Or(strings.Compare(a.App, b.App), strings.Compare(a.Name, b.Name))
+	})
 	return out, nil
 }
 
