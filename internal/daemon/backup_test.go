@@ -820,8 +820,10 @@ func TestBackupsAreEncrypted(t *testing.T) {
 	if !bytes.HasPrefix(data, []byte("age-encryption.org/v1\n")) {
 		t.Errorf("the backup does not start with the age header: %q", data[:min(40, len(data))])
 	}
-	// What a plain database would give away is not there.
-	for _, plain := range []string{"SQLite format 3", "Pull image", "web", "laptop"} {
+	// What a plain database would give away is not there. Only strings of
+	// six bytes and more: ciphertext is random, and a three-byte one such
+	// as "web" turns up by chance in about one backup in two hundred.
+	for _, plain := range []string{"SQLite format 3", "Pull image", "DATABASE_URL", "laptop"} {
 		if bytes.Contains(data, []byte(plain)) {
 			t.Errorf("%q is readable in the encrypted backup", plain)
 		}
