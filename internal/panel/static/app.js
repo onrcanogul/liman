@@ -1199,7 +1199,7 @@ function viewActivity() {
   return [h('h1', { text: 'Activity' }), h('div', { class: 'toolbar' }, h('span', { class: 'pick' }, $sel, icon('chevron')), h('div', { class: 'seg', role: 'group', 'aria-label': 'Show' }, segBtn('', 'All'), segBtn('problem', 'Failures, undos and restarts'))),
     h('div', { class: 'panel' }, shown.length ? eventTable(shown, true) : stateBlock(all.length ? 'No activity matches this filter' : 'Nothing has happened yet', h('p', { text: all.length ? 'Try another app, or show everything.' : 'Steps appear here as soon as the first deploy runs.' }),
       all.length ? h('button', { class: 'btn', onclick: function () { S.actApp = ''; S.actResult = ''; render(); } }, 'Clear filters') : null)),
-    h('div', { class: 'hint' }, 'The latest ' + fmtNum(all.length) + ' steps. For older ones: ', h('code', { text: 'liman history --limit 1000' }))];
+    h('div', { class: 'hint' }, 'The latest ' + fmtNum(all.length) + ' steps. For older ones: ', h('code', { text: 'liman history -n 1000' }))];
 }
 function viewSecrets() {
   var vault = !!(S.info && S.info.secrets);
