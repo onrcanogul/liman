@@ -148,6 +148,8 @@ type Token struct {
 	// LastUsedAt is when the daemon last accepted the token, to within a
 	// minute; absent if it has not since it started keeping track.
 	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	// Apps are the apps the token is limited to; absent for every app.
+	Apps []string `json:"apps,omitempty"`
 	// Current marks the token this request was made with.
 	Current bool `json:"current"`
 }
@@ -211,6 +213,10 @@ type Info struct {
 	// never does. A pointer, because omitempty leaves out nil but not a
 	// zero time.Time: a struct is never "empty" to encoding/json.
 	TokenExpiresAt *time.Time `json:"token_expires_at,omitempty"`
+	// TokenApps are the apps that token is limited to; absent when it may
+	// use every app. A limited token sees only these, and none of the
+	// endpoints about the daemon as a whole.
+	TokenApps []string `json:"token_apps,omitempty"`
 
 	// Proxy says whether the daemon manages a reverse proxy, Secrets whether
 	// it has secret storage, Backups whether it can make backups.

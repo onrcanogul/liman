@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -616,6 +617,51 @@ func TestDaemonServesThePanelUnlessDisabled(t *testing.T) {
 	// Disabled, the path is like any other unknown one: it needs a token.
 	if got := status(t, "daemon:\n  listen: 127.0.0.1:0\npanel:\n  disabled: true\n"); got != http.StatusUnauthorized {
 		t.Errorf("GET /ui/ with the panel disabled = %d, want 401", got)
+	}
+}
+
+func TestTokenCreateForApps(t *testing.T) {
+	td := newTestDaemon(t)
+	ctx := context.Background()
+
+	if code := td.Run(ctx, []string{"token", "create", "ci", "--app", "orders-api", "--app", "billing"}); code != exitOK {
+		t.Fatalf("token create --app: code %d, stderr %q", code, td.stderr.String())
+	}
+	if !strings.Contains(td.stdout.String(), `token "ci" for orders-api, billing`) {
+		t.Errorf("token create --app says: %q", td.stdout.String())
+	}
+	token := tokenRe.FindString(td.stdout.String())
+
+	st, err := store.Open(ctx, filepath.Join(td.Home, "liman.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, ok, err := st.LookupToken(ctx, token)
+	_ = st.Close()
+	if err != nil || !ok || !slices.Equal(info.Apps, []string{"billing", "orders-api"}) || info.Scope != store.ScopeAdmin {
+		t.Errorf("the created token = %+v, %v, %v; want admin, limited to billing and orders-api", info, ok, err)
+	}
+
+	if code := td.Run(ctx, []string{"token", "create", "laptop"}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	if code := td.Run(ctx, []string{"token", "list"}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	out := td.stdout.String()
+	if !regexp.MustCompile(`(?m)^ci\s+admin\s+billing,orders-api\s`).MatchString(out) || !regexp.MustCompile(`(?m)^laptop\s+admin\s+all\s`).MatchString(out) {
+		t.Errorf("token list does not show the apps:\n%s", out)
+	}
+
+	// A name that is not an app name is a typo, refused before anything
+	// is stored.
+	for _, bad := range []string{"Orders", "a b", ""} {
+		if code := td.Run(ctx, []string{"token", "create", "typo", "--app", bad}); code != exitUsage {
+			t.Errorf("token create --app %q: code %d, want %d", bad, code, exitUsage)
+		}
+	}
+	if code := td.Run(ctx, []string{"token", "list"}); code != exitOK || strings.Contains(td.stdout.String(), "typo") {
+		t.Errorf("a refused token was stored:\n%s", td.stdout.String())
 	}
 }
 

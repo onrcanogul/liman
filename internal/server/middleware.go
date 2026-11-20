@@ -27,6 +27,8 @@ type requestMeta struct {
 	scope string
 	// expires is when that token stops working; zero for never.
 	expires time.Time
+	// apps are the apps the token is limited to; nil for every app.
+	apps []string
 }
 
 // metaKey is the context key for *requestMeta. An unexported type of its
@@ -111,7 +113,7 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		}
 
 		meta := metaOf(r.Context())
-		meta.token, meta.scope, meta.expires = info.Name, info.Scope, info.ExpiresAt
+		meta.token, meta.scope, meta.expires, meta.apps = info.Name, info.Scope, info.ExpiresAt, info.Apps
 		s.recordUse(r.Context(), info)
 
 		// A read-only token may look and nothing else. The rule is about

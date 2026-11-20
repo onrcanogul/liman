@@ -372,7 +372,8 @@ Every request except `GET /v1/health` needs a token.
 limand token create <name>                         # prints the token once
 limand token create <name> --write-client <file>   # writes a client.yaml instead
 limand token create <name> --expires 90d           # stops working after 90 days (or 12h)
-limand token list                                  # with scope, expiry and last use
+limand token create <name> --app orders-api        # only this app; repeat --app for more
+limand token list                                  # with scope, apps, expiry and last use
 limand token revoke <name>
 ```
 
@@ -395,6 +396,26 @@ and every request would queue behind a write that waits for the disk. A
 dash in `token list` means not used since this was added. "Used a minute
 ago" is the question to answer before revoking a token that may still be
 in use.
+
+A token created with `--app` is limited to those apps, with its scope
+(admin or read) applying within them: give a CI pipeline a token for the
+app it deploys, so that a leak of it reaches that app only. Such a token
+
+- sees only its apps: `/v1/apps`, the history, the releases and the
+  secrets are filtered, in the query, so a limit is not used up by other
+  apps;
+- is refused, with one and the same 403, for any other app, whether that
+  app exists or not, so it cannot find out by trying names what else runs
+  here;
+- is refused everything about the daemon as a whole: tokens, backups, keys
+  and certificates.
+
+Every endpoint is declared in one table in `internal/server` together with
+what it gives access to (an app in the path, an app in the body, a
+listing, the daemon). A test checks the table; an endpoint added without
+saying is closed to limited tokens rather than open to them. A token
+without `--app`, including every token created before this existed, may
+use every app as before.
 
 Tokens can be listed and revoked over the API (and in the panel), but not
 created: a stolen admin token could otherwise make itself spares that

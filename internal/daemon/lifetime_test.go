@@ -101,7 +101,7 @@ func TestTokenCreateExpires(t *testing.T) {
 	}
 	out := td.stdout.String()
 	// Neither has been used: the daemon has not seen them yet.
-	if !regexp.MustCompile(`(?m)^NAME\s+SCOPE\s+CREATED\s+EXPIRES\s+LAST USED$`).MatchString(out) ||
+	if !regexp.MustCompile(`(?m)^NAME\s+SCOPE\s+APPS\s+CREATED\s+EXPIRES\s+LAST USED$`).MatchString(out) ||
 		!regexp.MustCompile(`(?m)^ci\s.*\(in 30 days\)\s+-$`).MatchString(out) ||
 		!regexp.MustCompile(`(?m)^laptop\s.*\snever\s+-$`).MatchString(out) {
 		t.Errorf("token list does not show the expiry:\n%s", out)

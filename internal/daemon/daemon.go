@@ -15,11 +15,13 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"text/tabwriter"
 	"time"
 
 	"github.com/onrcanogul/liman/internal/api"
+	"github.com/onrcanogul/liman/internal/app"
 	"github.com/onrcanogul/liman/internal/applock"
 	"github.com/onrcanogul/liman/internal/backup"
 	"github.com/onrcanogul/liman/internal/buildinfo"
@@ -45,14 +47,16 @@ liman CLI asks for.
 Usage:
   limand                          Serve the API (same as "limand serve")
   limand token create <name> [--read-only] [--expires <90d|12h>]
-                      [--write-client <file>] [--url <url>]
+                      [--app <app>]... [--write-client <file>] [--url <url>]
                                   Create an API token. It is printed once, or
                                   with --write-client written to a client.yaml
                                   instead of being printed. A --read-only
                                   token can look at everything and change
                                   nothing. With --expires it stops working
                                   after that many days or hours; without, it
-                                  works until it is revoked
+                                  works until it is revoked. With --app it
+                                  sees and acts on those apps only, and
+                                  nothing about the daemon as a whole
   limand token list               List tokens, when they expire and were last used
   limand token revoke <name>      Revoke a token
   limand backup create <dir> [--keep <n>]
@@ -555,7 +559,7 @@ func (d *Daemon) runToken(ctx context.Context, args []string) int {
 }
 
 func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
-	const synopsis = "limand token create <name> [--read-only] [--expires <90d|12h>] [--write-client <file>] [--url <url>]"
+	const synopsis = "limand token create <name> [--read-only] [--expires <90d|12h>] [--app <app>]... [--write-client <file>] [--url <url>]"
 
 	fs := flag.NewFlagSet("token create", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -563,6 +567,8 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 	url := fs.String("url", "", "daemon URL to put into the client.yaml")
 	readOnly := fs.Bool("read-only", false, "the token can look at everything and change nothing")
 	expires := fs.String("expires", "", "the token stops working after this long: 90d, 12h")
+	var apps appList
+	fs.Var(&apps, "app", "limit the token to this app; repeat for more")
 
 	// The flag package stops at the first non-flag argument, so the name is
 	// taken first and the flags are parsed from what follows it.
@@ -577,8 +583,16 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 		fmt.Fprintln(d.Stderr, "limand: --url only makes sense together with --write-client")
 		return exitUsage
 	}
-	// Checked before anything is touched: a typo in --expires is a usage
-	// error, like a typo in any other flag.
+	for _, a := range apps {
+		if !app.ValidName(a) {
+			fmt.Fprintf(d.Stderr, "limand: --app %q is not a valid app name\n", a)
+			return exitUsage
+		}
+	}
+	// Checked before anything is touched: a typo in --expires or --app is
+	// a usage error, like a typo in any other flag. An app name with a
+	// typo would make a token for an app that does not exist, which
+	// nobody would notice until it was refused.
 	var expiresAt time.Time
 	if *expires != "" {
 		lifetime, err := parseLifetime(*expires)
@@ -599,11 +613,14 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 	if *readOnly {
 		scope = store.ScopeRead
 	}
-	token, err := st.CreateScopedToken(ctx, name, scope, expiresAt)
+	token, err := st.CreateScopedToken(ctx, name, scope, expiresAt, apps...)
 	if err != nil {
 		return d.fail(err)
 	}
 	what := fmt.Sprintf("token %q", name)
+	if len(apps) > 0 {
+		what += " for " + strings.Join(apps, ", ")
+	}
 	if !expiresAt.IsZero() {
 		what += fmt.Sprintf(" (expires %s)", expiresAt.Local().Format("2006-01-02 15:04"))
 	}
@@ -633,6 +650,17 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 	return exitOK
 }
 
+// appList collects a flag that may be given more than once (--app a --app
+// b). flag.Value is the interface the flag package calls for each one.
+type appList []string
+
+func (l *appList) String() string { return strings.Join(*l, ",") }
+
+func (l *appList) Set(v string) error {
+	*l = append(*l, v)
+	return nil
+}
+
 func (d *Daemon) tokenList(ctx context.Context, args []string) int {
 	if len(args) != 0 {
 		return d.usageError("limand token list")
@@ -655,9 +683,13 @@ func (d *Daemon) tokenList(ctx context.Context, args []string) int {
 
 	w := tabwriter.NewWriter(d.Stdout, 0, 0, 2, ' ', 0)
 	now := time.Now()
-	fmt.Fprintln(w, "NAME\tSCOPE\tCREATED\tEXPIRES\tLAST USED")
+	fmt.Fprintln(w, "NAME\tSCOPE\tAPPS\tCREATED\tEXPIRES\tLAST USED")
 	for _, t := range tokens {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", t.Name, t.Scope, t.CreatedAt.Local().Format("2006-01-02 15:04:05"), describeExpiry(t, now), describeLastUse(t, now))
+		apps := "all"
+		if t.Limited() {
+			apps = strings.Join(t.Apps, ",")
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", t.Name, t.Scope, apps, t.CreatedAt.Local().Format("2006-01-02 15:04:05"), describeExpiry(t, now), describeLastUse(t, now))
 	}
 	if err := w.Flush(); err != nil {
 		return d.fail(err)

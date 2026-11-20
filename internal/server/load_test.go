@@ -134,7 +134,7 @@ func TestLoadReads(t *testing.T) {
 		}
 		client := &api.Client{BaseURL: lt.url, Token: lt.token}
 		for i := range 40 {
-			def := strings.Replace(definition, "name: orders-api", fmt.Sprintf("name: seed-%d", i), 1)
+			def := definitionFor(fmt.Sprintf("seed-%d", i))
 			if _, err := client.Deploy(context.Background(), []byte(def), api.DeployOptions{}, io.Discard); err != nil {
 				t.Fatalf("seed deploy: %v", err)
 			}
@@ -207,7 +207,7 @@ func TestLoadDeploys(t *testing.T) {
 			// Each worker redeploys its own app over and over, so the
 			// per-app lock never rejects anything.
 			Do: func(ctx context.Context, worker, _ int) string {
-				def := strings.Replace(definition, "name: orders-api", fmt.Sprintf("name: load-%d", worker), 1)
+				def := definitionFor(fmt.Sprintf("load-%d", worker))
 				_, err := client.Deploy(ctx, []byte(def), api.DeployOptions{}, io.Discard)
 				return deployOutcome(ctx, err)
 			},
@@ -308,7 +308,7 @@ func TestLoadLeavesNothingBehind(t *testing.T) {
 				// rejected, and some that are abandoned halfway.
 				switch i % 10 {
 				case 0:
-					def := strings.Replace(definition, "name: orders-api", fmt.Sprintf("name: mix-%d", worker), 1)
+					def := definitionFor(fmt.Sprintf("mix-%d", worker))
 					_, err := client.Deploy(ctx, []byte(def), api.DeployOptions{}, io.Discard)
 					return deployOutcome(ctx, err)
 				case 1:

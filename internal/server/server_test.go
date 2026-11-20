@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -37,6 +38,13 @@ port: 3000
 healthcheck:
   path: /health
 `
+
+// definitionFor is definition for another app, with a domain of its own:
+// two apps cannot share one.
+func definitionFor(name string) string {
+	d := strings.Replace(definition, "name: orders-api", "name: "+name, 1)
+	return strings.Replace(d, "domain: api.example.com", "domain: "+name+".example.com", 1)
+}
 
 func ctx() context.Context { return context.Background() }
 
@@ -408,7 +416,7 @@ func TestSecondDeployOfSameAppIsRejected(t *testing.T) {
 		t.Errorf("Stop() during a deploy error = %v, want a 409", err)
 	}
 	// A different app is unaffected.
-	other := strings.Replace(definition, "name: orders-api", "name: other", 1)
+	other := definitionFor("other")
 	if _, err := h.Client.Deploy(ctx(), []byte(other), api.DeployOptions{DryRun: true}, io.Discard); err != nil {
 		t.Errorf("Deploy() of another app error = %v", err)
 	}
@@ -893,7 +901,7 @@ func TestTooManyConcurrentRequestsAreShed(t *testing.T) {
 		parked.Add(1)
 		go func() {
 			defer parked.Done()
-			def := strings.Replace(definition, "name: orders-api", "name: "+name, 1)
+			def := definitionFor(name)
 			opts := api.DeployOptions{Confirm: func(string) (bool, error) {
 				asked <- struct{}{}
 				<-parkCtx.Done()
@@ -1554,7 +1562,7 @@ func TestReleasesListing(t *testing.T) {
 			t.Fatalf("Deploy() error = %v", err)
 		}
 	}
-	other := strings.Replace(definition, "orders-api", "web", 2)
+	other := strings.Replace(definitionFor("web"), "orders-api", "web", 1)
 	h.HealthErr = errors.New("503")
 	// A failed deploy comes back as a result and as an error.
 	if res, err := h.Client.Deploy(ctx(), []byte(other), api.DeployOptions{}, io.Discard); err == nil || res == nil || res.OK {
@@ -2203,6 +2211,143 @@ func TestAllSecretsIncludeAppsThatAreNotDeployed(t *testing.T) {
 	// The per-app listing still leaves the app out: it is in the path.
 	if per, _ := h.Client.Secrets(ctx(), "ghost-app"); len(per) != 1 || per[0].App != "" {
 		t.Errorf("Secrets(ghost-app) = %+v; want one, without app", per)
+	}
+}
+
+// statusOf sends a request with token and returns the status and body.
+func statusOf(t *testing.T, h *servertest.Harness, token, method, path string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequest(method, h.URL+path, strings.NewReader("x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	return resp.StatusCode, string(body)
+}
+
+func TestAppLimitedTokenSeesAndTouchesOnlyItsApps(t *testing.T) {
+	h := servertest.New(t)
+	for _, def := range []string{definition, definitionFor("billing")} {
+		if _, err := h.Client.Deploy(ctx(), []byte(def), api.DeployOptions{}, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, app := range []string{"orders-api", "billing"} {
+		if err := h.Client.SetSecret(ctx(), app, "KEY", []byte("value")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	token, err := h.Store.CreateScopedToken(ctx(), "ci", store.ScopeAdmin, time.Time{}, "orders-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ci := &api.Client{BaseURL: h.URL, Token: token}
+
+	// Listings show its app and nothing else.
+	containers, err := ci.Apps(ctx())
+	if err != nil || len(containers) == 0 {
+		t.Fatalf("Apps() = %+v, %v", containers, err)
+	}
+	for _, c := range containers {
+		if c.App != "orders-api" {
+			t.Errorf("Apps() shows %s", c.App)
+		}
+	}
+	if list, err := ci.AllSecrets(ctx()); err != nil || len(list) != 1 || list[0].App != "orders-api" {
+		t.Errorf("AllSecrets() = %+v, %v; want orders-api's only", list, err)
+	}
+	events, err := ci.History(ctx(), "", 1000)
+	if err != nil || len(events) == 0 {
+		t.Fatalf("History() = %d events, %v", len(events), err)
+	}
+	for _, ev := range events {
+		if ev.App != "orders-api" {
+			t.Errorf("History() shows %s", ev.App)
+		}
+	}
+	if rels, err := ci.Releases(ctx(), "", 10); err != nil || len(rels) != 1 || rels[0].App != "orders-api" {
+		t.Errorf("Releases() = %+v, %v; want orders-api's one", rels, err)
+	}
+	if info, err := ci.Info(ctx()); err != nil || !slices.Equal(info.TokenApps, []string{"orders-api"}) {
+		t.Errorf("Info() = %+v, %v; want token_apps [orders-api]", info, err)
+	}
+
+	// Another app, and one that does not exist, get the same answer: a
+	// limited token cannot find out what else runs here.
+	_, nope := statusOf(t, h, token, http.MethodGet, "/v1/apps/nope/secrets")
+	for _, c := range []struct{ method, path string }{
+		{http.MethodGet, "/v1/apps/billing/secrets"},
+		{http.MethodPut, "/v1/apps/billing/secrets/KEY"},
+		{http.MethodDelete, "/v1/apps/billing/secrets/KEY"},
+		{http.MethodDelete, "/v1/apps/billing"},
+		{http.MethodPost, "/v1/apps/billing/rollback"},
+		{http.MethodGet, "/v1/apps/billing/logs"},
+		{http.MethodGet, "/v1/apps/billing/health"},
+		{http.MethodGet, "/v1/history?app=billing"},
+		{http.MethodGet, "/v1/releases?app=billing"},
+	} {
+		status, body := statusOf(t, h, token, c.method, c.path)
+		if status != http.StatusForbidden {
+			t.Errorf("%s %s = %d, want 403", c.method, c.path, status)
+		}
+		if c.method == http.MethodGet && strings.HasSuffix(c.path, "/secrets") && body != nope {
+			t.Errorf("billing's answer %q differs from a missing app's %q", body, nope)
+		}
+		if strings.Contains(body, "billing") {
+			t.Errorf("%s %s names the other app: %s", c.method, c.path, body)
+		}
+	}
+	// The daemon as a whole is not its business.
+	for _, c := range []struct{ method, path string }{
+		{http.MethodGet, "/v1/tokens"},
+		{http.MethodDelete, "/v1/tokens/test"},
+		{http.MethodGet, "/v1/backups"},
+		{http.MethodPost, "/v1/backups"},
+		{http.MethodGet, "/v1/certs"},
+		{http.MethodGet, "/v1/keys"},
+	} {
+		if status, _ := statusOf(t, h, token, c.method, c.path); status != http.StatusForbidden {
+			t.Errorf("%s %s = %d, want 403", c.method, c.path, status)
+		}
+	}
+
+	// Deploying: the app is in the body, and a dry run is checked too.
+	var apiErr *api.Error
+	for _, dry := range []bool{true, false} {
+		if _, err := ci.Deploy(ctx(), []byte(definitionFor("billing")), api.DeployOptions{DryRun: dry}, io.Discard); !errors.As(err, &apiErr) || apiErr.Status != http.StatusForbidden {
+			t.Errorf("Deploy(billing, dry run %v) = %v, want a 403", dry, err)
+		}
+	}
+
+	// Its own app it may do everything its scope allows.
+	if err := ci.SetSecret(ctx(), "orders-api", "OTHER", []byte("v")); err != nil {
+		t.Errorf("SetSecret(orders-api) = %v", err)
+	}
+	if _, err := ci.Deploy(ctx(), []byte(definition), api.DeployOptions{}, io.Discard); err != nil {
+		t.Errorf("Deploy(orders-api) = %v", err)
+	}
+
+	// Nothing of billing changed.
+	if list, _ := h.Client.Secrets(ctx(), "billing"); len(list) != 1 {
+		t.Errorf("billing's secrets = %+v; want the one it had", list)
+	}
+
+	// The scope still applies within the apps.
+	readOnly, err := h.Store.CreateScopedToken(ctx(), "wall", store.ScopeRead, time.Time{}, "orders-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := statusOf(t, h, readOnly, http.MethodPut, "/v1/apps/orders-api/secrets/KEY"); status != http.StatusForbidden {
+		t.Errorf("PUT with a read-only token limited to the app = %d, want 403", status)
+	}
+	if status, _ := statusOf(t, h, readOnly, http.MethodGet, "/v1/apps/orders-api/secrets"); status != http.StatusOK {
+		t.Errorf("GET with a read-only token limited to the app = %d, want 200", status)
 	}
 }
 

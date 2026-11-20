@@ -14,7 +14,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -148,35 +150,125 @@ func (s *Server) authFailures() *authLimiter {
 	return s.limiter
 }
 
+// access says what an endpoint gives access to, for tokens limited to some
+// apps. Every route has to say: the zero value is no answer, and guard
+// keeps limited tokens away from such a route. A route added without
+// thinking about it is closed to them rather than open.
+type access int
+
+const (
+	accessUnset access = iota
+	// accessAny: nothing that belongs to an app, or only the caller's own
+	// token (health, info).
+	accessAny
+	// accessAppInPath: the {name} in the path is the app.
+	accessAppInPath
+	// accessAppInBody: the app is named in the request body; the handler
+	// checks it with mayUse once it has read it.
+	accessAppInBody
+	// accessListing: a list across apps; the handler leaves out what the
+	// token may not see.
+	accessListing
+	// accessOwner: belongs to the token that created it (a confirmation).
+	accessOwner
+	// accessDaemon: the daemon as a whole (tokens, backups, keys,
+	// certificates). Closed to limited tokens.
+	accessDaemon
+)
+
+type route struct {
+	pattern string
+	access  access
+	handler http.HandlerFunc
+}
+
+// routes is the API: every endpoint, with what it gives access to.
+func (s *Server) routes() []route {
+	return []route{
+		{"GET /v1/health", accessAny, s.handleHealth},
+		{"GET /v1/info", accessAny, s.handleInfo},
+		{"POST /v1/deploys", accessAppInBody, s.handleDeploy},
+		{"POST /v1/confirmations/{id}", accessOwner, s.handleConfirm},
+		{"GET /v1/apps", accessListing, s.handleApps},
+		{"GET /v1/apps/{name}/logs", accessAppInPath, s.handleLogs},
+		{"POST /v1/apps/{name}/rollback", accessAppInPath, s.handleRollback},
+		{"DELETE /v1/apps/{name}", accessAppInPath, s.handleStop},
+		{"GET /v1/apps/{name}/secrets", accessAppInPath, s.handleSecretList},
+		{"PUT /v1/apps/{name}/secrets/{key}", accessAppInPath, s.handleSecretSet},
+		{"DELETE /v1/apps/{name}/secrets/{key}", accessAppInPath, s.handleSecretDelete},
+		{"GET /v1/apps/{name}/health", accessAppInPath, s.handleHealthHistory},
+		{"GET /v1/secrets", accessListing, s.handleAllSecrets},
+		{"GET /v1/history", accessListing, s.handleHistory},
+		{"GET /v1/releases", accessListing, s.handleReleases},
+		{"GET /v1/tokens", accessDaemon, s.handleTokens},
+		{"DELETE /v1/tokens/{name}", accessDaemon, s.handleTokenRevoke},
+		{"GET /v1/backups", accessDaemon, s.handleBackupList},
+		{"POST /v1/backups", accessDaemon, s.handleBackupCreate},
+		{"POST /v1/backups/{name}/verify", accessDaemon, s.handleBackupVerify},
+		{"GET /v1/certs", accessDaemon, s.handleCertificates},
+		{"GET /v1/keys", accessDaemon, s.handleKeys},
+	}
+}
+
+// guard puts in front of a handler what its access needs. Tokens that may
+// use every app pass every guard: for them nothing changes.
+func (s *Server) guard(a access, h http.HandlerFunc) http.HandlerFunc {
+	switch a {
+	case accessAny, accessAppInBody, accessListing, accessOwner:
+		return h
+	case accessAppInPath:
+		return func(w http.ResponseWriter, r *http.Request) {
+			if s.mayUse(w, r, r.PathValue("name")) {
+				h(w, r)
+			}
+		}
+	default: // accessDaemon, and accessUnset
+		return func(w http.ResponseWriter, r *http.Request) {
+			if apps := metaOf(r.Context()).apps; len(apps) > 0 {
+				writeError(w, http.StatusForbidden, fmt.Errorf("this token is limited to %s; this endpoint is about the whole daemon", strings.Join(apps, ", ")))
+				return
+			}
+			h(w, r)
+		}
+	}
+}
+
+// mayUse reports whether the request's token may act on app, and answers
+// 403 if not. The answer is the same whether app exists or not, and names
+// only the token's own apps: a limited token cannot find out what else
+// runs here by trying names.
+func (s *Server) mayUse(w http.ResponseWriter, r *http.Request, app string) bool {
+	apps := metaOf(r.Context()).apps
+	if len(apps) == 0 || slices.Contains(apps, app) {
+		return true
+	}
+	writeError(w, http.StatusForbidden, fmt.Errorf("this token is limited to %s", strings.Join(apps, ", ")))
+	return false
+}
+
+// visibleApps is the set of apps a listing may show for this request:
+// nil for every app, otherwise the token's apps.
+func visibleApps(r *http.Request) []string {
+	return metaOf(r.Context()).apps
+}
+
+// visible reports whether app may appear in a listing for this request.
+func visible(r *http.Request, app string) bool {
+	apps := visibleApps(r)
+	return apps == nil || slices.Contains(apps, app)
+}
+
 // Handler returns the HTTP handler that serves the API.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
 	// The pattern names the method and the path; {name} is a wildcard that
 	// handlers read with r.PathValue. Requests with another method get 405
-	// and unknown paths 404 without any code here.
-	mux.HandleFunc("GET /v1/health", s.handleHealth)
-	mux.HandleFunc("POST /v1/deploys", s.handleDeploy)
-	mux.HandleFunc("POST /v1/confirmations/{id}", s.handleConfirm)
-	mux.HandleFunc("GET /v1/apps", s.handleApps)
-	mux.HandleFunc("GET /v1/apps/{name}/logs", s.handleLogs)
-	mux.HandleFunc("POST /v1/apps/{name}/rollback", s.handleRollback)
-	mux.HandleFunc("DELETE /v1/apps/{name}", s.handleStop)
-	mux.HandleFunc("GET /v1/apps/{name}/secrets", s.handleSecretList)
-	mux.HandleFunc("PUT /v1/apps/{name}/secrets/{key}", s.handleSecretSet)
-	mux.HandleFunc("DELETE /v1/apps/{name}/secrets/{key}", s.handleSecretDelete)
-	mux.HandleFunc("GET /v1/secrets", s.handleAllSecrets)
-	mux.HandleFunc("GET /v1/tokens", s.handleTokens)
-	mux.HandleFunc("DELETE /v1/tokens/{name}", s.handleTokenRevoke)
-	mux.HandleFunc("GET /v1/history", s.handleHistory)
-	mux.HandleFunc("GET /v1/info", s.handleInfo)
-	mux.HandleFunc("GET /v1/releases", s.handleReleases)
-	mux.HandleFunc("GET /v1/apps/{name}/health", s.handleHealthHistory)
-	mux.HandleFunc("GET /v1/backups", s.handleBackupList)
-	mux.HandleFunc("POST /v1/backups", s.handleBackupCreate)
-	mux.HandleFunc("POST /v1/backups/{name}/verify", s.handleBackupVerify)
-	mux.HandleFunc("GET /v1/certs", s.handleCertificates)
-	mux.HandleFunc("GET /v1/keys", s.handleKeys)
+	// and unknown paths 404 without any code here. Every route goes through
+	// guard, with what it gives access to.
+	for _, rt := range s.routes() {
+		mux.HandleFunc(rt.pattern, s.guard(rt.access, rt.handler))
+	}
 
 	// Middleware wraps the handler from the inside out; a request passes
 	// through the list below from top to bottom. The order is deliberate:
@@ -254,6 +346,12 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	a, err := app.Parse(body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	// The app is in the body, so this is the first moment it can be
+	// checked; nothing has been looked up or touched yet. A dry run too:
+	// its plan shows the app's secrets by name.
+	if !s.mayUse(w, r, a.Name) {
 		return
 	}
 
@@ -470,6 +568,8 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 	// The list is ordered by app and then oldest first, so the last
 	// container seen for an app is its newest: the one in service. Any
 	// other is a previous release, stopped and kept for a rollback.
+	containers = slices.DeleteFunc(containers, func(c engine.Container) bool { return !visible(r, c.App) })
+
 	current := map[string]string{}
 	for _, c := range containers {
 		current[c.App] = c.Name
@@ -608,7 +708,11 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stored, err := s.Store.Events(r.Context(), filter, limit)
+	apps, ok := s.listApps(w, r, filter)
+	if !ok {
+		return
+	}
+	stored, err := s.Store.EventsOf(r.Context(), apps, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -633,6 +737,7 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		Token:          meta.token,
 		Scope:          meta.scope,
 		TokenExpiresAt: optionalTime(meta.expires),
+		TokenApps:      meta.apps,
 		Version:        buildinfo.Version,
 		Commit:         buildinfo.Commit,
 		Built:          buildinfo.Date,
@@ -655,7 +760,11 @@ func (s *Server) handleReleases(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stored, err := s.Store.Releases(r.Context(), filter, limit)
+	apps, ok := s.listApps(w, r, filter)
+	if !ok {
+		return
+	}
+	stored, err := s.Store.ReleasesOf(r.Context(), apps, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -746,6 +855,19 @@ func listQuery(w http.ResponseWriter, r *http.Request) (limit int, filter string
 		return 0, "", false
 	}
 	return limit, filter, true
+}
+
+// listApps turns a listing's ?app= filter into the set of apps to read,
+// within what the token may see. Filtering in the query, not afterwards,
+// keeps the limit meaningful: other apps' rows do not use it up.
+func (s *Server) listApps(w http.ResponseWriter, r *http.Request, filter string) ([]string, bool) {
+	if filter != "" {
+		if !s.mayUse(w, r, filter) {
+			return nil, false
+		}
+		return []string{filter}, true
+	}
+	return visibleApps(r), true
 }
 
 // --- backups -------------------------------------------------------------------
@@ -956,7 +1078,9 @@ func (s *Server) handleAllSecrets(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]api.Secret, 0, len(infos))
 	for _, info := range infos {
-		out = append(out, api.Secret{App: info.App, Name: info.Name, UpdatedAt: info.UpdatedAt})
+		if visible(r, info.App) {
+			out = append(out, api.Secret{App: info.App, Name: info.Name, UpdatedAt: info.UpdatedAt})
+		}
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -979,6 +1103,7 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request) {
 			ExpiresAt:  optionalTime(t.ExpiresAt),
 			Expired:    t.Expired(now),
 			LastUsedAt: optionalTime(t.LastUsedAt),
+			Apps:       t.Apps,
 			Current:    t.Name == self,
 		})
 	}
