@@ -345,6 +345,72 @@ app can be deployed with it.
 `liman deploy app.yaml` with an admin token still works, for trying things
 out and for emergencies; nothing needs it.
 
+### Previewing a pull request
+
+A pull request's pipeline can ask what merging it would do, without
+deploying anything:
+
+```
+liman preview --file app.yaml [--digest <sha256:...>] [--markdown]
+```
+
+```
+orders-api: a deploy of this definition would be accepted
+  compared with release 20261120-203028-088:
+    changed: env.LOG_LEVEL, port
+    added:   env.NEW_FLAG
+  (values are compared as written in app.yaml; whether a secret's value changed is not known to a preview)
+  image sha256:…: in the registry
+  the deploy's pipeline must set: DATABASE_URL
+```
+
+It checks what a deploy would: the registration, the repository and the
+domain, the definition (an invalid port, a bad env name), and, given a
+digest, the image in the registry. It exits 1 when a deploy would be
+refused, so the pull request's checks fail before the merge. Nothing is
+deployed or recorded in the audit trail; the request is in the log.
+`--markdown` writes the same as a table, for a comment or for GitHub's
+`$GITHUB_STEP_SUMMARY`; liman does not talk to GitHub itself. Whoever
+opens the pull request writes app.yaml, and so the paths and messages in
+that summary: everything from it is in code spans, so it cannot add links,
+images or mentions.
+
+A preview needs **no secrets**, and refuses them. A fork's pull request
+gets none from GitHub, and a pull request's pipeline should not have
+them. Each deploy keeps, besides the checksums of the values it ran with,
+the checksum of each value as written (`${DATABASE_URL}` and all), and a
+preview compares those. So it answers "what changes in app.yaml", which is
+not always "what changes in what runs": a secret's new value shows only
+in the deploy, a renamed variable with the same value only in the
+preview. Until the first deploy after upgrading, there is nothing to
+compare with.
+
+It needs a **preview key**, which can preview and nothing else:
+
+```
+limand token create orders-pr --preview --app orders-api
+```
+
+Not the deploy key: a pull request can change the workflow it runs with,
+and a deploy key there would let anyone who opens one deploy. With GitHub
+Actions, run the preview on `pull_request`, never on
+`pull_request_target` (that one runs the pull request's code with the
+repository's secrets), and keep the deploy key in an environment only
+`main` can use:
+
+```yaml
+on: pull_request
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          LIMAN_URL: ${{ vars.LIMAN_URL }}
+          LIMAN_TOKEN: ${{ secrets.LIMAN_PREVIEW_TOKEN }}
+        run: liman preview --file app.yaml --markdown >> "$GITHUB_STEP_SUMMARY"
+```
+
 ## Secrets
 
 Passwords and API keys do not belong in `app.yaml`, which is committed to a
@@ -530,6 +596,7 @@ limand token create <name> --write-client <file>   # writes a client.yaml instea
 limand token create <name> --expires 90d           # stops working after 90 days (or 12h)
 limand token create <name> --app orders-api        # only this app; repeat --app for more
 limand token create <name> --deploy --app orders-api  # another deploy key for a registered app
+limand token create <name> --preview --app orders-api # a key that can only preview, for pull requests
 limand token list                                  # with scope, apps, expiry and last use
 limand token revoke <name>
 ```
@@ -621,6 +688,7 @@ The environment variables `LIMAN_URL` and `LIMAN_TOKEN` take precedence.
 | `GET /v1/audit[?app=][&limit=]` | The audit trail: who changed what, oldest first; a token limited to apps sees theirs |
 | `GET /v1/audit/verify` | Check the whole audit trail |
 | `GET /ui/` | The panel's files; no token needed, they contain no data |
+| `POST /hooks/preview` | On the `hooks.listen` listener only, with a preview or deploy key. Body: `{"app","definition"[,"digest"]}`, no variable values. What a deploy would change and what is wrong with it; deploys nothing |
 | `POST /hooks/deploy` | On the `hooks.listen` listener only, with a deploy key. Body: `{"app","digest","definition","vars"}`. Deploys a registered app with that definition and image, or does nothing if they already run; streams like a deploy |
 
 ## Audit trail
@@ -699,10 +767,10 @@ is equivalent to root. The API is built around keeping everyone else out:
   another are closed for every token: a deploy is refused when its domain
   belongs to another app (see Routing with Nginx), and a question of a
   step-by-step deploy can only be answered by the token that started it.
-- **Deploy keys.** The trigger endpoint is the one part of liman meant to
-  be reachable from the internet, and it takes deploy keys
-  (`--deploy`) only: a leaked admin token is no more use there than a
-  wrong one. A deploy key is in turn refused by the whole management API,
+- **Deploy keys.** The hooks listener is the one part of liman meant to
+  be reachable from the internet, and it takes deploy and preview keys
+  (`--deploy`, `--preview`) only: a leaked admin token is no more use there
+  than a wrong one. Such a key is in turn refused by the whole management API,
   `GET` included, since it lives in a CI system's settings. It is for
   registered apps only, and cannot change what their registration fixes:
   the image's repository and the domain. Within its app it can change
@@ -710,7 +778,10 @@ is equivalent to root. The API is built around keeping everyone else out:
   at another database, or deploy an older image of its repository, at
   most six times a minute. It cannot read the values that run, nor run an
   image of its own. Revoke it and create another; the audit trail shows
-  what it deployed and which values it changed. Behind Nginx every caller has Nginx's address, so the lockout
+  what it deployed and which values it changed. A preview key (`--preview`)
+  works there too, for pull requests, and can only preview: leaked, it
+  tells which values of a definition differ from the running one, never
+  what they are. Behind Nginx every caller has Nginx's address, so the lockout
   after failed attempts counts them all together; a valid key is never
   locked out. Limit per caller in Nginx (`limit_req`) if you want that.
 - **Audit trail.** Every change is recorded with who made it (see Audit
