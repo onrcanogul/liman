@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="robots" content="noindex">
+<title>liman</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<!-- The page is an empty frame. Everything in it is built by app.js from what
+     the API returns, as text nodes; no data is ever written into markup. -->
+<noscript><p class="noscript">The liman panel needs JavaScript. The command line does everything it shows: <code>liman ps</code>, <code>liman history</code>.</p></noscript>
+
+<div class="gate" id="gate" hidden></div>
+
+<div class="app" id="app" hidden>
+  <aside class="side" id="side" aria-label="Navigation">
+    <div class="side-top"><div class="logo" aria-hidden="true">li</div><div class="brand">liman</div></div>
+    <nav class="side-scroll" id="nav"></nav>
+    <div class="side-foot" id="foot"></div>
+  </aside>
+  <button class="scrim" id="scrim" aria-label="Close navigation"></button>
+  <div class="work">
+    <header class="bar">
+      <button class="btn icon" id="menu" aria-label="Open navigation"></button>
+      <div class="crumbs" id="crumbs"></div>
+      <div class="bar-tools">
+        <!-- Three fixed ranges: buttons show all of them at once and take
+             one click, where a drop-down would hide two and take two. -->
+        <div class="seg" id="range" role="group" aria-label="Time range">
+          <button type="button" data-range="6h" aria-pressed="false" title="Last 6 hours">6h</button>
+          <button type="button" data-range="24h" aria-pressed="true" title="Last 24 hours">24h</button>
+          <button type="button" data-range="7d" aria-pressed="false" title="Last 7 days">7d</button>
+        </div>
+        <!-- Refresh now, and how often to do it unasked, as one control. -->
+        <div class="split">
+          <button type="button" class="btn" id="refresh">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>
+            <span>Refresh</span>
+          </button>
+          <label class="pick" title="Refresh automatically">
+            <span class="sr">Refresh automatically</span>
+            <select id="every">
+              <option value="0">Off</option>
+              <option value="10" selected>10s</option>
+              <option value="30">30s</option>
+              <option value="60">1m</option>
+            </select>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+          </label>
+        </div>
+      </div>
+    </header>
+    <main id="main"></main>
+  </div>
+</div>
+<div id="tip" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

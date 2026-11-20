@@ -1,0 +1,911 @@
+// The liman panel: a read-only view of what the daemon knows.
+//
+// Three rules hold everywhere in this file:
+//
+//   1. Data is never turned into markup. Every element is created with h() or
+//      s() and every value is set as text. A field that contains "<script>"
+//      is shown as those eight characters.
+//   2. Nothing from the API is trusted to have the right shape. Values pass
+//      through str(), num() and time() before they are used; a field that is
+//      missing or odd becomes a dash or "Unknown", not an exception.
+//   3. A failure is drawn, not thrown. A request that fails turns into a
+//      banner, a chart that cannot be drawn into an empty box, and anything
+//      unforeseen into a message instead of a blank page.
+(function () {
+'use strict';
+
+// ---------- DOM builders ----------
+function h(tag, attrs) {
+  var el = document.createElement(tag);
+  setAttrs(el, attrs);
+  for (var i = 2; i < arguments.length; i++) add(el, arguments[i]);
+  return el;
+}
+var SVGNS = 'http://www.w3.org/2000/svg';
+function s(tag, attrs) {
+  var el = document.createElementNS(SVGNS, tag);
+  setAttrs(el, attrs);
+  for (var i = 2; i < arguments.length; i++) add(el, arguments[i]);
+  return el;
+}
+function setAttrs(el, attrs) {
+  if (!attrs) return;
+  Object.keys(attrs).forEach(function (k) {
+    var v = attrs[k];
+    if (v === null || v === undefined || v === false) return;
+    if (k === 'class') el.setAttribute('class', v);
+    else if (k.slice(0, 2) === 'on' && typeof v === 'function') el.addEventListener(k.slice(2), v);
+    else if (k === 'text') el.textContent = String(v);
+    // The content security policy forbids style attributes; setting
+    // properties on el.style is allowed, because only script can do it.
+    else if (k === 'css') Object.keys(v).forEach(function (p) { el.style[p] = v[p]; });
+    else el.setAttribute(k, v === true ? '' : String(v));
+  });
+}
+function add(el, c) {
+  if (c === null || c === undefined || c === false) return;
+  if (Array.isArray(c)) { c.forEach(function (x) { add(el, x); }); return; }
+  el.appendChild(c instanceof Node ? c : document.createTextNode(String(c)));
+}
+function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+
+// Icons are fixed path data written here, never data from the server.
+var ICONS = {
+  overview: 'M3 3h7v7H3zM14 3h7v4h-7zM14 11h7v10h-7zM3 14h7v7H3z',
+  apps: 'M12 2l9 5-9 5-9-5 9-5zM3 12l9 5 9-5M3 17l9 5 9-5',
+  activity: 'M3 12h4l3-8 4 16 3-8h4',
+  secrets: 'M7 11V8a5 5 0 0110 0v3M5 11h14v10H5z',
+  daemon: 'M4 4h16v6H4zM4 14h16v6H4zM8 7h.01M8 17h.01',
+  chevron: 'M6 9l6 6 6-6',
+  collapse: 'M15 6l-6 6 6 6', expand: 'M9 6l6 6-6 6', menu: 'M4 6h16M4 12h16M4 18h16',
+  signout: 'M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10'
+};
+function icon(name) {
+  return s('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.8', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true' },
+    s('path', { d: ICONS[name] || '' }));
+}
+
+// ---------- formatting that never throws on odd input ----------
+var DASH = '—';
+function str(v, max) {
+  if (v === null || v === undefined) return '';
+  var t = String(v).replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
+  return max && t.length > max ? t.slice(0, max - 1) + '…' : t;
+}
+function orDash(v, max) { var t = str(v, max); return t === '' ? DASH : t; }
+function num(v) { var n = Number(v); return v !== null && v !== '' && typeof v !== 'boolean' && Number.isFinite(n) && n >= 0 ? Math.floor(n) : null; }
+function fmtNum(v) { var n = num(v); if (n === null) return DASH; try { return n.toLocaleString('en-US'); } catch (e) { return String(n); } }
+// Go encodes a time that was never set as year 1; anything before 2000 is
+// treated as "unknown" rather than shown as a date nobody meant.
+var EPOCH_FLOOR = Date.UTC(2000, 0, 1);
+function time(ts) { var t = typeof ts === 'number' ? ts : Date.parse(ts); return Number.isFinite(t) && t > EPOCH_FLOOR ? t : null; }
+function ago(ts) {
+  var t = time(ts); if (t === null) return DASH;
+  var d = Math.round((Date.now() - t) / 1000);
+  if (d < -60) return 'in the future';
+  if (d < 5) return 'just now';
+  if (d < 60) return d + 's ago';
+  if (d < 3600) return Math.floor(d / 60) + 'm ago';
+  if (d < 86400) return Math.floor(d / 3600) + 'h ago';
+  return Math.floor(d / 86400) + 'd ago';
+}
+function abs(ts) { var t = time(ts); if (t === null) return 'Time unknown'; try { return new Date(t).toLocaleString(); } catch (e) { return 'Time unknown'; } }
+function clock(ts, withSec) { try { return new Date(ts).toLocaleTimeString([], withSec ? { hour: '2-digit', minute: '2-digit', second: '2-digit' } : { hour: '2-digit', minute: '2-digit' }); } catch (e) { return DASH; } }
+function day(ts) { try { return new Date(ts).toLocaleDateString([], { month: 'short', day: 'numeric' }); } catch (e) { return DASH; } }
+function when(ts) { return h('span', { title: abs(ts), text: ago(ts) }); }
+function took(ms) {
+  var n = num(ms); if (n === null) return DASH;
+  if (n < 1000) return n + ' ms';
+  if (n < 60000) return (Math.round(n / 100) / 10) + ' s';
+  return Math.floor(n / 60000) + 'm ' + Math.round((n % 60000) / 1000) + 's';
+}
+function span(seconds) {
+  var n = num(seconds); if (n === null || n === 0) return DASH;
+  if (n % 86400 === 0) return (n / 86400) + (n === 86400 ? ' day' : ' days');
+  if (n % 3600 === 0) return (n / 3600) + 'h';
+  if (n % 60 === 0) return (n / 60) + 'm';
+  return n + 's';
+}
+
+// Status is derived in one place. Anything unrecognised becomes "Unknown"
+// (and asks for attention) instead of breaking a row or looking fine.
+function status(app) {
+  var st = str(app && app.state).toLowerCase(), hl = str(app && app.health).toLowerCase();
+  if (hl === 'down') return { key: 'crit', label: 'Down', attn: true };
+  if (hl === 'restarting') return { key: 'warn', label: 'Restarting', attn: true };
+  if (st === 'running') {
+    if (hl === 'unhealthy') return { key: 'crit', label: 'Unhealthy', attn: true };
+    if (hl === 'healthy') return { key: 'ok', label: 'Healthy', attn: false };
+    if (hl === '') return { key: 'ok', label: 'Running', attn: false };
+    return { key: 'none', label: 'Unknown', attn: true };
+  }
+  // liman has no "stopped on purpose": stopping an app removes it. A
+  // container that is not running is one that should be.
+  if (st === 'exited' || st === 'created' || st === 'dead') return { key: 'crit', label: 'Stopped', attn: true };
+  return { key: 'none', label: 'Unknown', attn: true };
+}
+function pill(p) { return h('span', { class: 'pill ' + p.key }, h('i', { 'aria-hidden': 'true' }), p.label); }
+function okPill(ok) { return ok === true ? pill({ key: 'ok', label: 'Succeeded' }) : ok === false ? pill({ key: 'crit', label: 'Failed' }) : pill({ key: 'none', label: 'Unknown' }); }
+
+// ---------- state ----------
+var HOUR = 3600000, DAY = 86400000;
+var RANGES = { '6h': 'last 6 hours', '24h': 'last 24 hours', '7d': 'last 7 days' };
+var BUCKETS = 48;
+// How long derived data (health history, secret names) is reused before it
+// is asked for again. The main listing is refreshed far more often; these
+// change slowly and cost one request per app.
+var EXTRA_TTL = 60000;
+
+var S = {
+  mode: 'signin',        // signin | loading | ready | offline
+  token: '', gateError: '', gateBusy: false,
+  info: null, apps: [], events: [], releases: [],
+  engineError: '', offlineError: '', updated: 0,
+  health: new Map(),     // "app|range" -> { at, hist }
+  secrets: new Map(),    // app -> { at, list, error }
+  logs: { app: '', text: '', error: '', loading: false, cut: false },
+  q: '', only: 'all', actApp: '', actResult: '', tab: 'overview', range: '24h', every: 10, collapsed: false, drawer: false
+};
+// Maps, not plain objects, wherever a key comes from the server: an app
+// called "constructor" must be an ordinary key.
+
+function recall(key) { try { return window.localStorage.getItem(key); } catch (e) { return null; } }
+function remember(key, value) { try { window.localStorage.setItem(key, value); } catch (e) { /* storage is optional */ } }
+S.collapsed = recall('liman-side') === 'collapsed';
+
+// The token lives in sessionStorage: it survives a reload, is never shared
+// with another tab and is gone when this tab closes. If storage is not
+// available it lives in memory only, and a reload asks for it again.
+var TOKEN_KEY = 'liman-token';
+function loadToken() { try { return str(window.sessionStorage.getItem(TOKEN_KEY)); } catch (e) { return ''; } }
+function saveToken(t) { try { if (t) window.sessionStorage.setItem(TOKEN_KEY, t); else window.sessionStorage.removeItem(TOKEN_KEY); } catch (e) { /* memory only */ } }
+
+var $ = function (id) { return document.getElementById(id); };
+var $app = $('app'), $gate = $('gate'), $main = $('main'), $nav = $('nav'), $foot = $('foot'), $crumbs = $('crumbs'), $tip = $('tip');
+var afterMount = [];
+
+// ---------- talking to the daemon ----------
+// Every request is a same-origin GET with the token in a header. Nothing
+// here can change anything on the server: the panel is read-only.
+function fail(status, message) { return { apiError: true, status: status, message: message }; }
+function request(path, timeoutMs) {
+  var ctl = new AbortController(), timer = setTimeout(function () { ctl.abort(); }, timeoutMs || 15000);
+  return fetch(path, { headers: { Authorization: 'Bearer ' + S.token }, cache: 'no-store', credentials: 'omit', redirect: 'error', signal: ctl.signal })
+    .then(function (res) { return { res: res, done: function () { clearTimeout(timer); }, abort: function () { ctl.abort(); } }; },
+      function () { clearTimeout(timer); throw fail(0, ctl.signal.aborted ? 'The daemon took too long to answer.' : 'The daemon cannot be reached.'); });
+}
+function errorOf(res) {
+  return res.json().then(function (body) { return str(body && body.error, 300); }, function () { return ''; })
+    .then(function (msg) { return fail(res.status, msg || 'The daemon answered with status ' + res.status + '.'); });
+}
+function get(path) {
+  return request(path).then(function (r) {
+    if (!r.res.ok) return errorOf(r.res).then(function (e) { r.done(); throw e; });
+    return r.res.json().then(function (v) { r.done(); return v; }, function () { r.done(); throw fail(0, 'The daemon sent an answer that could not be read.'); });
+  });
+}
+// settle turns a promise into one that never rejects, so several requests
+// can be waited for together without one failure hiding the others.
+function settle(p) { return p.then(function (v) { return { ok: true, value: v }; }, function (e) { return { ok: false, error: e && e.apiError ? e : fail(0, 'Unexpected error.') }; }); }
+function appPath(name, rest) { return '/v1/apps/' + encodeURIComponent(name) + rest; }
+
+// seq numbers the refreshes. An answer that arrives after a newer refresh
+// started, or after signing out, is dropped.
+var seq = 0, refreshing = false;
+
+function refresh() {
+  if (refreshing || !S.token) return Promise.resolve();
+  refreshing = true;
+  var my = ++seq;
+  $('refresh').disabled = true; $('refresh').className = 'btn busy';
+
+  // /v1/info first and alone: it proves the token. If the token is wrong
+  // this is the only request that fails, and failed authentications are
+  // counted by the daemon.
+  return settle(get('/v1/info')).then(function (info) {
+    if (my !== seq) return null;
+    if (!info.ok) { connectionFailed(info.error); return null; }
+    S.info = info.value && typeof info.value === 'object' ? info.value : {};
+    return Promise.all([settle(get('/v1/apps')), settle(get('/v1/history?limit=300')), settle(get('/v1/releases?limit=500'))]);
+  }).then(function (parts) {
+    if (!parts || my !== seq) return;
+    var denied = parts.filter(function (p) { return !p.ok && p.error.status === 401; })[0];
+    if (denied) { connectionFailed(denied.error); return; }
+
+    // The app listing needs Docker; the rest does not. With Docker down the
+    // panel still shows the history, and says what is wrong.
+    if (parts[0].ok) { S.apps = buildApps(parts[0].value); S.engineError = ''; }
+    else S.engineError = parts[0].error.message;
+    if (parts[1].ok) S.events = cleanList(parts[1].value);
+    if (parts[2].ok) S.releases = cleanList(parts[2].value);
+
+    S.mode = 'ready'; S.offlineError = ''; S.updated = Date.now();
+    render();
+    return ensureExtras();
+  }).then(null, function (e) { crash(e); }).then(function () {
+    refreshing = false;
+    $('refresh').disabled = false; $('refresh').className = 'btn';
+  });
+}
+
+function connectionFailed(err) {
+  if (err.status === 401) { signOut('The daemon rejected this token. It may have been revoked.'); return; }
+  if (err.status === 429) { signOut(err.message); return; }
+  // Unreachable, or an error of the daemon's own: keep what is on screen,
+  // mark it as stale and keep trying.
+  if (S.mode === 'loading' && !S.info) { signOut(err.message, true); return; }
+  S.mode = 'offline'; S.offlineError = err.message;
+  render();
+}
+
+function cleanList(v) { return Array.isArray(v) ? v.filter(function (x) { return x && typeof x === 'object'; }) : []; }
+
+// buildApps turns the container listing into one entry per app: its
+// container in service plus the ones kept for a rollback.
+function buildApps(list) {
+  var by = new Map();
+  cleanList(list).forEach(function (c) {
+    var name = str(c.app); if (name === '') return;
+    if (!by.has(name)) by.set(name, { current: null, previous: [] });
+    if (str(c.role) === 'previous') by.get(name).previous.push(c); else by.get(name).current = c;
+  });
+  var out = [];
+  by.forEach(function (g, name) {
+    var c = g.current || g.previous[g.previous.length - 1], port = num(c.host_port);
+    out.push({
+      name: name, image: c.image, domain: c.domain, state: c.state, health: c.health, note: c.health_detail,
+      restarts: num(c.restarts) || 0, release: c.release, container: c.container, uptime: c.status,
+      address: port ? '127.0.0.1:' + port : '', healthcheck: c.healthcheck, deployed: c.created,
+      previous: g.current ? g.previous : []
+    });
+  });
+  return out;
+}
+
+// ensureExtras loads what the current view needs beyond the main listing
+// and draws again when something new arrived.
+function ensureExtras() {
+  if (S.mode !== 'ready') return Promise.resolve();
+  var r = route(), my = seq, now = Date.now(), jobs = [];
+
+  function wantHealth(name) {
+    var key = name + '|' + S.range, have = S.health.get(key);
+    if (have && now - have.at < EXTRA_TTL) return;
+    jobs.push(settle(get(appPath(name, '/health?range=' + encodeURIComponent(S.range)))).then(function (res) {
+      if (my !== seq && !S.token) return;
+      S.health.set(key, { at: Date.now(), hist: res.ok ? res.value : null, error: res.ok ? '' : res.error.message });
+    }));
+  }
+  function wantSecrets(name) {
+    var have = S.secrets.get(name);
+    if (have && now - have.at < EXTRA_TTL) return;
+    jobs.push(settle(get(appPath(name, '/secrets'))).then(function (res) {
+      if (my !== seq && !S.token) return;
+      S.secrets.set(name, { at: Date.now(), list: res.ok ? cleanList(res.value) : null, error: res.ok ? '' : res.error.message });
+    }));
+  }
+
+  var names = S.apps.map(function (a) { return a.name; });
+  var monitored = !!(S.info && S.info.monitor), vault = !!(S.info && S.info.secrets);
+  if (r.view === 'overview' && monitored) names.slice(0, 20).forEach(wantHealth);
+  if (r.view === 'app' && names.indexOf(r.name) !== -1) {
+    if (S.tab === 'overview' && monitored) wantHealth(r.name);
+    if (S.tab === 'secrets' && vault) wantSecrets(r.name);
+  }
+  if (r.view === 'secrets' && vault) names.forEach(wantSecrets);
+
+  if (jobs.length === 0) return Promise.resolve();
+  return Promise.all(jobs).then(function () { if (S.token) render(); });
+}
+
+// Logs are read on demand. The daemon sends the whole output of the
+// container; only its end is kept, so a chatty app cannot fill the tab's
+// memory, and the read is given up after a while.
+var LOG_KEEP = 200000, LOG_LINES = 400, logRun = 0;
+function loadLogs(name) {
+  var my = ++logRun;
+  S.logs = { app: name, text: '', error: '', loading: true, cut: false };
+  render();
+  request(appPath(name, '/logs'), 20000).then(function (r) {
+    if (!r.res.ok) return errorOf(r.res).then(function (e) { r.done(); throw e; });
+    if (!r.res.body || !r.res.body.getReader) return r.res.text().then(function (t) { r.done(); return { text: t.slice(-LOG_KEEP), cut: t.length > LOG_KEEP }; });
+    var reader = r.res.body.getReader(), dec = new TextDecoder(), text = '', cut = false;
+    function pump() {
+      return reader.read().then(function (chunk) {
+        if (chunk.done) { r.done(); return { text: text, cut: cut }; }
+        text += dec.decode(chunk.value, { stream: true });
+        if (text.length > LOG_KEEP * 2) { text = text.slice(-LOG_KEEP); cut = true; }
+        return pump();
+      }, function () { r.done(); return { text: text, cut: true, stopped: true }; });
+    }
+    return pump();
+  }).then(function (out) {
+    if (my !== logRun) return;
+    var lines = out.text.replace(/\r\n?/g, '\n').split('\n');
+    if (lines.length > LOG_LINES) { lines = lines.slice(-LOG_LINES); out.cut = true; }
+    S.logs = { app: name, text: lines.join('\n'), error: out.stopped ? 'Reading stopped before the end; the log is very large. The command line shows all of it.' : '', loading: false, cut: out.cut };
+    render(); scrollLogsToEnd();
+  }, function (e) {
+    if (my !== logRun) return;
+    S.logs = { app: name, text: '', error: e && e.apiError ? e.message : 'The logs could not be read.', loading: false, cut: false };
+    render();
+  });
+}
+function scrollLogsToEnd() { var el = $('logs'); if (el) el.scrollTop = el.scrollHeight; }
+
+// ---------- signing in and out ----------
+function signIn(token) {
+  token = str(token);
+  if (token === '') { S.gateError = 'Paste a token first.'; renderGate(); return; }
+  // A header value cannot contain these; refusing here gives a clear
+  // message instead of a failed request.
+  if (/[^\x21-\x7e]/.test(token)) { S.gateError = 'That does not look like a token: it contains spaces or other characters a token never has.'; renderGate(); return; }
+  S.token = token; S.gateError = ''; S.gateBusy = true; S.mode = 'loading'; S.info = null;
+  renderGate();
+  refresh().then(function () {
+    S.gateBusy = false;
+    if (S.mode === 'ready') saveToken(S.token);
+    render();
+  });
+}
+function signOut(message, keepToken) {
+  seq++; logRun++;
+  var token = keepToken ? S.token : '';
+  if (!keepToken) saveToken('');
+  S.token = ''; S.mode = 'signin'; S.gateError = str(message, 300); S.gateBusy = false;
+  S.info = null; S.apps = []; S.events = []; S.releases = []; S.engineError = ''; S.offlineError = ''; S.updated = 0;
+  S.health = new Map(); S.secrets = new Map(); S.logs = { app: '', text: '', error: '', loading: false, cut: false };
+  S.pending = token;
+  render();
+}
+function renderGate() {
+  clear($gate);
+  var $err = h('div', { class: 'err', id: 'gate-err', role: 'alert', text: S.gateError });
+  var $in = h('input', { class: 'input mono', id: 'token', type: 'password', autocomplete: 'off', autocapitalize: 'none', spellcheck: 'false', maxlength: '512', 'aria-describedby': 'gate-err gate-hint',
+    'aria-invalid': S.gateError ? 'true' : null, disabled: S.gateBusy, value: S.pending || null });
+  var form = h('form', { class: 'gate-card', novalidate: true, onsubmit: function (e) { e.preventDefault(); S.pending = ''; signIn($in.value); } },
+    h('div', { class: 'gate-brand' }, h('div', { class: 'logo', 'aria-hidden': 'true', text: 'li' }), h('div', { class: 'brand', text: 'liman' })),
+    h('h1', { text: 'Sign in to the panel' }),
+    h('p', null, 'The panel reads from the daemon at ', h('code', { text: str(window.location.host, 80) }), ' with an API token, the same kind the command line uses.'),
+    h('div', { class: 'field' }, h('label', { for: 'token' }, 'API token'), $in, $err),
+    h('button', { class: 'btn primary', type: 'submit', disabled: S.gateBusy }, S.gateBusy ? 'Checking…' : 'Sign in'),
+    h('p', { class: 'hint', id: 'gate-hint' }, 'Create one on the server with ', h('code', { text: 'limand token create panel' }), '. It is kept in this tab only and forgotten when the tab closes. The panel cannot change anything.'));
+  $gate.appendChild(form);
+  if (!S.gateBusy) { try { $in.focus(); } catch (e) { /* not focusable yet */ } }
+}
+
+// ---------- routing: plain #name hashes only ----------
+function route() {
+  var hash = ''; try { hash = decodeURIComponent((window.location.hash || '').replace(/^#/, '')); } catch (e) { hash = ''; }
+  if (['apps', 'activity', 'secrets', 'daemon'].indexOf(hash) !== -1) return { view: hash };
+  if (hash.indexOf('app-') === 0) return { view: 'app', name: hash.slice(4) };
+  return { view: 'overview' };
+}
+function appHref(name) { return '#app-' + encodeURIComponent(name); }
+function findApp(name) { return S.apps.filter(function (a) { return a.name === name; })[0] || null; }
+function byAttention(a, b) { return (status(b).attn - status(a).attn) || a.name.localeCompare(b.name); }
+function sortedEvents() { return S.events.slice().sort(function (a, b) { return (time(b.time) || 0) - (time(a.time) || 0); }); }
+
+// ---------- sidebar and top bar ----------
+function navItem(view, label, ic, current, badge, attn) {
+  return h('a', { class: 'nav', href: '#' + view, title: S.collapsed ? label : null, 'aria-current': current ? 'page' : null }, icon(ic), h('span', { class: 'lbl trunc', text: label }),
+    badge ? h('span', { class: 'badge' + (attn ? ' attn' : ''), text: badge }) : null);
+}
+function renderSide(r) {
+  clear($nav);
+  var list = S.apps.slice().sort(byAttention), attn = list.filter(function (a) { return status(a).attn; }).length;
+  add($nav, [h('div', { class: 'side-label', text: 'Operate' }),
+    navItem('overview', 'Overview', 'overview', r.view === 'overview'),
+    navItem('apps', 'Apps', 'apps', r.view === 'apps', S.info ? (attn ? attn + ' of ' + list.length : String(list.length)) : '', attn > 0)]);
+  if (list.length) {
+    var shown = list.slice(0, 12);
+    add($nav, h('div', { class: 'sub' }, shown.map(function (a) {
+      var st = status(a);
+      return h('a', { class: 'nav', href: appHref(a.name), title: a.name + ' · ' + st.label, 'aria-current': r.view === 'app' && r.name === a.name ? 'page' : null },
+        h('i', { class: 'dot ' + st.key, 'aria-hidden': 'true' }), h('span', { class: 'lbl trunc', text: a.name }), h('span', { class: 'sr', text: st.label }));
+    }), list.length > shown.length ? h('a', { class: 'nav muted', href: '#apps' }, h('span', { class: 'lbl', text: 'All ' + list.length + ' apps' })) : null));
+  }
+  add($nav, [navItem('activity', 'Activity', 'activity', r.view === 'activity'), navItem('secrets', 'Secrets', 'secrets', r.view === 'secrets'),
+    h('div', { class: 'side-label', text: 'System' }), navItem('daemon', 'Daemon', 'daemon', r.view === 'daemon')]);
+  renderFoot();
+  $app.className = 'app' + (S.collapsed ? ' collapsed' : '') + (S.drawer ? ' drawer' : '');
+}
+function renderFoot() {
+  clear($foot);
+  var p = S.mode === 'offline' ? ['crit', 'Unreachable'] : S.mode === 'loading' ? ['info', 'Connecting'] : ['ok', 'Connected'];
+  add($foot, [h('div', { class: 'conn', title: p[1] + ' · ' + str(window.location.host, 80) }, h('i', { class: 'dot ' + p[0], 'aria-hidden': 'true' }),
+      h('span', { class: 'lbl trunc' }, p[1], S.updated ? h('span', { class: 'muted', id: 'updated', text: ' · updated ' + ago(S.updated) }) : null)),
+    h('button', { class: 'nav', id: 'signout', title: S.collapsed ? 'Sign out' : null, onclick: function () { signOut(''); } }, icon('signout'), h('span', { class: 'lbl', text: 'Sign out' })),
+    h('button', { class: 'nav', id: 'collapse', 'aria-label': S.collapsed ? 'Expand navigation' : 'Collapse navigation', onclick: function () {
+      S.collapsed = !S.collapsed; remember('liman-side', S.collapsed ? 'collapsed' : 'open'); render(); } },
+      icon(S.collapsed ? 'expand' : 'collapse'), h('span', { class: 'lbl', text: 'Collapse' }))]);
+}
+function renderCrumbs(r) {
+  clear($crumbs);
+  var names = { overview: 'Overview', apps: 'Apps', activity: 'Activity', secrets: 'Secrets', daemon: 'Daemon' };
+  var parts = r.view === 'app' ? [['#apps', 'Apps'], [null, str(r.name, 80)]] : [[null, names[r.view]]];
+  add($crumbs, [h('a', { href: '#overview', text: 'liman' })]);
+  parts.forEach(function (p) { add($crumbs, [h('span', { class: 'sep', 'aria-hidden': 'true', text: '/' }), p[0] ? h('a', { href: p[0], text: p[1] }) : h('span', { class: 'here trunc', title: p[1], text: p[1] })]); });
+}
+
+// ---------- shared blocks ----------
+function panel(title, body, opts) {
+  opts = opts || {};
+  return h('section', { class: 'panel ' + (opts.span || 'c12') }, h('div', { class: 'panel-h' }, h('h2', { text: title }), opts.side || null), h('div', { class: 'panel-b' + (opts.flush ? ' flush' : '') }, body));
+}
+function stat(title, value, caption, opts) {
+  opts = opts || {};
+  return h('section', { class: 'panel c3' }, h('div', { class: 'panel-h' }, h('h2', { text: title })), h('div', { class: 'stat ' + (opts.tone || '') }, h('b', { class: opts.small ? 'small' : null, title: opts.small ? value : null, text: value }), h('span', { text: caption })));
+}
+function stateBlock(title, body, action, tight) { return h('div', { class: 'state' + (tight ? ' tight' : '') }, h('h3', { text: title }), body || null, action || null); }
+function fullState(title, body, action) { return h('div', { class: 'panel' }, stateBlock(title, body, action)); }
+function banners() {
+  var out = [];
+  if (S.mode === 'offline') out.push(h('div', { class: 'banner crit', role: 'alert' }, h('div', { class: 'grow' }, h('b', { text: 'The daemon is not answering. ' }),
+    'This is the status from ' + clock(S.updated, true) + ' and may be out of date. ' + str(S.offlineError, 200)),
+    h('button', { class: 'btn small', onclick: function () { refresh(); } }, 'Try again')));
+  else if (S.engineError) out.push(h('div', { class: 'banner crit', role: 'alert' }, h('div', { class: 'grow' }, h('b', { text: 'The daemon cannot reach Docker. ' }),
+    'The app list below is the last one it could read. ' + str(S.engineError, 240))));
+  var skew = S.info ? time(S.info.now) : null;
+  if (S.mode === 'ready' && skew !== null && Math.abs(skew - S.updated) > 120000) out.push(h('div', { class: 'banner warn' }, h('div', { class: 'grow' },
+    'The clock of the server and the clock of this computer are ' + Math.round(Math.abs(skew - S.updated) / 60000) + ' minutes apart. Times such as “5m ago” are off by that much.')));
+  return out;
+}
+function skeleton() {
+  var cells = [];
+  for (var i = 0; i < 4; i++) cells.push(h('div', { class: 'panel c3' }, h('div', { class: 'panel-h' }, h('div', { class: 'skel', css: { width: '45%' } })), h('div', { class: 'stat' }, h('div', { class: 'skel', css: { width: '30%', height: '30px' } }))));
+  var lines = []; for (var j = 0; j < 6; j++) lines.push(h('div', { class: 'skel', css: { width: (96 - j * 7) + '%' } }));
+  cells.push(h('div', { class: 'panel c12' }, h('div', { class: 'panel-h' }, h('div', { class: 'skel', css: { width: '160px' } })), h('div', { class: 'panel-b skel-stack' }, lines)));
+  return h('div', { class: 'grid', 'aria-busy': 'true', 'aria-label': 'Loading' }, cells);
+}
+
+// ---------- tooltip shared by every chart ----------
+function showTip(text, x, y) {
+  $tip.textContent = text; $tip.hidden = false;
+  var w = $tip.offsetWidth, hh = $tip.offsetHeight, vw = window.innerWidth;
+  $tip.style.left = Math.max(8, Math.min(vw - w - 8, x + 12)) + 'px';
+  $tip.style.top = Math.max(8, y - hh - 12) + 'px';
+}
+function hideTip() { $tip.hidden = true; }
+
+// ---------- health history, shared by the timeline and the line chart ----------
+// frame returns the stretch of time a history covers, in the daemon's own
+// numbers, or null if the answer does not make sense.
+function frame(hist) {
+  if (!hist || typeof hist !== 'object') return null;
+  var since = time(hist.since), until = time(hist.until), step = num(hist.bucket_seconds);
+  if (since === null || until === null || !step || until <= since) return null;
+  return { since: since, until: until, step: step * 1000, buckets: cleanList(hist.buckets) };
+}
+// states spreads the buckets the daemon sent over the fixed number of
+// slots. A slot without a bucket stays "none": nothing was measured then.
+function states(f) {
+  var out = [], n = Math.min(400, Math.max(1, Math.round((f.until - f.since) / f.step)));
+  for (var i = 0; i < n; i++) out.push({ key: 'none', ok: 0, failed: 0 });
+  f.buckets.forEach(function (b) {
+    var t = time(b.start); if (t === null) return;
+    var i = Math.floor((t - f.since) / f.step); if (i < 0 || i >= n) return;
+    var ok = num(b.ok) || 0, failed = num(b.failed) || 0;
+    out[i] = { key: failed > 0 ? (ok > 0 ? 'warn' : 'crit') : ok > 0 ? 'ok' : 'none', ok: ok, failed: failed };
+  });
+  return out;
+}
+
+// ---------- chart: health timeline ----------
+// Status colours carry meaning here, so the legend names each one and the
+// tooltip spells the state out: colour is never the only signal.
+var TL_LABEL = { ok: 'Healthy', warn: 'Some checks failed', crit: 'All checks failed', none: 'No data' };
+function timelinePanel(list, spanClass) {
+  var title = 'Health over the ' + RANGES[S.range];
+  if (!(S.info && S.info.monitor)) return panel(title, stateBlock('The health monitor is turned off', h('p', null, 'Without it the daemon does not check the apps, so there is no history to show. It is switched on in ', h('code', { text: 'config.yaml' }), '.'), null, true), { span: spanClass });
+
+  var axisFrame = null;
+  var rows = list.map(function (a) {
+    var have = S.health.get(a.name + '|' + S.range), f = have ? frame(have.hist) : null, label = list.length > 1
+      ? h('a', { class: 'trunc', href: appHref(a.name), title: a.name, text: a.name }) : h('span', { class: 'muted', text: 'Health checks' });
+    if (!f) {
+      var empty = []; for (var i = 0; i < BUCKETS; i++) empty.push(h('i'));
+      return h('div', { class: 'tl-row' }, label, h('div', { class: 'tl-band', role: 'img', 'aria-label': a.name + ': ' + (have ? 'history could not be read' : 'loading'), title: have ? str(have.error, 200) || 'The history could not be read.' : 'Loading…' }, empty));
+    }
+    axisFrame = axisFrame || f;
+    var st = states(f);
+    var band = h('div', { class: 'tl-band', role: 'img', 'aria-label': str(a.name, 60) + ': ' + summarise(st) }, st.map(function (v) { return h('i', { class: v.key }); }));
+    function move(e) {
+      var rect = band.getBoundingClientRect(), i = Math.max(0, Math.min(st.length - 1, Math.floor(((e.clientX - rect.left) / Math.max(1, rect.width)) * st.length)));
+      var from = f.since + i * f.step, v = st[i], counts = v.key === 'none' ? '' : ' (' + v.ok + ' ok, ' + v.failed + ' failed)';
+      showTip(str(a.name, 40) + ' · ' + (S.range === '7d' ? day(from) + ' ' : '') + clock(from) + '–' + clock(from + f.step) + ' · ' + TL_LABEL[v.key] + counts, e.clientX, rect.top);
+    }
+    band.addEventListener('pointermove', move); band.addEventListener('pointerdown', move); band.addEventListener('pointerleave', hideTip);
+    return h('div', { class: 'tl-row' }, label, band);
+  });
+  var far = S.range === '7d';
+  var axis = axisFrame ? h('div', { class: 'tl-row' }, h('span'), h('div', { class: 'tl-axis' },
+    h('span', { text: far ? day(axisFrame.since) : clock(axisFrame.since) }), h('span', { text: far ? day((axisFrame.since + axisFrame.until) / 2) : clock((axisFrame.since + axisFrame.until) / 2) }), h('span', { text: 'now' }))) : null;
+  var legend = h('div', { class: 'legend' }, ['ok', 'warn', 'crit', 'none'].map(function (k) { return h('span', null, h('i', { class: k }), TL_LABEL[k]); }));
+  return panel(title, h('div', { class: 'tl' }, rows, axis), { span: spanClass, side: legend });
+}
+function summarise(st) {
+  var c = { ok: 0, warn: 0, crit: 0, none: 0 }; st.forEach(function (v) { c[v.key]++; });
+  return ['ok', 'warn', 'crit', 'none'].filter(function (k) { return c[k]; }).map(function (k) { return Math.round((c[k] / st.length) * 100) + '% ' + TL_LABEL[k].toLowerCase(); }).join(', ');
+}
+
+// ---------- chart: one line (response time) ----------
+// A single series: the panel title names it, so there is no legend. Where
+// nothing was measured the line stops instead of bridging the gap.
+function niceMax(v) { if (!(v > 0)) return 1; var p = Math.pow(10, Math.floor(Math.log10(v))), n = v / p; return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p; }
+function latencyChart(a) {
+  var box = h('div', { class: 'chart' });
+  if (!(S.info && S.info.monitor)) { box.appendChild(stateBlock('The health monitor is turned off', null, null, true)); return box; }
+  if (str(a.healthcheck) === '') { box.appendChild(stateBlock('This app defines no health check', h('p', null, 'Add a ', h('code', { text: 'healthcheck:' }), ' section to its app.yaml and the daemon will measure how long each check takes.'), null, true)); return box; }
+  var have = S.health.get(a.name + '|' + S.range), f = have ? frame(have.hist) : null;
+  if (!have) { box.appendChild(h('div', { class: 'skel-stack', 'aria-busy': 'true' }, h('div', { class: 'skel', css: { height: '120px' } }))); return box; }
+  if (!f) { box.appendChild(stateBlock('The history could not be read', h('p', { text: str(have.error, 200) }), null, true)); return box; }
+
+  var pts = [];
+  f.buckets.forEach(function (b) {
+    var t = time(b.start), avg = Number(b.avg_ms), max = Number(b.max_ms);
+    if (t === null || !(num(b.probed) > 0) || !Number.isFinite(avg) || avg < 0) return;
+    pts.push({ t: t + f.step / 2, v: Math.round(avg * 10) / 10, max: Number.isFinite(max) ? max : avg });
+  });
+  pts.sort(function (x, y) { return x.t - y.t; });
+  if (pts.length === 0) { box.appendChild(stateBlock('No measurements in this range', h('p', { text: 'Response times appear here once the app has been checked a few times.' }), null, true)); return box; }
+
+  afterMount.push(function () {
+    var vals = pts.map(function (p) { return p.v; }), top = Math.max.apply(null, vals), last = pts[pts.length - 1];
+    var W = Math.max(260, box.clientWidth), H = 190, L = 56, R = 12, T = 10, B = 24, max = niceMax(top);
+    var X = function (t) { return L + ((t - f.since) / (f.until - f.since)) * (W - L - R); }, Y = function (v) { return T + (1 - v / max) * (H - T - B); };
+    var svg = s('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'Average response time of the health check, latest ' + last.v + ' ms, highest ' + top + ' ms' });
+    [0, 0.5, 1].forEach(function (fr) { var y = Y(max * fr); add(svg, [s('line', { x1: L, x2: W - R, y1: y, y2: y, stroke: 'var(--line)', 'stroke-width': 1 }), s('text', { x: L - 8, y: y + 4, 'text-anchor': 'end', text: Math.round(max * fr * 10) / 10 + ' ms' })]); });
+    var far = S.range === '7d';
+    [[f.since, 'start'], [(f.since + f.until) / 2, 'middle'], [f.until, 'end']].forEach(function (p) { svg.appendChild(s('text', { x: X(p[0]), y: H - 6, 'text-anchor': p[1], text: far ? day(p[0]) : clock(p[0]) })); });
+
+    // Split the points into runs of neighbouring buckets.
+    var runs = [], run = [];
+    pts.forEach(function (p, i) { if (i > 0 && p.t - pts[i - 1].t > f.step * 1.5) { runs.push(run); run = []; } run.push(p); });
+    runs.push(run);
+    runs.forEach(function (rn) {
+      if (rn.length === 1) { svg.appendChild(s('circle', { r: 2.5, fill: 'var(--series)', cx: X(rn[0].t), cy: Y(rn[0].v) })); return; }
+      var d = rn.map(function (p, i) { return (i ? 'L' : 'M') + X(p.t).toFixed(1) + ' ' + Y(p.v).toFixed(1); }).join(' ');
+      add(svg, [s('path', { d: d + ' L' + X(rn[rn.length - 1].t).toFixed(1) + ' ' + Y(0) + ' L' + X(rn[0].t).toFixed(1) + ' ' + Y(0) + ' Z', fill: 'var(--series)', opacity: 0.12, stroke: 'none' }),
+        s('path', { d: d, fill: 'none', stroke: 'var(--series)', 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' })]);
+    });
+
+    var cross = s('line', { y1: T, y2: H - B, stroke: 'var(--fg-3)', 'stroke-width': 1, visibility: 'hidden' });
+    var dot = s('circle', { r: 4.5, fill: 'var(--series)', stroke: 'var(--panel)', 'stroke-width': 2, cx: X(last.t), cy: Y(last.v) });
+    var hit = s('rect', { class: 'hit', x: L, y: T, width: W - L - R, height: H - T - B, fill: 'transparent' });
+    function move(e) {
+      var rect = svg.getBoundingClientRect(), x = ((e.clientX - rect.left) / Math.max(1, rect.width)) * W, best = 0, bd = Infinity;
+      pts.forEach(function (p, i) { var dd = Math.abs(X(p.t) - x); if (dd < bd) { bd = dd; best = i; } });
+      var p = pts[best]; cross.setAttribute('x1', X(p.t)); cross.setAttribute('x2', X(p.t)); cross.setAttribute('visibility', 'visible'); dot.setAttribute('cx', X(p.t)); dot.setAttribute('cy', Y(p.v));
+      showTip((far ? day(p.t) + ' ' : '') + clock(p.t) + ' · average ' + p.v + ' ms, slowest ' + Math.round(p.max) + ' ms', e.clientX, rect.top + (Y(p.v) / H) * rect.height);
+    }
+    function leave() { hideTip(); cross.setAttribute('visibility', 'hidden'); dot.setAttribute('cx', X(last.t)); dot.setAttribute('cy', Y(last.v)); }
+    hit.addEventListener('pointermove', move); hit.addEventListener('pointerdown', move); hit.addEventListener('pointerleave', leave);
+    add(svg, [cross, dot, hit]); clear(box); box.appendChild(svg);
+  });
+  return box;
+}
+
+// ---------- chart: deploys per day, stacked succeeded + failed ----------
+var DEPLOY_DAYS = 14;
+function deploysPerDay() {
+  var days = [], index = new Map(), today = new Date(); today.setHours(0, 0, 0, 0);
+  for (var i = DEPLOY_DAYS - 1; i >= 0; i--) {
+    var d = new Date(today.getFullYear(), today.getMonth(), today.getDate() - i);
+    var entry = { t: d.getTime(), ok: 0, failed: 0 }; days.push(entry); index.set(d.toDateString(), entry);
+  }
+  S.releases.forEach(function (r) {
+    var t = time(r.started_at); if (t === null) return;
+    var entry = index.get(new Date(t).toDateString()); if (!entry) return;
+    if (str(r.status) === 'succeeded') entry.ok++; else entry.failed++;
+  });
+  return days;
+}
+function topRound(x, y, w, hh, r) { r = Math.min(r, hh, w / 2); return 'M' + x + ' ' + (y + hh) + ' V' + (y + r) + ' Q' + x + ' ' + y + ' ' + (x + r) + ' ' + y + ' H' + (x + w - r) + ' Q' + (x + w) + ' ' + y + ' ' + (x + w) + ' ' + (y + r) + ' V' + (y + hh) + ' Z'; }
+function barChart(days) {
+  var box = h('div', { class: 'chart' }), total = days.reduce(function (n, d) { return n + d.ok + d.failed; }, 0);
+  if (total === 0) { box.appendChild(stateBlock('No deploys in the last ' + DEPLOY_DAYS + ' days', h('p', { text: 'Each deploy is counted here on the day it ran.' }), null, true)); return box; }
+  afterMount.push(function () {
+    var W = Math.max(260, box.clientWidth), H = 190, L = 28, R = 8, T = 10, B = 24, max = Math.max(2, Math.max.apply(null, days.map(function (d) { return d.ok + d.failed; })));
+    max = max % 2 ? max + 1 : max;
+    var slot = (W - L - R) / days.length, bw = Math.max(4, Math.min(24, slot - 6)), Y = function (v) { return T + (1 - v / max) * (H - T - B); }, base = Y(0);
+    var svg = s('svg', { viewBox: '0 0 ' + W + ' ' + H, role: 'img', 'aria-label': 'Deploys per day for ' + DEPLOY_DAYS + ' days, ' + total + ' in total' });
+    [0, max / 2, max].forEach(function (v) { add(svg, [s('line', { x1: L, x2: W - R, y1: Y(v), y2: Y(v), stroke: 'var(--line)', 'stroke-width': 1 }), s('text', { x: L - 8, y: Y(v) + 4, 'text-anchor': 'end', text: v })]); });
+    days.forEach(function (d, i) {
+      var x = L + i * slot + (slot - bw) / 2, hOk = base - Y(d.ok), hF = base - Y(d.failed), g = s('g');
+      if (d.ok > 0) g.appendChild(d.failed > 0 ? s('rect', { x: x, y: base - hOk, width: bw, height: hOk, fill: 'var(--series)' }) : s('path', { d: topRound(x, base - hOk, bw, hOk, 4), fill: 'var(--series)' }));
+      if (d.failed > 0) g.appendChild(s('path', { d: topRound(x, base - hOk - hF - (d.ok > 0 ? 2 : 0), bw, hF, 4), fill: 'var(--st-crit)' }));
+      var hit = s('rect', { x: L + i * slot, y: T, width: slot, height: H - T - B, fill: 'transparent' });
+      function move(e) { showTip(day(d.t) + ' · ' + d.ok + ' succeeded' + (d.failed ? ', ' + d.failed + ' failed' : ''), e.clientX, svg.getBoundingClientRect().top + 20); }
+      hit.addEventListener('pointermove', move); hit.addEventListener('pointerdown', move); hit.addEventListener('pointerleave', hideTip);
+      add(svg, [g, hit]);
+      if (i === 0 || i === days.length - 1 || i === Math.floor(days.length / 2)) svg.appendChild(s('text', { x: x + bw / 2, y: H - 6, 'text-anchor': i === 0 ? 'start' : i === days.length - 1 ? 'end' : 'middle', text: day(d.t) }));
+    });
+    clear(box); box.appendChild(svg);
+  });
+  return box;
+}
+
+// ---------- view: overview ----------
+function noApps() {
+  return fullState('No apps on this server yet', h('p', null, 'Deploy the first one from your machine with ', h('code', { text: 'liman deploy app.yaml' }), '. It shows up here as soon as its container starts.'));
+}
+function viewOverview() {
+  var list = S.apps.slice().sort(byAttention);
+  if (list.length === 0 && S.releases.length === 0) return [h('h1', { text: 'Overview' }), noApps()];
+  var c = { ok: 0, attn: 0, restarts: 0 };
+  list.forEach(function (a) { var st = status(a); if (st.attn) c.attn++; else if (st.key === 'ok') c.ok++; c.restarts += a.restarts; });
+  var attn = list.filter(function (a) { return status(a).attn; });
+  var attnBody = attn.length ? h('div', { class: 'list' }, attn.slice(0, 6).map(function (a) {
+      return h('a', { href: appHref(a.name) }, h('div', { class: 't' }, pill(status(a)), h('b', { class: 'trunc', title: a.name, text: a.name })), h('span', { class: 'muted wrap-any', text: str(a.note, 240) || 'Open the app to see its recent activity and logs.' }));
+    })) : stateBlock('Nothing needs attention', h('p', { text: list.length ? 'Every app is running.' : 'There are no apps.' }), null, true);
+  var legend = h('div', { class: 'legend' }, h('span', null, h('i', { class: 'series' }), 'Succeeded'), h('span', null, h('i', { class: 'crit' }), 'Failed'));
+  var recent = sortedEvents().slice(0, 6);
+  return [h('div', { class: 'grid' },
+    stat('Apps', fmtNum(list.length), 'on this server'),
+    stat('Running normally', fmtNum(c.ok), 'up and passing their checks', { tone: c.ok ? 'okc' : '' }),
+    stat('Need attention', fmtNum(c.attn), c.attn ? 'unhealthy, restarting or stopped' : 'nothing to do', { tone: c.attn ? 'crit' : '' }),
+    stat('Automatic restarts', fmtNum(c.restarts), 'since the apps were last stable'),
+    list.length ? timelinePanel(list.slice(0, 20), 'c12') : null,
+    panel('Needs attention', attnBody, { span: 'c5', flush: true }),
+    panel('Deploys per day', barChart(deploysPerDay()), { span: 'c7', side: legend }),
+    panel('Latest activity', recent.length ? eventTable(recent, true) : stateBlock('Nothing has happened yet', null, null, true), { span: 'c12', flush: true, side: h('a', { class: 'btn small', href: '#activity' }, 'All activity') }))];
+}
+
+// ---------- view: apps ----------
+function viewApps() {
+  var list = S.apps;
+  var out = [h('div', { class: 'head' }, h('div', { class: 'grow' }, h('h1', { text: 'Apps' })))];
+  if (list.length === 0) { out.push(noApps()); return out; }
+  var attn = list.filter(function (a) { return status(a).attn; }).length;
+  var $rows = h('div', { class: 'rows', id: 'app-rows' });
+  var $search = h('input', { class: 'input', id: 'app-search', type: 'search', placeholder: 'Filter by name, domain or image', maxlength: '100', autocomplete: 'off', 'aria-label': 'Filter apps', value: S.q, oninput: function (e) { S.q = e.target.value; fill(); } });
+  function segBtn(key, label) { return h('button', { type: 'button', 'aria-pressed': S.only === key ? 'true' : 'false', onclick: function () { S.only = key; render(); } }, label); }
+  out.push(h('div', { class: 'toolbar' }, $search, h('div', { class: 'seg', role: 'group', 'aria-label': 'Show' }, segBtn('all', 'All'), segBtn('attn', 'Needs attention' + (attn ? ' (' + attn + ')' : '')))));
+  function fill() {
+    clear($rows);
+    var q = str(S.q, 100).toLowerCase();
+    var shown = list.filter(function (a) { if (S.only === 'attn' && !status(a).attn) return false; return q === '' || [a.name, a.domain, a.image].some(function (f) { return str(f).toLowerCase().indexOf(q) !== -1; }); }).sort(byAttention);
+    if (shown.length === 0) {
+      $rows.appendChild(stateBlock(S.only === 'attn' && q === '' ? 'Nothing needs attention' : 'No app matches this filter', h('p', { text: S.only === 'attn' && q === '' ? 'Every app is running.' : 'Check the spelling, or clear the filter to see all ' + list.length + ' apps.' }),
+        h('button', { class: 'btn', onclick: function () { S.q = ''; S.only = 'all'; render(); } }, 'Show all apps')));
+      return;
+    }
+    $rows.appendChild(h('div', { class: 'row-h' }, h('div', { text: 'App' }), h('div', { text: 'Status' }), h('div', { text: 'Release' }), h('div', { text: 'Address' }), h('div', { class: 'right', text: 'Restarts' }), h('div', { text: 'Deployed' })));
+    shown.forEach(function (a) {
+      var st = status(a);
+      $rows.appendChild(h('a', { class: 'row', href: appHref(a.name), 'aria-label': a.name + ', ' + st.label },
+        h('div', { class: 'c app' }, h('span', { class: 'name trunc', title: a.name, text: a.name }), h('span', { class: 'sub2 trunc', title: str(a.domain), text: orDash(a.domain) })),
+        h('div', { class: 'c st' }, h('div', null, pill(st))),
+        h('div', { class: 'c wide' }, h('span', { class: 'k', text: 'Release' }), h('span', { class: 'mono trunc', title: str(a.release), text: orDash(a.release) }), h('span', { class: 'sub2 trunc', title: str(a.image), text: str(a.image) })),
+        h('div', { class: 'c wide' }, h('span', { class: 'k', text: 'Address' }), h('span', { class: 'mono trunc', text: orDash(a.address) })),
+        h('div', { class: 'c wide' }, h('span', { class: 'k', text: 'Restarts' }), h('span', { class: 'num', text: fmtNum(a.restarts) })),
+        h('div', { class: 'c wide' }, h('span', { class: 'k', text: 'Deployed' }), when(a.deployed))));
+    });
+  }
+  fill();
+  out.push(h('div', { class: 'panel' }, $rows));
+  return out;
+}
+
+// ---------- view: one app, in tabs ----------
+var TABS = [['overview', 'Overview'], ['releases', 'Releases'], ['secrets', 'Secrets'], ['activity', 'Activity'], ['logs', 'Logs']];
+function setTab(tab) {
+  S.tab = tab; render();
+  var r = route();
+  if (tab === 'logs' && r.view === 'app' && findApp(r.name) && S.logs.app !== r.name) loadLogs(r.name);
+  ensureExtras();
+}
+function viewApp(name) {
+  var a = findApp(name);
+  if (!a) return [fullState('There is no app called “' + str(name, 80) + '”', h('p', { text: 'It may have been stopped and removed, or the link is mistyped.' }), h('a', { class: 'btn', href: '#apps' }, 'Back to all apps'))];
+  var st = status(a);
+  if (!TABS.some(function (t) { return t[0] === S.tab; })) S.tab = 'overview';
+  var out = [h('div', { class: 'head' },
+    h('div', { class: 'grow' }, h('h1', { text: a.name }), h('div', { class: 'hstack' }, pill(st), h('span', { class: 'mono wrap-any muted', text: orDash(a.domain) }))))];
+  if (str(a.note)) out.push(h('div', { class: 'banner ' + (st.key === 'crit' || st.key === 'warn' ? st.key : 'info') }, h('div', { class: 'grow wrap-any', text: str(a.note, 500) })));
+  out.push(h('div', { class: 'tabs', role: 'tablist', 'aria-label': 'App sections' }, TABS.map(function (t) {
+    return h('button', { role: 'tab', id: 'tab-' + t[0], 'aria-selected': S.tab === t[0] ? 'true' : 'false', onclick: function () { setTab(t[0]); } }, t[1]);
+  })));
+
+  if (S.tab === 'overview') {
+    var prev = a.previous.length ? a.previous[a.previous.length - 1] : null;
+    out.push(h('div', { class: 'grid' },
+      stat('Release', orDash(a.release, 40), 'in service', { small: true }),
+      stat('Deployed', ago(a.deployed), abs(a.deployed), { small: true }),
+      stat('Address', orDash(a.address, 40), 'where the proxy sends requests', { small: true }),
+      stat('Automatic restarts', fmtNum(a.restarts), 'since it was last stable', { tone: a.restarts > 0 ? 'crit' : '' }),
+      timelinePanel([a], 'c12'),
+      panel('Health check response time', latencyChart(a), { span: 'c7', side: h('span', { class: 'hint', text: 'average per interval, ' + RANGES[S.range] }) }),
+      panel('Deployment', h('dl', { class: 'kv' },
+        h('dt', { text: 'Image' }), h('dd', { class: 'mono', text: orDash(a.image) }),
+        h('dt', { text: 'Container' }), h('dd', { class: 'mono', text: orDash(a.container) }),
+        h('dt', { text: 'Docker says' }), h('dd', { text: orDash(a.uptime, 80) }),
+        h('dt', { text: 'Domain' }), h('dd', { class: 'mono', text: orDash(a.domain) }),
+        h('dt', { text: 'Health check' }), h('dd', { class: 'mono', text: str(a.healthcheck) ? 'GET ' + str(a.healthcheck) : 'none' }),
+        h('dt', { text: 'Kept for rollback' }), h('dd', { class: 'mono', text: prev ? orDash(prev.container) : 'nothing' })), { span: 'c5' })));
+  } else if (S.tab === 'releases') {
+    var rels = S.releases.filter(function (r) { return str(r.app) === a.name; });
+    var body = rels.length ? h('div', { class: 'tbl-wrap' }, h('table', null,
+      h('thead', null, h('tr', null, h('th', { text: 'Result' }), h('th', { text: 'Release' }), h('th', { text: 'Image' }), h('th', { text: 'Started' }), h('th', { text: 'Took' }), h('th', { text: 'Error' }))),
+      h('tbody', null, rels.map(function (r) {
+        var t0 = time(r.started_at), t1 = time(r.finished_at), result = str(r.status) === 'succeeded' ? true : str(r.status) === 'failed' ? false : null;
+        return h('tr', null,
+          h('td', { class: 'nowrap' }, h('div', { class: 'hstack' }, okPill(result), str(r.release) !== '' && str(r.release) === str(a.release) ? pill({ key: 'info', label: 'In service' }) : null)),
+          h('td', { class: 'mono nowrap', text: orDash(r.release, 60) }), h('td', { class: 'detail mono', text: orDash(r.image, 300) }),
+          h('td', { class: 'nowrap' }, when(r.started_at)), h('td', { class: 'nowrap mono', text: t0 !== null && t1 !== null && t1 >= t0 ? took(t1 - t0) : DASH }),
+          h('td', { class: 'detail', text: orDash(r.error, 600) }));
+      })))) : stateBlock('No deploys are recorded for this app', null, null, true);
+    out.push(h('div', { class: 'grid' }, panel('Deploys', body, { flush: true })));
+    out.push(h('div', { class: 'hint' }, a.previous.length ? 'The previous release is kept stopped; ' : 'No previous release is kept. ', a.previous.length ? h('code', { text: 'liman rollback ' + a.name }) : null, a.previous.length ? ' puts it back in service.' : null));
+  } else if (S.tab === 'secrets') {
+    out.push(h('div', { class: 'grid' }, panel('Secrets', secretTable([a], false), { flush: true })));
+    out.push(h('div', { class: 'hint' }, 'Names only: values are stored encrypted and no interface can read them back. Set one with ', h('code', { text: 'liman secret set ' + a.name + ' NAME' }), '; it takes effect on the next deploy.'));
+  } else if (S.tab === 'activity') {
+    var ev = sortedEvents().filter(function (e) { return str(e.app) === a.name; });
+    out.push(h('div', { class: 'grid' }, panel('Activity', ev.length ? eventTable(ev, false) : stateBlock('Nothing recorded for this app in the latest ' + S.events.length + ' steps', null, null, true), { flush: true })));
+  } else {
+    var lg = S.logs.app === a.name ? S.logs : { loading: true, text: '', error: '', cut: false };
+    var logBody = lg.loading ? stateBlock('Reading the logs…', null, null, true)
+      : lg.text === '' && lg.error ? stateBlock('The logs could not be read', h('p', { text: str(lg.error, 300) }), null, true)
+      : lg.text === '' ? stateBlock('The container has not written anything', null, null, true)
+      : h('pre', { class: 'logs', id: 'logs', tabindex: '0', 'aria-label': 'Log output', text: lg.text });
+    out.push(h('div', { class: 'grid' }, panel('Logs', logBody, { flush: true, side: h('div', { class: 'hstack' },
+      h('span', { class: 'hint', text: lg.cut ? 'the last ' + LOG_LINES + ' lines at most' : 'output of the current container' }),
+      h('button', { class: 'btn small', disabled: lg.loading, onclick: function () { loadLogs(a.name); } }, 'Reload')) })));
+    if (lg.text !== '' && lg.error) out.push(h('div', { class: 'hint', text: str(lg.error, 300) }));
+    out.push(h('div', { class: 'hint' }, 'Logs are not followed here. To watch them live: ', h('code', { text: 'liman logs -f ' + a.name })));
+  }
+  return out;
+}
+
+// ---------- tables shared by views ----------
+var ACTIONS = { run: 'Step', undo: 'Undo', restart: 'Restart' };
+function eventTable(list, withApp) {
+  return h('div', { class: 'tbl-wrap' }, h('table', null,
+    h('thead', null, h('tr', null, h('th', { text: 'When' }), withApp ? h('th', { text: 'App' }) : null, h('th', { text: 'Kind' }), h('th', { text: 'Step' }), h('th', { text: 'Result' }), h('th', { text: 'Took' }), h('th', { text: 'Error' }))),
+    h('tbody', null, list.map(function (e) {
+      var app = str(e.app), action = str(e.action).toLowerCase();
+      return h('tr', null, h('td', { class: 'nowrap' }, when(e.time)),
+        withApp ? h('td', { class: 'name' }, findApp(app) ? h('a', { href: appHref(app), text: app }) : orDash(app, 80)) : null,
+        h('td', { class: 'nowrap', text: ACTIONS[action] || orDash(e.action, 40) }), h('td', { class: 'detail', text: orDash(e.step, 300) }),
+        h('td', { class: 'nowrap' }, okPill(typeof e.ok === 'boolean' ? e.ok : null)), h('td', { class: 'nowrap mono', text: took(e.duration_ms) }), h('td', { class: 'detail', text: orDash(e.error, 600) }));
+    }))));
+}
+function secretTable(list, withApp) {
+  if (!(S.info && S.info.secrets)) return stateBlock('This daemon has no secret storage', null, null, true);
+  var rows = [], waiting = 0, failed = '';
+  list.forEach(function (a) {
+    var have = S.secrets.get(a.name);
+    if (!have) { waiting++; return; }
+    if (have.list === null) { failed = have.error; return; }
+    have.list.forEach(function (x) { if (str(x.name)) rows.push([a, x]); });
+  });
+  if (rows.length === 0 && waiting) return stateBlock('Reading the secret names…', null, null, true);
+  if (rows.length === 0 && failed) return stateBlock('The secret names could not be read', h('p', { text: str(failed, 300) }), null, true);
+  if (rows.length === 0) return stateBlock(withApp ? 'No secrets are stored for these apps' : 'This app has no secrets', h('p', null, 'Store one with ', h('code', { text: 'liman secret set' }), ', then list its name under ', h('code', { text: 'secrets:' }), ' in app.yaml.'), null, true);
+  return h('div', { class: 'tbl-wrap' }, h('table', null, h('thead', null, h('tr', null, withApp ? h('th', { text: 'App' }) : null, h('th', { text: 'Name' }), h('th', { text: 'Last changed' }))),
+    h('tbody', null, rows.map(function (r) {
+      var a = r[0], x = r[1];
+      return h('tr', null, withApp ? h('td', { class: 'name' }, h('a', { href: appHref(a.name), text: a.name })) : null, h('td', { class: 'mono detail', text: str(x.name, 300) }), h('td', { class: 'nowrap' }, when(x.updated_at)));
+    }))));
+}
+
+// ---------- views: activity, secrets, daemon ----------
+function viewActivity() {
+  var all = sortedEvents(), names = [];
+  all.forEach(function (e) { var n = str(e.app); if (n && names.indexOf(n) === -1) names.push(n); });
+  names.sort();
+  if (S.actApp && names.indexOf(S.actApp) === -1) S.actApp = '';
+  var shown = all.filter(function (e) { return (!S.actApp || str(e.app) === S.actApp) && (S.actResult !== 'problem' || e.ok !== true || str(e.action).toLowerCase() !== 'run'); });
+  var $sel = h('select', { id: 'act-app', 'aria-label': 'App', onchange: function (e) { S.actApp = e.target.value; render(); } }, h('option', { value: '', text: 'All apps' }), names.map(function (n) { return h('option', { value: n, selected: n === S.actApp, text: str(n, 48) }); }));
+  function segBtn(key, label) { return h('button', { type: 'button', 'aria-pressed': S.actResult === key ? 'true' : 'false', onclick: function () { S.actResult = key; render(); } }, label); }
+  return [h('h1', { text: 'Activity' }), h('div', { class: 'toolbar' }, h('span', { class: 'pick' }, $sel, icon('chevron')), h('div', { class: 'seg', role: 'group', 'aria-label': 'Show' }, segBtn('', 'All'), segBtn('problem', 'Failures, undos and restarts'))),
+    h('div', { class: 'panel' }, shown.length ? eventTable(shown, true) : stateBlock(all.length ? 'No activity matches this filter' : 'Nothing has happened yet', h('p', { text: all.length ? 'Try another app, or show everything.' : 'Steps appear here as soon as the first deploy runs.' }),
+      all.length ? h('button', { class: 'btn', onclick: function () { S.actApp = ''; S.actResult = ''; render(); } }, 'Clear filters') : null)),
+    h('div', { class: 'hint' }, 'The latest ' + fmtNum(all.length) + ' steps. For older ones: ', h('code', { text: 'liman history --limit 1000' }))];
+}
+function viewSecrets() {
+  if (S.apps.length === 0) return [h('h1', { text: 'Secrets' }), noApps()];
+  return [h('h1', { text: 'Secrets' }), h('div', { class: 'panel' }, secretTable(S.apps.slice().sort(function (a, b) { return a.name.localeCompare(b.name); }), true)),
+    h('div', { class: 'hint', text: 'Names only, for the apps that are deployed. Values are stored encrypted and no interface can read them back.' })];
+}
+function viewDaemon() {
+  var d = S.info || {}, m = d.monitor && typeof d.monitor === 'object' ? d.monitor : null;
+  function part(label, key, word, text) { return [h('dt', { text: label }), h('dd', { class: 'hstack' }, pill({ key: key, label: word }), h('span', { class: 'muted wrap-any', text: text }))]; }
+  return [h('h1', { text: 'Daemon' }), h('div', { class: 'grid' },
+    panel('Parts', h('dl', { class: 'kv' },
+      S.engineError ? part('Docker', 'crit', 'Problem', str(S.engineError, 240)) : part('Docker', 'ok', 'OK', 'answers the daemon'),
+      d.proxy ? part('Reverse proxy', 'ok', 'Managed', 'the daemon writes and reloads the Nginx config') : part('Reverse proxy', 'none', 'Off', 'apps are only reachable on their own port'),
+      d.secrets ? part('Secret storage', 'ok', 'On', 'values are encrypted with the master key') : part('Secret storage', 'none', 'Off', 'apps that name secrets cannot be deployed'),
+      m ? part('Health monitor', 'ok', 'On', 'checks every ' + span(m.interval_seconds) + ', restarts after ' + fmtNum(m.failure_threshold) + ' failures in a row, keeps ' + span(m.retention_seconds) + ' of history')
+        : part('Health monitor', 'none', 'Off', 'apps are not checked or restarted')), { span: 'c6' }),
+    panel('Process', h('dl', { class: 'kv' },
+      h('dt', { text: 'Version' }), h('dd', { class: 'mono', text: orDash(d.version, 80) }),
+      h('dt', { text: 'Commit' }), h('dd', { class: 'mono', text: orDash(d.commit, 80) }),
+      h('dt', { text: 'Built' }), h('dd', { class: 'mono', text: orDash(d.built, 80) }),
+      h('dt', { text: 'Running since' }), h('dd', null, when(d.started_at), h('span', { class: 'muted', text: time(d.started_at) === null ? '' : ' · ' + abs(d.started_at) })),
+      h('dt', { text: 'Panel address' }), h('dd', { class: 'mono', text: str(window.location.host, 120) })), { span: 'c6' }),
+    panel('Access', h('dl', { class: 'kv' },
+      h('dt', { text: 'This panel' }), h('dd', null, 'Signed in with an API token that is kept in this browser tab only. It can read; it cannot deploy, stop or change anything.'),
+      h('dt', { text: 'Tokens' }), h('dd', null, 'Created and revoked on the server: ', h('code', { text: 'limand token list' }), '. Revoking the token signs this panel out at its next refresh.')),
+      { span: 'c12', side: h('button', { class: 'btn small', onclick: function () { signOut(''); } }, 'Sign out') }))];
+}
+
+// ---------- render, with a last line of defence ----------
+function render() {
+  try {
+    hideTip(); afterMount = [];
+    var gated = S.mode === 'signin' || (S.mode === 'loading' && !S.info);
+    $gate.hidden = !gated; $app.hidden = gated;
+    document.body.className = gated ? 'gated' : '';
+    if (gated) { renderGate(); return; }
+
+    // A background refresh redraws the page. Whatever the user is in the
+    // middle of (typing in a filter, reading the end of a log) is put back.
+    var active = document.activeElement, keepId = active && $main.contains(active) ? active.id : '', selStart = null, selEnd = null;
+    if (keepId) { try { selStart = active.selectionStart; selEnd = active.selectionEnd; } catch (e) { /* not a text field */ } }
+    var oldLogs = $('logs'), logScroll = oldLogs ? oldLogs.scrollTop : null, pageScroll = $main.scrollTop;
+
+    var r = route(); renderSide(r); renderCrumbs(r); clear($main);
+    var page = h('div', { class: 'page' }); $main.appendChild(page);
+    if (!S.info) { add(page, skeleton()); return; }
+    add(page, banners());
+    add(page, r.view === 'app' ? viewApp(r.name) : r.view === 'apps' ? viewApps() : r.view === 'activity' ? viewActivity() : r.view === 'secrets' ? viewSecrets() : r.view === 'daemon' ? viewDaemon() : viewOverview());
+    afterMount.forEach(function (fn) { try { fn(); } catch (e) { /* one broken chart must not take the page down */ } });
+
+    $main.scrollTop = pageScroll;
+    var newLogs = $('logs'); if (newLogs && logScroll !== null) newLogs.scrollTop = logScroll;
+    var again = keepId ? $(keepId) : null;
+    if (again) { try { again.focus({ preventScroll: true }); if (selStart !== null && again.setSelectionRange) again.setSelectionRange(selStart, selEnd); } catch (e) { /* focus is a convenience */ } }
+  } catch (err) { crash(err); }
+}
+function crash(err) {
+  try {
+    $gate.hidden = true; $app.hidden = false; document.body.className = '';
+    clear($main);
+    $main.appendChild(h('div', { class: 'page' }, fullState('This page could not be drawn', h('p', { text: 'The panel received something it could not display. Your apps are not affected. Details: ' + str(err && err.message, 200) }),
+      h('button', { class: 'btn', onclick: function () { window.location.reload(); } }, 'Reload the panel'))));
+  } catch (e) { /* nothing left to do */ }
+}
+function setDrawer(open) { S.drawer = open; $app.className = 'app' + (S.collapsed ? ' collapsed' : '') + (S.drawer ? ' drawer' : ''); }
+
+// ---------- wiring ----------
+$('menu').appendChild(icon('menu'));
+$('menu').addEventListener('click', function () { setDrawer(true); });
+$('scrim').addEventListener('click', function () { setDrawer(false); });
+$('range').addEventListener('click', function (e) {
+  var btn = e.target instanceof Element ? e.target.closest('button[data-range]') : null;
+  if (!btn || !RANGES[btn.getAttribute('data-range')]) return;
+  S.range = btn.getAttribute('data-range');
+  Array.prototype.forEach.call($('range').querySelectorAll('button'), function (b) { b.setAttribute('aria-pressed', b === btn ? 'true' : 'false'); });
+  render(); ensureExtras();
+});
+$('every').addEventListener('change', function (e) { S.every = num(e.target.value) || 0; });
+$('refresh').addEventListener('click', function () { refresh(); });
+window.addEventListener('error', function (e) { crash(e.error || e); });
+window.addEventListener('hashchange', function () {
+  S.drawer = false; S.tab = 'overview'; render(); $main.scrollTop = 0; ensureExtras();
+});
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && S.drawer) setDrawer(false); });
+var lastW = window.innerWidth, resizeTimer = null;
+window.addEventListener('resize', function () { if (window.innerWidth === lastW) return; lastW = window.innerWidth; clearTimeout(resizeTimer); resizeTimer = setTimeout(render, 150); });
+
+// One timer drives both the "updated 12s ago" text and the automatic
+// refresh. A tab nobody is looking at does not ask the daemon for anything.
+var tick = 0;
+setInterval(function () {
+  var el = $('updated'); if (el && S.updated) el.textContent = ' · updated ' + ago(S.updated);
+  tick++;
+  if (S.every > 0 && tick % S.every === 0 && (S.mode === 'ready' || S.mode === 'offline') && !document.hidden) refresh();
+}, 1000);
+// Coming back to the tab after a while: show fresh data at once.
+document.addEventListener('visibilitychange', function () {
+  if (!document.hidden && S.every > 0 && (S.mode === 'ready' || S.mode === 'offline') && Date.now() - S.updated > S.every * 1000) refresh();
+});
+
+// ---------- start ----------
+var saved = loadToken();
+if (saved) { S.token = saved; S.mode = 'loading'; S.gateBusy = true; render(); refresh().then(function () { S.gateBusy = false; render(); }); }
+else render();
+})();
