@@ -479,15 +479,15 @@ is equivalent to root. The API is built around keeping everyone else out:
   A successful read that the same token repeats within ten minutes is not
   logged again, so that the panel's refreshing does not fill the log;
   changes and failures are always logged.
+  Ten failed attempts from one address (one /64 for IPv6) within a minute
+  lock that address out (429) until the minute is over. A request with a
+  valid token is never locked out: failures by someone else at the same
+  address cannot keep the operator away.
 - **Authorization by app.** A token created with `--app` reaches its apps
   and nothing else (see Tokens). Two places where one app could act on
   another are closed for every token: a deploy is refused when its domain
   belongs to another app (see Routing with Nginx), and a question of a
   step-by-step deploy can only be answered by the token that started it.
-  Ten failed attempts from one address (one /64 for IPv6) within a minute
-  lock that address out (429) until the minute is over. A request with a
-  valid token is never locked out: failures by someone else at the same
-  address cannot keep the operator away.
 - **Browsers.** Requests that a browser marks as coming from another site
   (`Sec-Fetch-Site`) are refused, as are requests carrying an `Origin` header, so a web
   page open on the same machine cannot talk to a daemon on 127.0.0.1. The
