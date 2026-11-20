@@ -62,6 +62,10 @@ type Deployer struct {
 	// Proxy routes the app's domain to its container. Nil means no proxy
 	// is managed: the proxy steps are left out of the pipeline.
 	Proxy Proxy
+	// Certs obtains a certificate for a domain that has none, after a
+	// successful deploy. Nil means HTTPS comes only from certificates that
+	// are already on disk.
+	Certs Certs
 
 	// The fields below are the deployer's dependencies on the outside
 	// world. They are fields rather than direct calls so tests can replace
@@ -188,6 +192,9 @@ func (d *Deployer) Deploy(ctx context.Context, a *app.App, opts Options) (Result
 
 	err = pipeline.Run(ctx, d.steps(st), popts)
 	res.HostPort = st.hostPort
+	if err == nil && !opts.DryRun {
+		d.enableHTTPS(ctx, st)
+	}
 	return res, err
 }
 

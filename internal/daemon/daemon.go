@@ -170,6 +170,11 @@ func (d *Daemon) serve(ctx context.Context) int {
 	if cfg.Nginx.Enabled() {
 		srv.Proxy = nginx.New(cfg.Nginx)
 	}
+	// The same check for the issuer: a nil *certs.Issuer in the interface
+	// would look like one that is there.
+	if is := d.issuer(cfg); is != nil {
+		srv.Certs = deployCerts{is: is}
+	}
 
 	// The monitor runs for as long as the daemon does, in a goroutine of
 	// its own. monitorDone is closed when that goroutine has ended, which
@@ -240,6 +245,7 @@ func (d *Daemon) serve(ctx context.Context) int {
 		"listen", listener.Addr().String(),
 		"version", buildinfo.Version,
 		"nginx", cfg.Nginx.Enabled(),
+		"acme", cfg.ACME.Enabled(),
 		"monitor", !cfg.Monitor.Disabled,
 		"panel", !cfg.Panel.Disabled,
 	)

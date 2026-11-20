@@ -23,6 +23,10 @@ type fakeProxy struct {
 
 	testErr   error
 	reloadErr error
+
+	// tls lists the domains with a certificate on disk; Render then adds
+	// an HTTPS line, as the real template adds a 443 server block.
+	tls map[string]bool
 }
 
 func newFakeProxy() *fakeProxy {
@@ -38,7 +42,11 @@ func (p *fakeProxy) Render(_, domain string, hostPort int, release string) ([]by
 	if hostPort != 0 {
 		port = fmt.Sprint(hostPort)
 	}
-	return fmt.Appendf(nil, "release %s;\nserver_name %s;\nproxy_pass 127.0.0.1:%s;\n", release, domain, port), nil
+	conf := fmt.Sprintf("release %s;\nserver_name %s;\nproxy_pass 127.0.0.1:%s;\n", release, domain, port)
+	if p.tls[domain] {
+		conf += "listen 443 ssl;\n"
+	}
+	return []byte(conf), nil
 }
 
 // ReleaseOf reads back the first line written by Render.

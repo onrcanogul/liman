@@ -94,6 +94,10 @@ type Server struct {
 	// pointer so that "not set" and "zero: do not wait" can be told apart.
 	Drain *time.Duration
 
+	// Certs obtains a certificate after a deploy for a domain that has
+	// none. Nil means HTTPS only comes from certificates already on disk.
+	Certs deploy.Certs
+
 	// NewDeployer builds the deployer for a request. Nil means deploy.New;
 	// tests replace it to control ports, timing and release names.
 	NewDeployer func(e engine.Engine, out io.Writer) *deploy.Deployer
@@ -990,6 +994,7 @@ func (s *Server) newDeployer(e engine.Engine, out io.Writer) *deploy.Deployer {
 		d = deploy.New(e, out)
 	}
 	d.Proxy = s.Proxy
+	d.Certs = s.Certs
 	if s.Drain != nil {
 		d.Drain = *s.Drain
 	}
