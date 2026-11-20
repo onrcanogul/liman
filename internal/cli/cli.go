@@ -50,6 +50,8 @@ Commands:
   logs [-f] <app>      Show the logs of an app (-f keeps following)
   stop <app>           Stop and remove an app
   history [-n N] [app] Show the last N executed steps (default 20)
+  audit [-n N] [app]   Show who changed what: the last N entries of the audit
+                       trail (default 20)
   secret set <app> <NAME>
                        Store a secret; the value is read from standard input
                        (or typed at a prompt that does not show it)
@@ -111,6 +113,8 @@ func (c *CLI) Run(ctx context.Context, args []string) int {
 		return c.runStop(ctx, rest)
 	case "history":
 		return c.runHistory(ctx, rest)
+	case "audit":
+		return c.runAudit(ctx, rest)
 	case "secret":
 		return c.runSecret(ctx, rest)
 	case "status":
@@ -409,6 +413,42 @@ func (c *CLI) runHistory(ctx context.Context, args []string) int {
 			ev.App, ev.Release, ev.Action, result,
 			(time.Duration(ev.DurationMS) * time.Millisecond).String(),
 			ev.Step)
+	}
+	if err := w.Flush(); err != nil {
+		return c.fail(err)
+	}
+	return exitOK
+}
+
+func (c *CLI) runAudit(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("audit", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	limit := fs.Int("n", 20, "number of entries to show")
+	if err := fs.Parse(args); err != nil || fs.NArg() > 1 || *limit < 1 || *limit > 1000 {
+		return c.usageError("liman audit [-n N] [app]")
+	}
+
+	entries, err := c.API.Audit(ctx, fs.Arg(0), *limit)
+	if err != nil {
+		return c.fail(err)
+	}
+	if len(entries) == 0 {
+		fmt.Fprintln(c.Stdout, "Nothing recorded yet.")
+		return exitOK
+	}
+	w := tabwriter.NewWriter(c.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "#\tTIME\tACTOR\tACTION\tAPP\tTARGET\tRESULT")
+	for _, e := range entries {
+		result := "ok"
+		if !e.OK {
+			result = "FAILED: " + e.Error
+		}
+		app := e.App
+		if app == "" {
+			app = "-"
+		}
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\n", e.Seq, e.At.Local().Format("2006-01-02 15:04:05"),
+			e.Actor, e.Action, app, e.Target, result)
 	}
 	if err := w.Flush(); err != nil {
 		return c.fail(err)

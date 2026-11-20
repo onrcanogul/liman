@@ -351,3 +351,38 @@ type BackupResult struct {
 	// Removed is how many older backups were removed afterwards.
 	Removed int `json:"removed"`
 }
+
+// AuditEntry is one entry of GET /v1/audit: who changed what, when, and how
+// it ended.
+type AuditEntry struct {
+	Seq    int64     `json:"seq"`
+	At     time.Time `json:"at"`
+	Actor  string    `json:"actor"`
+	Action string    `json:"action"`
+	// App is absent for what concerns the daemon as a whole.
+	App    string `json:"app,omitempty"`
+	Target string `json:"target,omitempty"`
+	OK     bool   `json:"ok"`
+	Error  string `json:"error,omitempty"`
+	// KeyID names the master key that signed the entry; absent when there
+	// was none. MAC is its signature, in hex, to compare with the daemon's
+	// log.
+	KeyID string `json:"key_id,omitempty"`
+	MAC   string `json:"mac"`
+}
+
+// AuditReport is the answer of GET /v1/audit/verify.
+type AuditReport struct {
+	Entries int64  `json:"entries"`
+	LastSeq int64  `json:"last_seq"`
+	LastMAC string `json:"last_mac,omitempty"`
+	Intact  bool   `json:"intact"`
+	// Broken is the first entry that does not check out; absent when none.
+	Broken  int64  `json:"broken,omitempty"`
+	Problem string `json:"problem,omitempty"`
+	// Unsigned counts entries written before there was a master key;
+	// Unchecked, by key ID, entries signed with a key this server no
+	// longer has.
+	Unsigned  int64            `json:"unsigned,omitempty"`
+	Unchecked map[string]int64 `json:"unchecked,omitempty"`
+}

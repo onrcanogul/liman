@@ -208,6 +208,8 @@ func (s *Server) routes() []route {
 		{"GET /v1/secrets", accessListing, s.handleAllSecrets},
 		{"GET /v1/history", accessListing, s.handleHistory},
 		{"GET /v1/releases", accessListing, s.handleReleases},
+		{"GET /v1/audit", accessListing, s.handleAudit},
+		{"GET /v1/audit/verify", accessDaemon, s.handleAuditVerify},
 		{"GET /v1/tokens", accessDaemon, s.handleTokens},
 		{"DELETE /v1/tokens/{name}", accessDaemon, s.handleTokenRevoke},
 		{"GET /v1/backups", accessDaemon, s.handleBackupList},
@@ -1221,6 +1223,64 @@ func (s *Server) handleTokenRevoke(w http.ResponseWriter, r *http.Request) {
 		s.logger().Warn("token revoked", "token", name, "by", metaOf(r.Context()).token)
 		w.WriteHeader(http.StatusNoContent)
 	}
+}
+
+// handleAudit lists the audit trail. A token limited to some apps sees
+// their entries only; the entries about the daemon as a whole (app "")
+// are not among them.
+func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
+	limit, filter, ok := listQuery(w, r)
+	if !ok {
+		return
+	}
+	apps, ok := s.listApps(w, r, filter)
+	if !ok {
+		return
+	}
+	rows, err := s.Store.AuditEntries(r.Context(), apps, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	out := make([]api.AuditEntry, 0, len(rows))
+	for _, e := range rows {
+		out = append(out, api.AuditEntry{
+			Seq: e.Seq, At: e.At, Actor: e.Actor, Action: e.Action, App: e.App, Target: e.Target,
+			OK: e.OK, Error: e.Error, KeyID: e.KeyID, MAC: hex.EncodeToString(e.MAC),
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleAuditVerify checks the whole trail. It reads every entry, so it is
+// for the daemon as a whole: a limited token could not be told about
+// entries it may not see anyway.
+func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
+	if s.Audit == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("this daemon keeps no audit trail"))
+		return
+	}
+	var keys *secrets.Keyring
+	if s.Audit.Keys != nil {
+		var err error
+		if keys, err = s.Audit.Keys(); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	rep, err := audit.Verify(r.Context(), s.Store, keys)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	out := api.AuditReport{
+		Entries: rep.Entries, LastSeq: rep.LastSeq, LastMAC: rep.LastMAC, Intact: rep.Intact(),
+		Broken: rep.Broken, Problem: rep.Problem, Unsigned: rep.Unsigned,
+	}
+	if len(rep.Unchecked) > 0 {
+		out.Unchecked = rep.Unchecked
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // record writes an audit entry for what this request did, in the name of

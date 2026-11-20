@@ -2571,6 +2571,52 @@ func TestChangesAreAudited(t *testing.T) {
 	}
 }
 
+func TestAuditListingAndVerify(t *testing.T) {
+	h := servertest.New(t)
+	for _, def := range []string{definition, definitionFor("billing")} {
+		if _, err := h.Client.Deploy(ctx(), []byte(def), api.DeployOptions{}, io.Discard); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.Client.SetSecret(ctx(), "billing", "KEY", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Client.CreateBackup(ctx()); err != nil {
+		t.Fatal(err)
+	}
+
+	all, err := h.Client.Audit(ctx(), "", 100)
+	if err != nil || len(all) != 4 || all[0].Seq != 1 || all[3].Action != "backup.create" || all[3].App != "" || all[0].MAC == "" || all[0].KeyID == "" {
+		t.Fatalf("Audit() = %+v, %v; want 4 entries, oldest first, signed", all, err)
+	}
+	if billing, err := h.Client.Audit(ctx(), "billing", 100); err != nil || len(billing) != 2 {
+		t.Errorf("Audit(billing) = %+v, %v; want its deploy and its secret", billing, err)
+	}
+
+	// A token limited to orders-api sees orders-api's entries, and none
+	// about the daemon as a whole.
+	token, err := h.Store.CreateScopedToken(ctx(), "ci", store.ScopeRead, time.Time{}, "orders-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ci := &api.Client{BaseURL: h.URL, Token: token}
+	if mine, err := ci.Audit(ctx(), "", 100); err != nil || len(mine) != 1 || mine[0].App != "orders-api" {
+		t.Errorf("Audit() for a limited token = %+v, %v; want orders-api's only", mine, err)
+	}
+	var apiErr *api.Error
+	if _, err := ci.Audit(ctx(), "billing", 100); !errors.As(err, &apiErr) || apiErr.Status != http.StatusForbidden {
+		t.Errorf("Audit(billing) for a limited token = %v, want a 403", err)
+	}
+	if _, err := ci.VerifyAudit(ctx()); !errors.As(err, &apiErr) || apiErr.Status != http.StatusForbidden {
+		t.Errorf("VerifyAudit() for a limited token = %v, want a 403", err)
+	}
+
+	rep, err := h.Client.VerifyAudit(ctx())
+	if err != nil || !rep.Intact || rep.Entries != 4 || rep.LastSeq != 4 || rep.LastMAC != all[3].MAC {
+		t.Errorf("VerifyAudit() = %+v, %v; want 4 intact, ending with the last entry's signature", rep, err)
+	}
+}
+
 // rowsBackupName is the name of the one backup in the harness's directory.
 func rowsBackupName(t *testing.T, h *servertest.Harness) string {
 	t.Helper()

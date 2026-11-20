@@ -59,6 +59,7 @@ var ICONS = {
   secrets: 'M7 11V8a5 5 0 0110 0v3M5 11h14v10H5z',
   daemon: 'M4 4h16v6H4zM4 14h16v6H4zM8 7h.01M8 17h.01',
   tokens: 'M19 9a4 4 0 11-8 0 4 4 0 018 0zM12 12l-9 9M6 18l3 3M9 15l2 2',
+  audit: 'M9 4h6v3H9zM7 5H5v16h14V5h-2M9 14l2 2 4-4',
   backups: 'M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3zM4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6',
   chevron: 'M6 9l6 6 6-6',
   collapse: 'M15 6l-6 6 6 6', expand: 'M9 6l6 6-6 6', menu: 'M4 6h16M4 12h16M4 18h16',
@@ -155,6 +156,8 @@ var S = {
   secrets: new Map(),    // app -> { at, list, error }
   allSecrets: null,      // { at, list, error }: GET /v1/secrets, every app's
   tokens: null,          // { at, list, error }: GET /v1/tokens
+  audit: null,           // { at, list, error }: GET /v1/audit
+  auditCheck: null,      // { at, data, error }: GET /v1/audit/verify
   logs: { app: '', text: '', error: '', loading: false, cut: false, following: false, ended: false },
   backups: null,         // { at, list, error }
   certs: null,           // { at, data, error }: GET /v1/certs
@@ -162,7 +165,7 @@ var S = {
   backupBusy: false, backupNote: null,   // note: { kind, text }
   note: null,            // { kind, text }: the outcome of the last action
   checks: new Map(),     // backup name -> { busy, report, error }
-  q: '', only: 'all', actApp: '', actResult: '', tab: 'overview', range: '24h', every: 10, collapsed: false, drawer: false
+  q: '', only: 'all', actApp: '', actResult: '', auditApp: '', tab: 'overview', range: '24h', every: 10, collapsed: false, drawer: false
 };
 // Maps, not plain objects, wherever a key comes from the server: an app
 // called "constructor" must be an ordinary key.
@@ -394,6 +397,20 @@ function ensureExtras() {
       S.allSecrets = { at: Date.now(), list: res.ok ? cleanList(res.value) : null, error: res.ok ? '' : res.error.message };
     }));
   }
+  if (r.view === 'audit' && !(S.audit && now - S.audit.at < EXTRA_TTL)) {
+    jobs.push(settle(get('/v1/audit?limit=200')).then(function (res) {
+      if (!S.token) return;
+      S.audit = { at: Date.now(), list: res.ok ? cleanList(res.value) : null, error: res.ok ? '' : res.error.message };
+    }));
+  }
+  // Checking the chain reads every entry, so it is about the daemon as a
+  // whole: a limited token is not offered it.
+  if (r.view === 'audit' && !tokenApps() && !(S.auditCheck && now - S.auditCheck.at < EXTRA_TTL)) {
+    jobs.push(settle(get('/v1/audit/verify')).then(function (res) {
+      if (!S.token) return;
+      S.auditCheck = { at: Date.now(), data: res.ok && res.value && typeof res.value === 'object' ? res.value : null, error: res.ok ? '' : res.error.message };
+    }));
+  }
   if (r.view === 'tokens' && !tokenApps() && !(S.tokens && now - S.tokens.at < EXTRA_TTL)) {
     jobs.push(settle(get('/v1/tokens')).then(function (res) {
       if (!S.token) return;
@@ -573,7 +590,7 @@ function signOut(message, keepToken) {
   S.info = null; S.apps = []; S.events = []; S.releases = []; S.engineError = ''; S.offlineError = ''; S.updated = 0;
   S.health = new Map(); S.secrets = new Map(); S.logs = emptyLogs();
   S.backups = null; S.backupBusy = false; S.backupNote = null; S.checks = new Map(); S.note = null;
-  S.certs = null; S.keys = null; S.allSecrets = null; S.tokens = null;
+  S.certs = null; S.keys = null; S.allSecrets = null; S.tokens = null; S.audit = null; S.auditCheck = null;
   // What the last page showed is not merely hidden behind the sign-in
   // form: it is taken out of the page.
   clear($main);
@@ -600,7 +617,7 @@ function renderGate() {
 // ---------- routing: plain #name hashes only ----------
 function route() {
   var hash = ''; try { hash = decodeURIComponent((window.location.hash || '').replace(/^#/, '')); } catch (e) { hash = ''; }
-  if (['apps', 'activity', 'secrets', 'tokens', 'daemon', 'backups'].indexOf(hash) !== -1) return { view: hash };
+  if (['apps', 'activity', 'audit', 'secrets', 'tokens', 'daemon', 'backups'].indexOf(hash) !== -1) return { view: hash };
   if (hash.indexOf('app-') === 0) return { view: 'app', name: hash.slice(4) };
   return { view: 'overview' };
 }
@@ -628,7 +645,7 @@ function renderSide(r) {
         h('i', { class: 'dot ' + st.key, 'aria-hidden': 'true' }), h('span', { class: 'lbl trunc', text: a.name }), h('span', { class: 'sr', text: st.label }));
     }), list.length > shown.length ? h('a', { class: 'nav muted', href: '#apps' }, h('span', { class: 'lbl', text: 'All ' + list.length + ' apps' })) : null));
   }
-  add($nav, [navItem('activity', 'Activity', 'activity', r.view === 'activity'), navItem('secrets', 'Secrets', 'secrets', r.view === 'secrets'),
+  add($nav, [navItem('activity', 'Activity', 'activity', r.view === 'activity'), navItem('audit', 'Audit', 'audit', r.view === 'audit'), navItem('secrets', 'Secrets', 'secrets', r.view === 'secrets'),
     h('div', { class: 'side-label', text: 'System' }), tokenApps() ? null : navItem('tokens', 'Tokens', 'tokens', r.view === 'tokens'), tokenApps() ? null : navItem('backups', 'Backups', 'backups', r.view === 'backups'), navItem('daemon', 'Daemon', 'daemon', r.view === 'daemon')]);
   renderFoot();
   $app.className = 'app' + (S.collapsed ? ' collapsed' : '') + (S.drawer ? ' drawer' : '');
@@ -645,7 +662,7 @@ function renderFoot() {
 }
 function renderCrumbs(r) {
   clear($crumbs);
-  var names = { overview: 'Overview', apps: 'Apps', activity: 'Activity', secrets: 'Secrets', tokens: 'Tokens', daemon: 'Daemon', backups: 'Backups' };
+  var names = { overview: 'Overview', apps: 'Apps', activity: 'Activity', audit: 'Audit', secrets: 'Secrets', tokens: 'Tokens', daemon: 'Daemon', backups: 'Backups' };
   var parts = r.view === 'app' ? [['#apps', 'Apps'], [null, str(r.name, 80)]] : [[null, names[r.view]]];
   add($crumbs, [h('a', { href: '#overview', text: 'liman' })]);
   parts.forEach(function (p) { add($crumbs, [h('span', { class: 'sep', 'aria-hidden': 'true', text: '/' }), p[0] ? h('a', { href: p[0], text: p[1] }) : h('span', { class: 'here trunc', title: p[1], text: p[1] })]); });
@@ -1201,6 +1218,63 @@ function viewActivity() {
       all.length ? h('button', { class: 'btn', onclick: function () { S.actApp = ''; S.actResult = ''; render(); } }, 'Clear filters') : null)),
     h('div', { class: 'hint' }, 'The latest ' + fmtNum(all.length) + ' steps. For older ones: ', h('code', { text: 'liman history -n 1000' }))];
 }
+// actorText says who acted, the way a person reads it: a token by its name
+// (the full actor, with the token's creation time, is in the tooltip), a
+// command on the server by its user, the daemon's own helpers by role.
+function actorText(actor) {
+  var a = str(actor, 200), kind = a.split(':')[0], rest = a.slice(kind.length + 1);
+  if (kind === 'token') return { text: rest.split('@')[0] || DASH, note: 'token' };
+  if (kind === 'server') return { text: rest || DASH, note: 'on the server' };
+  if (a === 'monitor') return { text: 'Health monitor', note: '' };
+  if (a === 'renewer') return { text: 'Certificate renewer', note: '' };
+  return { text: a || DASH, note: '' };
+}
+var AUDIT_ACTIONS = {
+  deploy: 'Deploy', rollback: 'Roll back', stop: 'Stop', restart: 'Restart', 'secret.set': 'Set secret', 'secret.delete': 'Remove secret',
+  'token.create': 'Create token', 'token.revoke': 'Revoke token', 'backup.create': 'Back up', 'backup.restore': 'Restore', 'key.rotate': 'Rotate key',
+  'key.retire': 'Retire key', 'cert.obtain': 'Get certificate'
+};
+function auditChain() {
+  var c = S.auditCheck, d = c && c.data;
+  if (tokenApps()) return null;
+  if (!c) return h('div', { class: 'banner info', role: 'status' }, h('div', { class: 'grow', text: 'Checking the chain\u2026' }));
+  if (!d) return h('div', { class: 'banner warn', role: 'status' }, h('div', { class: 'grow wrap-any', text: 'The chain could not be checked: ' + str(c.error, 300) }));
+  if (!d.intact) return h('div', { class: 'banner crit', role: 'alert' }, h('div', { class: 'grow wrap-any' },
+    h('b', { text: 'The audit trail is broken at entry ' + fmtNum(d.broken) + '. ' }), str(d.problem, 300) + '. Entries from there on cannot be trusted; compare with the system log (journalctl -t limand | grep msg=audit).'));
+  var notes = [];
+  if (num(d.unsigned)) notes.push(fmtNum(d.unsigned) + ' at the start were written before there was a master key and are hashed, not signed.');
+  if (d.unchecked && typeof d.unchecked === 'object') Object.keys(d.unchecked).forEach(function (id) { notes.push(fmtNum(d.unchecked[id]) + ' signed with key ' + str(id, 32) + ' cannot be checked: that key is gone.'); });
+  return h('div', { class: 'banner info', role: 'status' }, h('div', { class: 'grow wrap-any' },
+    h('b', { text: num(d.entries) ? 'The chain is intact: ' + fmtNum(d.entries) + (num(d.entries) === 1 ? ' entry' : ' entries') + ' check out. ' : 'Nothing recorded yet. ' }),
+    notes.join(' '), num(d.entries) ? h('span', null, ' The last one is ', h('code', { text: '#' + fmtNum(d.last_seq) + ' ' + str(d.last_mac, 64).slice(0, 16) + '\u2026' }), '; the system log (journalctl -t limand) must end with the same one.') : null));
+}
+function viewAudit() {
+  var have = S.audit, out = [h('h1', { text: 'Audit' }), auditChain()];
+  if (!have) { out.push(h('div', { class: 'panel' }, stateBlock('Reading the audit trail\u2026', null, null, true))); return out; }
+  if (have.list === null) { out.push(fullState('The audit trail could not be read', h('p', { text: str(have.error, 300) }), h('button', { class: 'btn', onclick: function () { S.audit = null; render(); ensureExtras(); } }, 'Try again'))); return out; }
+  var all = have.list.slice().reverse(), names = [];
+  all.forEach(function (e) { var n = str(e.app); if (n && names.indexOf(n) === -1) names.push(n); });
+  names.sort();
+  if (S.auditApp && S.auditApp !== '-' && names.indexOf(S.auditApp) === -1) S.auditApp = '';
+  var shown = all.filter(function (e) { return !S.auditApp || (S.auditApp === '-' ? !str(e.app) : str(e.app) === S.auditApp); });
+  var $sel = h('select', { id: 'audit-app', 'aria-label': 'App', onchange: function (e) { S.auditApp = e.target.value; render(); } },
+    h('option', { value: '', text: 'Everything' }), tokenApps() ? null : h('option', { value: '-', selected: S.auditApp === '-', text: 'The daemon as a whole' }),
+    names.map(function (n) { return h('option', { value: n, selected: n === S.auditApp, text: str(n, 48) }); }));
+  out.push(h('div', { class: 'toolbar' }, h('span', { class: 'pick' }, $sel, icon('chevron'))));
+  out.push(h('div', { class: 'panel' }, shown.length ? h('div', { class: 'tbl-wrap' }, h('table', null,
+    h('thead', null, h('tr', null, h('th', { class: 'right', text: '#' }), h('th', { text: 'When' }), h('th', { text: 'Who' }), h('th', { text: 'What' }), h('th', { text: 'App' }), h('th', { text: 'On' }), h('th', { text: 'Result' }))),
+    h('tbody', null, shown.map(function (e) {
+      var who = actorText(e.actor), app = str(e.app);
+      return h('tr', null, h('td', { class: 'right mono muted', text: fmtNum(e.seq) }), h('td', { class: 'nowrap' }, when(e.at)),
+        h('td', { class: 'nowrap', title: str(e.actor, 200) }, h('span', { class: 'mono', text: who.text }), who.note ? h('span', { class: 'muted', text: ' ' + who.note }) : null),
+        h('td', { class: 'nowrap', text: AUDIT_ACTIONS[str(e.action)] || orDash(e.action, 40) }),
+        h('td', { class: 'name' }, app ? (findApp(app) ? h('a', { href: appHref(app), text: app }) : h('span', { text: str(app, 80) })) : h('span', { class: 'muted', text: 'daemon' })),
+        h('td', { class: 'mono detail', text: orDash(e.target, 300) }),
+        h('td', { class: 'detail' }, okPill(typeof e.ok === 'boolean' ? e.ok : null), e.ok === false && str(e.error) ? h('div', { class: 'muted wrap-any', text: str(e.error, 600) }) : null));
+    })))) : stateBlock(all.length ? 'Nothing matches this filter' : 'Nothing recorded yet', h('p', { text: all.length ? 'Try another app, or everything.' : 'Every change appears here: deploys, rollbacks, stops, secrets, tokens, backups, keys, restarts by the health monitor.' }), null, true)));
+  out.push(h('div', { class: 'hint' }, 'The latest ' + fmtNum(all.length) + ' entries, newest first. Who changed what; reads are not recorded, values never. For more: ', h('code', { text: 'liman audit -n 1000' }), '. On the server, ', h('code', { text: 'limand audit verify' }), ' checks the whole chain.'));
+  return out;
+}
 function viewSecrets() {
   var vault = !!(S.info && S.info.secrets);
   var head = h('div', { class: 'head' }, h('div', { class: 'grow' }, h('h1', { text: 'Secrets' })),
@@ -1394,7 +1468,7 @@ function render() {
     var page = h('div', { class: 'page' }); $main.appendChild(page);
     if (!S.info) { add(page, skeleton()); return; }
     add(page, banners());
-    add(page, r.view === 'app' ? viewApp(r.name) : r.view === 'apps' ? viewApps() : r.view === 'activity' ? viewActivity() : r.view === 'secrets' ? viewSecrets() : r.view === 'tokens' ? viewTokens() : r.view === 'daemon' ? viewDaemon() : r.view === 'backups' ? viewBackups() : viewOverview());
+    add(page, r.view === 'app' ? viewApp(r.name) : r.view === 'apps' ? viewApps() : r.view === 'activity' ? viewActivity() : r.view === 'audit' ? viewAudit() : r.view === 'secrets' ? viewSecrets() : r.view === 'tokens' ? viewTokens() : r.view === 'daemon' ? viewDaemon() : r.view === 'backups' ? viewBackups() : viewOverview());
     afterMount.forEach(function (fn) { try { fn(); } catch (e) { /* one broken chart must not take the page down */ } });
 
     $main.scrollTop = pageScroll;

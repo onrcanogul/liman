@@ -98,6 +98,7 @@ liman ps                     # containers managed by liman
 liman logs -f <app>          # follow the logs of the newest release
 liman stop <app>             # stop and remove all containers of an app; its secrets are kept
 liman history [-n N] [app]   # every executed step, with result and duration
+liman audit [-n N] [app]     # who changed what
 liman status                 # is the daemon reachable, is the token accepted
 ```
 
@@ -461,7 +462,60 @@ The environment variables `LIMAN_URL` and `LIMAN_TOKEN` take precedence.
 | `POST /v1/backups/{name}/verify` | Check a backup: intact, and can its secrets be decrypted |
 | `GET /v1/certs` | Certificates in `nginx.cert_dir`, their expiry and status |
 | `GET /v1/keys` | Master keys by ID, their role, and the secrets and backups that depend on each |
+| `GET /v1/audit[?app=][&limit=]` | The audit trail: who changed what, oldest first; a token limited to apps sees theirs |
+| `GET /v1/audit/verify` | Check the whole audit trail |
 | `GET /ui/` | The panel's files; no token needed, they contain no data |
+
+## Audit trail
+
+Every change is recorded in the database with who made it, when, and how it
+ended: deploys, rollbacks, stops, secrets set and removed, tokens created
+and revoked, backups made and restored, keys rotated and retired,
+certificates obtained, and restarts by the health monitor. Reads are not
+recorded; values never are (a secret's name is, its value is not).
+
+```
+liman audit [-n N] [app]     # the last N records
+limand audit verify          # on the server: check the whole chain
+```
+
+Who did it is a token, with its creation time (a revoked token's name can
+be given to a new one), the operating system user for a `limand` command on
+the server, `monitor` or `renewer`. The panel shows the trail on its Audit
+page. A token limited to some apps sees their records only.
+
+The request log already says who did what, but it is not this: it rotates,
+it is not in the backups, it is hard to query, and anyone who can edit it
+can do so unseen. Each record here is signed together with the signature
+of the record before it, with a key derived from the master key:
+
+```
+mac_n = HMAC(key, mac_(n-1) || record n)
+```
+
+so a record that is changed, removed, inserted or moved later breaks every
+signature from there on, and nobody without the master key can sign a
+rewritten trail. `limand audit verify` finds the first record that does not
+check out. Records signed with a key that has since been retired can no
+longer be checked; verify says so, and checks the chain after them.
+
+What a chain cannot show is records cut off at the end, or the whole
+database replaced by an older copy: what is left is consistent. For that,
+every record is also written to the system log with its signature, by the
+daemon and by `limand` commands alike, and the daemon logs the head of the
+trail when it starts. The last record verify reports must be the last one
+there:
+
+```
+journalctl -t limand | grep 'msg=audit' | tail -1
+```
+
+Against someone with root (and so the master key and the logs) nothing on
+the same machine is proof; send the system log to another machine if that
+matters. Records are written after the change, with its outcome; if one
+cannot be written, the change stands and the failure is logged as an error.
+A restore makes the backup's trail the current one and adds the restore to
+it; what was recorded after the backup stays in the database set aside.
 
 ## Security
 
@@ -488,6 +542,8 @@ is equivalent to root. The API is built around keeping everyone else out:
   another are closed for every token: a deploy is refused when its domain
   belongs to another app (see Routing with Nginx), and a question of a
   step-by-step deploy can only be answered by the token that started it.
+- **Audit trail.** Every change is recorded with who made it (see Audit
+  trail), in a chain where a record changed or removed later shows.
 - **Browsers.** Requests that a browser marks as coming from another site
   (`Sec-Fetch-Site`) are refused, as are requests carrying an `Origin` header, so a web
   page open on the same machine cannot talk to a daemon on 127.0.0.1. The

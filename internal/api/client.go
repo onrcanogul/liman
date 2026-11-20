@@ -338,6 +338,27 @@ func (c *Client) RevokeToken(ctx context.Context, name string) error {
 	return resp.Body.Close()
 }
 
+// Audit returns the newest limit entries of the audit trail, of app or of
+// everything this token may see when app is "".
+func (c *Client) Audit(ctx context.Context, app string, limit int) ([]AuditEntry, error) {
+	q := url.Values{"limit": {strconv.Itoa(limit)}}
+	if app != "" {
+		q.Set("app", app)
+	}
+	var out []AuditEntry
+	err := c.getJSON(ctx, "/v1/audit", q, &out)
+	return out, err
+}
+
+// VerifyAudit asks the daemon to check the whole audit trail.
+func (c *Client) VerifyAudit(ctx context.Context) (*AuditReport, error) {
+	var out AuditReport
+	if err := c.getJSON(ctx, "/v1/audit/verify", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func secretPath(app, name string) string {
 	return "/v1/apps/" + url.PathEscape(app) + "/secrets/" + url.PathEscape(name)
 }
