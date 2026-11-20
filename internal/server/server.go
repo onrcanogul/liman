@@ -119,6 +119,9 @@ type Server struct {
 	mu sync.Mutex
 	// confirms holds the questions that are waiting for an answer.
 	confirms map[string]chan bool
+	// domains holds the domains of deploys in progress, by app; see
+	// claimDomain.
+	domains map[string]string
 
 	// ownLocks is used when Locks is nil.
 	ownLocks applock.Locks
@@ -394,6 +397,14 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		if eng, err = s.Connect(ctx); err != nil {
 			writeError(w, http.StatusServiceUnavailable, err)
 			return
+		}
+		if a.Domain != "" {
+			release, err := s.claimDomain(ctx, eng, r, a)
+			if err != nil {
+				writeError(w, http.StatusConflict, err)
+				return
+			}
+			defer release()
 		}
 	}
 
@@ -855,6 +866,58 @@ func listQuery(w http.ResponseWriter, r *http.Request) (limit int, filter string
 		return 0, "", false
 	}
 	return limit, filter, true
+}
+
+// claimDomain makes sure no other app has a's domain, and holds it for a
+// until release is called. Two apps with one domain would each get an
+// Nginx server block for it; Nginx only warns ("conflicting server name"),
+// and the block whose file sorts first wins. An app named to sort early
+// would quietly take another app's traffic, which a token limited to that
+// app must not be able to do.
+//
+// Two places can hold a domain: a container of another app, running or
+// kept for a rollback, and a deploy of another app that is in progress
+// and has no container yet.
+func (s *Server) claimDomain(ctx context.Context, eng engine.Engine, r *http.Request, a *app.App) (release func(), err error) {
+	domain := a.Domain
+	taken := func(other string) error {
+		// The other app is named only to a token that may see it.
+		if visible(r, other) {
+			return fmt.Errorf("domain %s is used by app %s; stop it, or give it another domain, first", a.Domain, other)
+		}
+		return fmt.Errorf("domain %s is used by another app", a.Domain)
+	}
+
+	s.mu.Lock()
+	if s.domains == nil {
+		s.domains = map[string]string{}
+	}
+	for other, d := range s.domains {
+		if d == domain && other != a.Name {
+			s.mu.Unlock()
+			return nil, taken(other)
+		}
+	}
+	s.domains[a.Name] = domain
+	s.mu.Unlock()
+	release = func() {
+		s.mu.Lock()
+		delete(s.domains, a.Name)
+		s.mu.Unlock()
+	}
+
+	containers, err := eng.List(ctx)
+	if err != nil {
+		release()
+		return nil, fmt.Errorf("check domain %s: %w", a.Domain, err)
+	}
+	for _, c := range containers {
+		if c.App != a.Name && c.Domain == domain {
+			release()
+			return nil, taken(c.App)
+		}
+	}
+	return release, nil
 }
 
 // listApps turns a listing's ?app= filter into the set of apps to read,

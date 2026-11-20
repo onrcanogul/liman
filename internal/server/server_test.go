@@ -2351,6 +2351,67 @@ func TestAppLimitedTokenSeesAndTouchesOnlyItsApps(t *testing.T) {
 	}
 }
 
+func TestADomainBelongsToOneApp(t *testing.T) {
+	h := servertest.New(t)
+	sameDomain := strings.Replace(definitionFor("shop"), "domain: shop.example.com", "domain: api.example.com", 1)
+	var apiErr *api.Error
+
+	// A deploy in progress holds its domain before it has a container:
+	// park the first deploy of orders-api at its first question.
+	parkCtx, release := context.WithCancel(ctx())
+	asked := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = h.Client.Deploy(parkCtx, []byte(definition), api.DeployOptions{Confirm: func(string) (bool, error) {
+			asked <- struct{}{}
+			<-parkCtx.Done()
+			return false, parkCtx.Err()
+		}}, io.Discard)
+	}()
+	select {
+	case <-asked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the parked deploy did not reach its first question")
+	}
+	if _, err := h.Client.Deploy(ctx(), []byte(sameDomain), api.DeployOptions{}, io.Discard); !errors.As(err, &apiErr) || apiErr.Status != http.StatusConflict || !strings.Contains(err.Error(), "orders-api") {
+		t.Errorf("Deploy(shop) during orders-api's deploy = %v, want a 409 naming orders-api", err)
+	}
+	release()
+	<-done
+
+	if _, err := h.Client.Deploy(ctx(), []byte(definition), api.DeployOptions{}, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Client.Deploy(ctx(), []byte(sameDomain), api.DeployOptions{}, io.Discard); !errors.As(err, &apiErr) || apiErr.Status != http.StatusConflict || !strings.Contains(err.Error(), "used by app orders-api") {
+		t.Errorf("Deploy(shop) with orders-api's domain = %v, want a 409 naming orders-api", err)
+	}
+	// A token that may not see orders-api is not told its name.
+	token, err := h.Store.CreateScopedToken(ctx(), "shop-ci", store.ScopeAdmin, time.Time{}, "shop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&api.Client{BaseURL: h.URL, Token: token}).Deploy(ctx(), []byte(sameDomain), api.DeployOptions{}, io.Discard)
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusConflict || strings.Contains(err.Error(), "orders-api") || !strings.Contains(err.Error(), "another app") {
+		t.Errorf("Deploy(shop) with a token limited to shop = %v, want a 409 that does not name orders-api", err)
+	}
+	if h.Engine.State("shop") != "" {
+		t.Error("a refused deploy started something")
+	}
+
+	// The app itself keeps its domain on every deploy...
+	if _, err := h.Client.Deploy(ctx(), []byte(definition), api.DeployOptions{}, io.Discard); err != nil {
+		t.Errorf("redeploying orders-api = %v", err)
+	}
+	// ...and gives it up when it is stopped.
+	if _, err := h.Client.Stop(ctx(), "orders-api"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Client.Deploy(ctx(), []byte(sameDomain), api.DeployOptions{}, io.Discard); err != nil {
+		t.Errorf("Deploy(shop) after orders-api was stopped = %v", err)
+	}
+}
+
 func TestRepeatedReadsAreLoggedOnce(t *testing.T) {
 	var log lockedBuffer
 	h := servertest.New(t, func(s *server.Server) {

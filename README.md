@@ -776,6 +776,13 @@ and include that directory once from the `http` block of your Nginx config:
 include /etc/nginx/liman/*.conf;
 ```
 
+A domain belongs to one app at a time. A deploy whose domain another app
+has (a running container, one kept for a rollback, or a deploy of it in
+progress) is refused with a 409 before anything is started; stop that app
+first. Nginx itself would accept both, with only a warning (`conflicting
+server name`), and send the domain's traffic to whichever file sorts
+first, so an app could quietly take another's traffic.
+
 liman never reads or edits any other Nginx file. A deploy then gains three
 steps between the health check and the retiring of the previous release:
 
