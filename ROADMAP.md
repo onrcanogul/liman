@@ -99,6 +99,6 @@ collection.
   - [ ] 5c: certificates from Let's Encrypt
 - [x] Stage 6
 - [x] Stage 7
-- [ ] Stage 8
+- [x] Stage 8
   - [x] 8a: encrypted secret storage
-  - [ ] 8b: read-only status panel
+  - [x] 8b: read-only status panel

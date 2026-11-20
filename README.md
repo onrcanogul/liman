@@ -228,6 +228,39 @@ from someone who can run `docker inspect` on the server, or from the app
 itself: the value is in the container's environment in plain text. There is
 no API to read a secret back.
 
+## The panel
+
+While it runs, the daemon serves a read-only web panel at `/ui/` on its
+listen address (`http://127.0.0.1:7070/ui/` by default):
+
+- **Overview**: how many apps are fine, which ones need attention, a health
+  timeline per app, deploys per day and the latest activity.
+- **Apps**: every app with its status, release, address and restarts; per
+  app the health history, the response time of its health check, its
+  deploys, the names of its secrets, its activity and its logs.
+- **Activity**, **Secrets** (names only) and **Daemon** (version, which
+  parts are switched on).
+
+Sign in with an API token (`limand token create panel`). The token is kept
+in that browser tab only and is forgotten when the tab closes. The panel
+cannot change anything: it only sends `GET` requests, and deploys, rollbacks
+and secrets stay with the command line.
+
+The files of the panel are compiled into `limand`; there is nothing to
+install next to it. They are served without a token, because they contain no
+data: the page asks the API for everything, like any other client. To turn
+the panel off:
+
+```yaml
+# config.yaml
+panel:
+  disabled: true
+```
+
+The health timeline and the response times come from the health monitor,
+which records every check it makes and keeps seven days of them. With the
+monitor disabled those two charts are empty.
+
 ## The daemon
 
 `limand` keeps its files in `$LIMAN_HOME` (default `~/.liman`):
@@ -235,7 +268,7 @@ no API to read a secret back.
 | File | Content |
 |---|---|
 | `config.yaml` | Optional settings, see below |
-| `liman.db` | SQLite database: step and restart history, releases, token hashes, encrypted secrets |
+| `liman.db` | SQLite database: step and restart history, releases, token hashes, encrypted secrets, seven days of health checks |
 | `master.key` | The key the secrets are encrypted with; created on first start |
 
 ```yaml
@@ -293,6 +326,10 @@ The environment variables `LIMAN_URL` and `LIMAN_TOKEN` take precedence.
 | `GET /v1/apps/{name}/secrets` | Names of an app's secrets, never values |
 | `PUT /v1/apps/{name}/secrets/{key}` | Body: the value. Stores it encrypted |
 | `DELETE /v1/apps/{name}/secrets/{key}` | Removes a secret |
+| `GET /v1/info` | Version, start time and which parts of the daemon are switched on |
+| `GET /v1/releases[?app=][&limit=]` | Deploys and how they ended, newest first |
+| `GET /v1/apps/{name}/health[?range=6h\|24h\|7d]` | Health checks of an app, summarised in 48 buckets |
+| `GET /ui/` | The panel's files; no token needed, they contain no data |
 
 ## Security
 
@@ -305,7 +342,15 @@ is equivalent to root. The API is built around keeping everyone else out:
   stored. Ten failed attempts from one address within a minute lock that
   address out (429) until the minute is over, valid token or not.
 - **Browsers.** Requests carrying an `Origin` header are refused, so a web
-  page open on the same machine cannot talk to a daemon on 127.0.0.1.
+  page open on the same machine cannot talk to a daemon on 127.0.0.1. The
+  daemon's own panel is not affected: it only reads, and browsers send no
+  `Origin` header with a same-origin `GET`.
+- **The panel.** Served with a content security policy that allows scripts,
+  styles and connections from the daemon itself and nothing else, and
+  forbids framing. The page builds everything from text nodes, so a
+  container name or an error message containing markup is shown, not run.
+  Its token lives in the tab's session storage; a script that ran in the
+  page could read it, which is what the policy is there to prevent.
 - **Slow and large requests.** Headers must arrive within 10 seconds and a
   body within 15; headers are limited to 16 KiB and bodies to 1 MiB; at most
   64 requests are handled at once; idle connections are closed.
@@ -461,7 +506,8 @@ internal/cli/        the liman command: arguments, output, exit codes
 internal/daemon/     the limand command: serving and token management
 internal/api/        wire types and the HTTP client (what the CLI links)
 internal/server/     HTTP handlers, streaming, auth, per-app locking
-internal/store/      SQLite: history, releases, tokens, sealed secrets
+internal/panel/      the web panel: static files embedded into limand
+internal/store/      SQLite: history, releases, tokens, sealed secrets, health samples
 internal/secrets/    encryption of secrets at rest and the master key file
 internal/app/        app definition: loading and validation
 internal/deploy/     the steps of a deploy and how each is undone
