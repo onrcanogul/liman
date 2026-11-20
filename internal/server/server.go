@@ -261,7 +261,8 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	// Add the app's secrets to its environment. This comes before anything
 	// is locked, connected or started: a deploy that cannot have its
 	// configuration must fail without having touched anything.
-	if status, err := s.addSecrets(ctx, a, dryRun); err != nil {
+	secretFiles, status, err := s.addSecrets(ctx, a, dryRun)
+	if err != nil {
 		writeError(w, status, err)
 		return
 	}
@@ -298,7 +299,7 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 
 	deployer := s.newDeployer(eng, stream)
 
-	opts := deploy.Options{DryRun: dryRun}
+	opts := deploy.Options{DryRun: dryRun, SecretFiles: secretFiles}
 	if !dryRun {
 		opts.OnEvent = s.recordEvent(a.Name)
 		if stepMode {
@@ -956,42 +957,45 @@ func secretName(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return key, true
 }
 
-// addSecrets puts the values of the secrets an app refers to into its
+// addSecrets resolves the secrets an app refers to. Those under secrets go
+// into its environment; those under secret_files are returned, to be
+// written into the container, and their <NAME>_FILE goes into the
 // environment. On failure it returns the HTTP status that fits.
 //
 // In a dry run the values are not decrypted, only checked for existence:
 // the plan shows the names (masked like every other variable), and a dry
 // run that reads secrets would be a way to probe them.
-func (s *Server) addSecrets(ctx context.Context, a *app.App, dryRun bool) (int, error) {
-	if len(a.Secrets) == 0 {
-		return http.StatusOK, nil
+func (s *Server) addSecrets(ctx context.Context, a *app.App, dryRun bool) (map[string][]byte, int, error) {
+	names := append(append([]string{}, a.Secrets...), a.SecretFiles...)
+	if len(names) == 0 {
+		return nil, http.StatusOK, nil
 	}
 	if s.Secrets == nil {
-		return http.StatusServiceUnavailable, errors.New("the app refers to secrets, but this daemon has no secret storage")
+		return nil, http.StatusServiceUnavailable, errors.New("the app refers to secrets, but this daemon has no secret storage")
 	}
 
 	values := map[string]string{}
 	if dryRun {
-		missing, err := s.Secrets.Missing(ctx, a.Name, a.Secrets)
+		missing, err := s.Secrets.Missing(ctx, a.Name, names)
 		if err != nil {
-			return http.StatusInternalServerError, err
+			return nil, http.StatusInternalServerError, err
 		}
 		if len(missing) > 0 {
-			return http.StatusBadRequest, &secrets.MissingError{App: a.Name, Names: missing}
+			return nil, http.StatusBadRequest, &secrets.MissingError{App: a.Name, Names: missing}
 		}
-		for _, name := range a.Secrets {
+		for _, name := range names {
 			values[name] = ""
 		}
 	} else {
-		resolved, err := s.Secrets.Resolve(ctx, a.Name, a.Secrets)
+		resolved, err := s.Secrets.Resolve(ctx, a.Name, names)
 		if errors.Is(err, secrets.ErrNotSet) {
-			return http.StatusBadRequest, err
+			return nil, http.StatusBadRequest, err
 		}
 		if err != nil {
 			// A value that is stored but cannot be decrypted: the key was
 			// replaced or the data was changed. That is the daemon's
 			// problem, not the request's.
-			return http.StatusInternalServerError, err
+			return nil, http.StatusInternalServerError, err
 		}
 		values = resolved
 	}
@@ -999,15 +1003,25 @@ func (s *Server) addSecrets(ctx context.Context, a *app.App, dryRun bool) (int, 
 	// Build a new map instead of writing into a.Env: the definition may
 	// have had no env section at all, which leaves the map nil, and a nil
 	// map cannot be written to.
-	env := make(map[string]string, len(a.Env)+len(values))
+	env := make(map[string]string, len(a.Env)+len(names))
 	for k, v := range a.Env {
 		env[k] = v
 	}
-	for k, v := range values {
-		env[k] = v
+	for _, name := range a.Secrets {
+		env[name] = values[name]
+	}
+	var files map[string][]byte
+	if len(a.SecretFiles) > 0 {
+		files = make(map[string][]byte, len(a.SecretFiles))
+	}
+	for _, name := range a.SecretFiles {
+		// The environment only says where the file is; the value itself
+		// never enters it.
+		env[app.SecretFileEnv(name)] = app.SecretFilePath(name)
+		files[name] = []byte(values[name])
 	}
 	a.Env = env
-	return http.StatusOK, nil
+	return files, http.StatusOK, nil
 }
 
 // --- helpers used by handlers ---------------------------------------------

@@ -38,6 +38,14 @@ type App struct {
 	// deploy time, under the same name. Set them with "liman secret set".
 	Secrets []string `yaml:"secrets"`
 
+	// SecretFiles names secrets given to the container as files rather
+	// than environment variables: each is written to /run/secrets/<NAME>
+	// before the container starts, and <NAME>_FILE in the environment
+	// says where (the convention of the official Docker images). A file
+	// does not show in "docker inspect" and is not inherited by every
+	// process the app starts, as an environment variable is.
+	SecretFiles []string `yaml:"secret_files"`
+
 	// Resources limits what the container may consume. Zero values mean
 	// "no limit".
 	Resources Resources `yaml:"resources"`
@@ -95,3 +103,12 @@ func Parse(data []byte) (*App, error) {
 	}
 	return &a, nil
 }
+
+// SecretsDir is where secret files are put inside a container.
+const SecretsDir = "/run/secrets"
+
+// SecretFilePath is the path of the secret name inside the container.
+func SecretFilePath(name string) string { return SecretsDir + "/" + name }
+
+// SecretFileEnv is the environment variable that holds that path.
+func SecretFileEnv(name string) string { return name + "_FILE" }

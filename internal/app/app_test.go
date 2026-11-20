@@ -129,6 +129,12 @@ func TestValidate(t *testing.T) {
 		{name: "secrets", mutate: func(a *App) { a.Secrets = []string{"DATABASE_URL", "API_KEY"} }},
 		{name: "secret with invalid name", mutate: func(a *App) { a.Secrets = []string{"MY-SECRET"} }, wantErr: `secrets: invalid name "MY-SECRET"`},
 		{name: "secret listed twice", mutate: func(a *App) { a.Secrets = []string{"KEY", "KEY"} }, wantErr: "secrets: KEY is listed twice"},
+		{name: "secret files", mutate: func(a *App) { a.SecretFiles = []string{"TLS_KEY"}; a.Secrets = []string{"DATABASE_URL"} }},
+		{name: "secret file with invalid name", mutate: func(a *App) { a.SecretFiles = []string{"../etc/passwd"} }, wantErr: `secret_files: invalid name "../etc/passwd"`},
+		{name: "secret file listed twice", mutate: func(a *App) { a.SecretFiles = []string{"K", "K"} }, wantErr: "secret_files: K is listed twice"},
+		{name: "secret both as file and in env", mutate: func(a *App) { a.SecretFiles = []string{"K"}; a.Secrets = []string{"K"} }, wantErr: "secret_files: K is also listed under secrets"},
+		{name: "secret file pointer set under env", mutate: func(a *App) { a.SecretFiles = []string{"K"}; a.Env = map[string]string{"K_FILE": "/x"} }, wantErr: "secret_files: K_FILE is set under env"},
+		{name: "secret file pointer listed as secret", mutate: func(a *App) { a.SecretFiles = []string{"K"}; a.Secrets = []string{"K_FILE"} }, wantErr: "secret_files: K_FILE is listed under secrets"},
 		{
 			name:    "secret that is also in env",
 			mutate:  func(a *App) { a.Env = map[string]string{"KEY": "x"}; a.Secrets = []string{"KEY"} },

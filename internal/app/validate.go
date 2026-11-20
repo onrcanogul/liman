@@ -139,6 +139,32 @@ func (a *App) Validate() error {
 		}
 	}
 
+	if len(a.SecretFiles) > maxEnvVars {
+		errs = append(errs, fmt.Errorf("secret_files: at most %d are allowed, got %d", maxEnvVars, len(a.SecretFiles)))
+	}
+	seenFile := map[string]bool{}
+	for _, name := range a.SecretFiles {
+		switch {
+		case !envKeyRe.MatchString(name):
+			errs = append(errs, fmt.Errorf("secret_files: invalid name %q", name))
+			continue
+		case seenFile[name]:
+			errs = append(errs, fmt.Errorf("secret_files: %s is listed twice", name))
+		case seen[name]:
+			// In both lists the value would be in the environment anyway,
+			// which is what the file is there to avoid.
+			errs = append(errs, fmt.Errorf("secret_files: %s is also listed under secrets; a secret is given either as a file or in the environment", name))
+		}
+		seenFile[name] = true
+		pointer := SecretFileEnv(name)
+		if _, clash := a.Env[pointer]; clash {
+			errs = append(errs, fmt.Errorf("secret_files: %s is set under env, but liman sets it to the file's path", pointer))
+		}
+		if seen[pointer] {
+			errs = append(errs, fmt.Errorf("secret_files: %s is listed under secrets, but liman sets it to the file's path", pointer))
+		}
+	}
+
 	if a.Resources.Memory != "" {
 		if _, err := a.Resources.MemoryBytes(); err != nil {
 			errs = append(errs, fmt.Errorf("resources.memory: %w", err))

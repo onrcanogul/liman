@@ -2167,3 +2167,72 @@ func TestCertificatesAndKeysWhenNotOffered(t *testing.T) {
 		t.Errorf("Info() = %+v, %v; want no certificates, no acme", info, err)
 	}
 }
+
+// --- secrets as files ------------------------------------------------------------
+
+const definitionWithSecretFiles = definition + `secrets:
+  - API_KEY
+secret_files:
+  - DATABASE_URL
+`
+
+func TestDeployGivesSecretFilesAsFiles(t *testing.T) {
+	h := servertest.New(t)
+	if err := h.Client.SetSecret(ctx(), "orders-api", "DATABASE_URL", []byte("postgres://user:hunter2@db/app")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Client.SetSecret(ctx(), "orders-api", "API_KEY", []byte("k-123")); err != nil {
+		t.Fatal(err)
+	}
+
+	// A dry run checks that the secret exists and decrypts nothing.
+	var plan bytes.Buffer
+	if _, err := h.Client.Deploy(ctx(), []byte(definitionWithSecretFiles), api.DeployOptions{DryRun: true}, &plan); err != nil {
+		t.Fatalf("dry run: %v\n%s", err, plan.String())
+	}
+	if !strings.Contains(plan.String(), "copied in before it starts: /run/secrets/DATABASE_URL") || strings.Contains(plan.String(), "hunter2") {
+		t.Errorf("the plan does not mention the file, or shows the value:\n%s", plan.String())
+	}
+
+	var out bytes.Buffer
+	if _, err := h.Client.Deploy(ctx(), []byte(definitionWithSecretFiles), api.DeployOptions{}, &out); err != nil {
+		t.Fatalf("Deploy() error = %v\n%s", err, out.String())
+	}
+	spec := h.Engine.Specs[0]
+	// The environment says where the file is, never what is in it.
+	if spec.Env["DATABASE_URL_FILE"] != "/run/secrets/DATABASE_URL" {
+		t.Errorf("DATABASE_URL_FILE = %q", spec.Env["DATABASE_URL_FILE"])
+	}
+	if _, inEnv := spec.Env["DATABASE_URL"]; inEnv {
+		t.Error("the secret file's value is in the environment too")
+	}
+	for k, v := range spec.Env {
+		if strings.Contains(v, "hunter2") {
+			t.Errorf("%s carries the value", k)
+		}
+	}
+	// A secret under secrets: stays an environment variable.
+	if spec.Env["API_KEY"] != "k-123" {
+		t.Errorf("API_KEY = %q, want it in the environment as before", spec.Env["API_KEY"])
+	}
+	if len(spec.Files) != 1 || spec.Files[0].Path != "/run/secrets/DATABASE_URL" || string(spec.Files[0].Content) != "postgres://user:hunter2@db/app" || spec.Files[0].Mode != 0o444 {
+		t.Errorf("files = %+v", spec.Files)
+	}
+	if strings.Contains(out.String(), "hunter2") {
+		t.Error("the value appears in the deploy output")
+	}
+}
+
+func TestDeployWithAMissingSecretFileIsRefused(t *testing.T) {
+	h := servertest.New(t)
+	if err := h.Client.SetSecret(ctx(), "orders-api", "API_KEY", []byte("k-123")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := h.Client.Deploy(ctx(), []byte(definitionWithSecretFiles), api.DeployOptions{}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "DATABASE_URL") || !strings.Contains(err.Error(), "not set") {
+		t.Fatalf("Deploy() without the secret file's value = %v", err)
+	}
+	if len(h.Engine.Specs) != 0 {
+		t.Error("a container was started although a secret was missing")
+	}
+}

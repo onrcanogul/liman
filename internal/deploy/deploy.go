@@ -104,6 +104,10 @@ type Options struct {
 	Confirm func(step pipeline.Step) (bool, error)
 	// OnEvent, when set, receives every executed run and undo.
 	OnEvent func(release string, ev pipeline.Event)
+	// SecretFiles holds the values of the app's secret_files, by name.
+	// They are written to /run/secrets/<NAME> in the new container before
+	// it starts. Empty in a dry run, which does not decrypt anything.
+	SecretFiles map[string][]byte
 }
 
 // Result describes a deploy. Release and Container are always set; HostPort
@@ -163,6 +167,15 @@ func (d *Deployer) Deploy(ctx context.Context, a *app.App, opts Options) (Result
 	if err != nil {
 		return Result{}, fmt.Errorf("resources.memory: %w", err)
 	}
+	// An empty file where a secret should be would start the app with a
+	// wrong value; better not to start it at all.
+	if !opts.DryRun {
+		for _, name := range a.SecretFiles {
+			if _, ok := opts.SecretFiles[name]; !ok {
+				return Result{}, fmt.Errorf("secret_files: no value was given for %s", name)
+			}
+		}
+	}
 
 	release := d.NewRelease()
 	res := Result{Release: release, Container: a.Name + "-" + release}
@@ -178,6 +191,7 @@ func (d *Deployer) Deploy(ctx context.Context, a *app.App, opts Options) (Result
 		memory:      memory,
 		container:   res.Container,
 		release:     release,
+		secretFiles: opts.SecretFiles,
 	}
 
 	popts := pipeline.Options{
@@ -211,6 +225,8 @@ type state struct {
 	memoryLimit string // as written in the definition, for messages
 
 	memory int64
+	// secretFiles are the values of the app's secret_files, by name.
+	secretFiles map[string][]byte
 	// container is the container being brought into service: the new one
 	// in a deploy, the previous one in a rollback.
 	container string
@@ -274,6 +290,7 @@ func (d *Deployer) steps(st *state) []pipeline.Step {
 					ContainerPort: a.Port,
 					HostPort:      st.hostPort,
 					Env:           a.Env,
+					Files:         secretFiles(a, st.secretFiles),
 					MemoryBytes:   st.memory,
 					CPUs:          a.Resources.CPUs,
 					Release:       st.release,
@@ -574,7 +591,27 @@ func runCommand(st *state) string {
 	}
 
 	fmt.Fprintf(&b, " %s", a.Image)
+	if len(a.SecretFiles) > 0 {
+		// docker run cannot do this part; liman creates the container,
+		// copies the files in, and only then starts it.
+		paths := make([]string, len(a.SecretFiles))
+		for i, name := range a.SecretFiles {
+			paths[i] = app.SecretFilePath(name)
+		}
+		fmt.Fprintf(&b, "   # copied in before it starts: %s", strings.Join(paths, ", "))
+	}
 	return b.String()
+}
+
+// secretFiles turns the values of the app's secret_files into files for
+// the engine: /run/secrets/<NAME>, readable by every user in the container
+// (the app may not run as root; the container is the app's alone).
+func secretFiles(a *app.App, values map[string][]byte) []engine.File {
+	var files []engine.File
+	for _, name := range a.SecretFiles {
+		files = append(files, engine.File{Path: app.SecretFilePath(name), Content: values[name], Mode: 0o444})
+	}
+	return files
 }
 
 func healthCommand(st *state) string {

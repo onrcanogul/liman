@@ -450,3 +450,16 @@ func TestIndentWriter(t *testing.T) {
 		t.Errorf("output = %q, want %q", out.String(), want)
 	}
 }
+
+func TestDeployRefusesASecretFileWithoutValue(t *testing.T) {
+	fake := enginetest.New()
+	d := newTestDeployer(fake, io.Discard)
+	a := testApp()
+	a.SecretFiles = []string{"TLS_KEY"}
+	if _, err := d.Deploy(context.Background(), a, Options{}); err == nil || !strings.Contains(err.Error(), "no value was given for TLS_KEY") {
+		t.Fatalf("Deploy() = %v, want a refusal", err)
+	}
+	if len(fake.Running()) != 0 {
+		t.Error("a container was started")
+	}
+}
