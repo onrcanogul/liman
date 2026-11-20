@@ -8,11 +8,22 @@ LDFLAGS := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
            -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
            -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: build test test-integration load-test lint fmt check clean dev-nginx dev-nginx-stop dev-cert
+.PHONY: build release test test-integration load-test lint fmt check clean dev-nginx dev-nginx-stop dev-cert
 
 build: ## Build the CLI (bin/liman) and the daemon (bin/limand)
 	go build -ldflags "$(LDFLAGS)" -o bin/liman ./cmd/liman
 	go build -ldflags "$(LDFLAGS)" -o bin/limand ./cmd/limand
+
+# The binaries contain no C code (the SQLite driver is pure Go), so building
+# for another operating system and CPU needs no cross-compiler: GOOS and
+# GOARCH are all it takes. -trimpath leaves this machine's paths out.
+release: ## Build for Linux servers into dist/ (amd64 and arm64)
+	@for arch in amd64 arm64; do \
+		for cmd in liman limand; do \
+			echo "dist/$$cmd-linux-$$arch"; \
+			CGO_ENABLED=0 GOOS=linux GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" -o dist/$$cmd-linux-$$arch ./cmd/$$cmd || exit 1; \
+		done; \
+	done
 
 test: ## Run all tests with the race detector
 	go test -race ./...
@@ -41,4 +52,4 @@ dev-cert: ## Create a self-signed certificate: make dev-cert DOMAIN=whoami.local
 	./scripts/dev-cert.sh $(DOMAIN)
 
 clean:
-	rm -rf bin
+	rm -rf bin dist
