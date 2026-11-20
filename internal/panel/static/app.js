@@ -1319,7 +1319,7 @@ function viewTokens() {
     })))), { flush: true }));
   out.push(h('div', { class: 'hint' }, '“Last used” is written down at most once a minute. Tokens are created on the server, never here: ',
     h('code', { text: 'limand token create <name>' }), ', with ', h('code', { text: '--read-only' }), ' for one that can only look, ', h('code', { text: '--app <app>' }), ' for one that sees and changes only that app, ',
-    h('code', { text: '--deploy --app <app>' }), ' for a CI pipeline\u2019s deploy key, which can trigger deploys of that app and nothing else, and ', h('code', { text: '--expires 30d' }), ' for one that stops working by itself.'));
+    h('code', { text: '--deploy --app <app>' }), ' for another deploy key of an app registered with ', h('code', { text: 'limand app create' }), ', which can trigger its deploys and nothing else, and ', h('code', { text: '--expires 30d' }), ' for one that stops working by itself.'));
   return out;
 }
 function dlgRevokeToken(t) {

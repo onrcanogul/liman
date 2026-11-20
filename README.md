@@ -192,25 +192,23 @@ containers it started itself (label `liman.app`).
 
 ## Deploying from CI
 
-A pipeline that builds and pushes an image can deploy it as its last step,
-whatever runs it (GitHub Actions, GitLab CI, Jenkins, a script) and
-whichever registry holds the image. It sends one request with the app's
-name and the **digest** of the image it just pushed:
+An app can be deployed by its pipeline alone, whatever runs it (GitHub
+Actions, GitLab CI, Jenkins, a script) and whichever registry holds its
+images. Nobody deploys it by hand, not even the first time: app.yaml lives
+in the repository next to the code, and every run of the pipeline sends it
+along with the **digest** of the image it just pushed.
 
 ```
-docker push → digest (sha256:…) → POST /hooks/deploy {"app", "digest"} → liman deploys repo@digest
+docker push → digest (sha256:…) → POST /hooks/deploy {app.yaml, digest, variables}
+                                → liman deploys <repository>@<digest> with that definition
 ```
 
-liman deploys the app again with everything from its last deploy made by
-hand, the image replaced by `<the app's repository>@<digest>`. A digest is
-the hash of the image's content: unlike a tag, it cannot be moved to
-another image while the deploy runs, and the release records exactly
-which image ran. Nobody edits `app.yaml` for a new version; it changes only
-when the domain, secrets or limits do, and is then deployed with
-`liman deploy` as before.
+A digest is the hash of the image's content: unlike a tag, it cannot be
+moved to another image while the deploy runs, and the release records
+exactly which image ran.
 
-**On the server**, turn the trigger endpoint on. It gets a listener of its
-own, which serves `POST /hooks/deploy` and nothing else:
+**On the server, once**, turn the trigger endpoint on. It gets a listener of
+its own, which serves `POST /hooks/deploy` and nothing else:
 
 ```yaml
 # config.yaml
@@ -242,16 +240,34 @@ server {
 Even a mistake in that file cannot expose the management API: it is not
 served on that listener.
 
-**Per app**, deploy it once by hand (that is the definition triggers
-repeat), and create a deploy key for its pipeline:
+**Per app, once**, register it. The registration fixes what its pipeline
+may not change, the image's repository and the domain, and creates its
+deploy key:
 
 ```
-liman deploy app.yaml
-limand token create orders-ci --deploy --app orders-api
+limand app create orders-api --repo ghcr.io/team/orders-api --domain api.example.com
+limand app list
+limand app delete orders-api          # its pipeline can no longer deploy it
 ```
 
 Store the key as a secret variable of the CI system, `LIMAN_TOKEN`, and the
-public address as `LIMAN_URL` (`https://ops.example.com`).
+public address as `LIMAN_URL` (`https://ops.example.com`). Another key for
+the same app: `limand token create <name> --deploy --app orders-api`.
+
+**In the repository**, app.yaml names the repository without a version
+(the digest says which image) and refers to secrets by name:
+
+```yaml
+name: orders-api
+image: ghcr.io/team/orders-api
+domain: api.example.com
+port: 3000
+env:
+  LOG_LEVEL: info
+  DATABASE_URL: ${DATABASE_URL}     # the value is a secret of the CI system
+healthcheck:
+  path: /health
+```
 
 **In the pipeline**, with GitHub Actions:
 
@@ -260,42 +276,74 @@ public address as `LIMAN_URL` (`https://ops.example.com`).
   id: build
   with:
     push: true
-    tags: ghcr.io/user/orders-api:${{ github.sha }}
+    tags: ghcr.io/team/orders-api:${{ github.sha }}
 - name: Deploy
   env:
     LIMAN_URL: ${{ secrets.LIMAN_URL }}
     LIMAN_TOKEN: ${{ secrets.LIMAN_TOKEN }}
-  run: liman trigger --app orders-api --digest "${{ steps.build.outputs.digest }}"
+    DATABASE_URL: ${{ secrets.DATABASE_URL }}
+  run: liman trigger --digest "${{ steps.build.outputs.digest }}" --file app.yaml
 ```
 
-Anywhere else, `docker buildx build --push --metadata-file meta.json` writes
-the digest to `containerimage.digest` in `meta.json`, and plain `curl`
-does what `liman trigger` does:
-
-```
-curl -fsS -N https://ops.example.com/hooks/deploy \
-  -H "Authorization: Bearer $LIMAN_TOKEN" \
-  -d "{\"app\":\"orders-api\",\"digest\":\"$DIGEST\"}"
-```
+`liman trigger` sends the file as it is and the values of the variables
+its env values refer to, from its own environment; a variable named in a
+comment or elsewhere is not sent. Anywhere else, `docker buildx build
+--push --metadata-file meta.json` writes the digest to
+`containerimage.digest` in `meta.json`, and `docker push` prints it. Not
+`docker inspect`'s `RepoDigests`: for an image pulled from elsewhere it
+may list another registry's digest first, one the app's repository does
+not have (found in a trial; liman refuses it with 422).
 
 The answer streams the deploy's progress like `liman deploy`; the last line
 is the result. `liman trigger` exits non-zero when the deploy failed (and
 was rolled back), so the pipeline fails with it.
+
+**What a deploy does depends on what changed.** liman fills in the
+variables, takes a checksum of the definition (of its values, so that
+comments, order and quoting do not count) and compares it with the last
+triggered deploy's:
+
+| The pipeline sends | liman |
+|---|---|
+| The same definition and the same image, still running | Nothing: `already runs this definition and image`. A pipeline run again is harmless |
+| The same definition, a new image | Deploys the image |
+| A changed definition | Deploys it, and names the changed values (`env.LOG_LEVEL`, `port`) in the answer and the audit trail, never what they are |
+
+A deploy by hand, a rollback or a stop makes the next trigger deploy
+whatever it brings. A stopped app is deployed again by its next push: it
+is registered; unregister it to keep it away.
+
+Variables are filled in after app.yaml has been parsed, in env values
+only, and a value goes in as it is. Filling in the text first, as
+`envsubst` does, was tried and is wrong three ways: a secret with ` #` in
+it was cut short (YAML read the rest as a comment), a value with a line
+break added keys of its own, and a variable that was not set became an
+empty string without a word. Here a variable that is not set is an error.
+
+What liman keeps is checksums: an HMAC of the whole definition and one of
+each value, with a key derived from the master key. A plain hash would
+give a short secret away to anyone who can guess it (one of six digits
+took 1.5 seconds in a trial); the values themselves are not stored at
+all, only passed to the container.
 
 What liman checks before anything changes:
 
 | Check | Answer |
 |---|---|
 | The token is a deploy key, for this app | 401 / 403 |
-| The body is `{"app","digest"}` and nothing else, at most 4 KiB; the digest is `sha256:` and 64 hexadecimal digits | 400 |
+| The body is `{"app","digest","definition","vars"}`, the digest `sha256:` and 64 hexadecimal digits | 400 |
 | The key has triggered fewer than 6 deploys in the last minute | 429 with `Retry-After` |
-| The app has a deploy made by hand to repeat, and has not been stopped since | 404 |
-| The registry has that digest in the app's own repository (asked without downloading, with the credentials of `docker login`) | 422; 502 if the registry cannot be asked |
-| No other deploy of the app is running | 409 |
+| The app is registered | 404 |
+| The definition is this app's, its repository and domain the registered ones | 400 / 403 |
+| Every variable its env values refer to is sent, and the definition is valid | 400 |
+| The registry has that digest in the app's repository (asked without downloading, with the credentials of `docker login`) | 422; 502 if the registry cannot be asked |
+| No other operation on the app is running | 409 |
 
-The repository always comes from the app's definition, never from the
-request: a deploy key chooses an image of its app, not any image. Stopping
-an app forgets its definition, so the next push does not bring it back.
+A registered domain is the app's even before its first deploy: no other
+app can be deployed with it.
+
+`liman deploy app.yaml` with an admin token still works, for trying things
+out and for emergencies; nothing needs it.
 
 ## Secrets
 
@@ -481,7 +529,7 @@ limand token create <name>                         # prints the token once
 limand token create <name> --write-client <file>   # writes a client.yaml instead
 limand token create <name> --expires 90d           # stops working after 90 days (or 12h)
 limand token create <name> --app orders-api        # only this app; repeat --app for more
-limand token create <name> --deploy --app orders-api  # a deploy key for a pipeline
+limand token create <name> --deploy --app orders-api  # another deploy key for a registered app
 limand token list                                  # with scope, apps, expiry and last use
 limand token revoke <name>
 ```
@@ -573,7 +621,7 @@ The environment variables `LIMAN_URL` and `LIMAN_TOKEN` take precedence.
 | `GET /v1/audit[?app=][&limit=]` | The audit trail: who changed what, oldest first; a token limited to apps sees theirs |
 | `GET /v1/audit/verify` | Check the whole audit trail |
 | `GET /ui/` | The panel's files; no token needed, they contain no data |
-| `POST /hooks/deploy` | On the `hooks.listen` listener only, with a deploy key. Body: `{"app","digest"}`. Deploys the app again with that image; streams like a deploy |
+| `POST /hooks/deploy` | On the `hooks.listen` listener only, with a deploy key. Body: `{"app","digest","definition","vars"}`. Deploys a registered app with that definition and image, or does nothing if they already run; streams like a deploy |
 
 ## Audit trail
 
@@ -655,12 +703,14 @@ is equivalent to root. The API is built around keeping everyone else out:
   be reachable from the internet, and it takes deploy keys
   (`--deploy`) only: a leaked admin token is no more use there than a
   wrong one. A deploy key is in turn refused by the whole management API,
-  `GET` included, since it lives in a CI system's settings. It always
-  names its apps, and can only deploy an image that is in the app's own
-  repository: a leaked key can deploy what anyone with push access to
-  that repository could, an older version included, at most six times a
-  minute. Revoke it and create another; the audit trail shows what it
-  deployed. Behind Nginx every caller has Nginx's address, so the lockout
+  `GET` included, since it lives in a CI system's settings. It is for
+  registered apps only, and cannot change what their registration fixes:
+  the image's repository and the domain. Within its app it can change
+  everything else, env values included: a leaked key could point the app
+  at another database, or deploy an older image of its repository, at
+  most six times a minute. It cannot read the values that run, nor run an
+  image of its own. Revoke it and create another; the audit trail shows
+  what it deployed and which values it changed. Behind Nginx every caller has Nginx's address, so the lockout
   after failed attempts counts them all together; a valid key is never
   locked out. Limit per caller in Nginx (`limit_req`) if you want that.
 - **Audit trail.** Every change is recorded with who made it (see Audit
