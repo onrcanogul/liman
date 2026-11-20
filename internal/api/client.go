@@ -71,6 +71,26 @@ func (c *Client) Trigger(ctx context.Context, req TriggerRequest, out io.Writer)
 	return c.runStreamed(ctx, "/hooks/deploy", "application/json", bytes.NewReader(body), DeployOptions{}, out)
 }
 
+// Preview asks the daemon's hooks listener what a deploy of req's
+// definition would change, without deploying it. The client's token must
+// be a preview or deploy key for the app.
+func (c *Client) Preview(ctx context.Context, req TriggerRequest) (*Preview, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(ctx, http.MethodPost, "/hooks/preview", nil, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var p Preview
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	return &p, nil
+}
+
 // runStreamed posts to an endpoint that answers with a stream of
 // DeployEvents and follows that stream to its result.
 func (c *Client) runStreamed(ctx context.Context, path, contentType string, body io.Reader, opts DeployOptions, out io.Writer) (*DeployResult, error) {

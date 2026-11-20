@@ -133,17 +133,17 @@ func (s *Server) authenticate(next http.Handler, aud audience) http.Handler {
 		s.recordUse(r.Context(), info)
 
 		switch {
-		case aud == triggerEndpoint && info.Scope != store.ScopeDeploy:
+		case aud == triggerEndpoint && info.Scope != store.ScopeDeploy && info.Scope != store.ScopePreview:
 			// Somebody put a token that can do far more into a pipeline,
 			// or tried one from outside. Either way the owner should know.
-			s.logger().Warn("a token that is not a deploy key was used on the trigger endpoint",
+			s.logger().Warn("a token that is not a deploy or preview key was used on the trigger endpoint",
 				"token", info.Name, "scope", info.Scope, "remote", r.RemoteAddr)
-			writeError(w, http.StatusForbidden, errors.New("only deploy keys are accepted here; create one with: limand token create <name> --app <app> --deploy"))
+			writeError(w, http.StatusForbidden, errors.New("only deploy and preview keys are accepted here; create one with: limand token create <name> --app <app> --deploy (or --preview)"))
 			return
-		case aud == managementAPI && info.Scope == store.ScopeDeploy:
-			// Not even GET: a deploy key sits in a CI system's settings,
-			// and must not be able to read what runs here either.
-			writeError(w, http.StatusForbidden, errors.New("this is a deploy key; it only triggers deploys, on the hooks listener"))
+		case aud == managementAPI && (info.Scope == store.ScopeDeploy || info.Scope == store.ScopePreview):
+			// Not even GET: these keys sit in a CI system's settings, and
+			// must not be able to read what runs here either.
+			writeError(w, http.StatusForbidden, fmt.Errorf("this is a %s key; it works only on the hooks listener", info.Scope))
 			return
 		// A read-only token may look and nothing else. The rule is about
 		// the method, not a list of paths: an endpoint added later is

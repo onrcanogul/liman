@@ -9,9 +9,11 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/server/servertest"
+	"github.com/onrcanogul/liman/internal/store"
 )
 
 // digest returns a valid digest made of c.
@@ -151,7 +153,7 @@ func TestTriggerRefusals(t *testing.T) {
 		status            int
 		contains          string
 	}{
-		{"admin token", h.Client.Token, jsonOf(t, ok), http.StatusForbidden, "only deploy keys"},
+		{"admin token", h.Client.Token, jsonOf(t, ok), http.StatusForbidden, "only deploy and preview keys"},
 		{"another app's key", other, jsonOf(t, ok), http.StatusForbidden, "limited to billing"},
 		{"not registered", goneKey, with(func(r *api.TriggerRequest) {
 			r.App = "gone"
@@ -306,5 +308,110 @@ func TestTriggersPerKeyAreLimited(t *testing.T) {
 	// The limit is the key's, not the app's.
 	if status, body := trigger(t, h, other, missing); status != http.StatusUnprocessableEntity {
 		t.Errorf("another key = %d %s; want 422", status, body)
+	}
+}
+
+// previewKey returns a client with a preview key for orders-api.
+func previewKey(t *testing.T, h *servertest.Harness, name string) (string, *api.Client) {
+	t.Helper()
+	token, err := h.Store.CreateScopedToken(ctx(), name, store.ScopePreview, time.Time{}, "orders-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return token, &api.Client{BaseURL: h.HookURL, Token: token}
+}
+
+func TestPreviewComparesTheDefinitionAsWritten(t *testing.T) {
+	h, _, ci := registered(t)
+	_, pr := previewKey(t, h, "orders-pr")
+	preview := func(definition, d string) *api.Preview {
+		t.Helper()
+		p, err := pr.Preview(ctx(), api.TriggerRequest{App: "orders-api", Digest: d, Definition: definition})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	// Before any trigger there is nothing to compare with.
+	if p := preview(pipelineApp, ""); !p.OK || p.Compared || p.Running != "" || !slices.Equal(p.Variables, []string{"DATABASE_URL"}) {
+		t.Errorf("first preview = %+v", p)
+	}
+
+	if _, err := ci.Trigger(ctx(), triggerReq(digest("a"), pipelineApp, "secret-1"), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	starts := len(h.Engine.Specs)
+
+	// The same file: no change, whatever the secret's value is now.
+	p := preview(pipelineApp, digest("a"))
+	if !p.OK || !p.Compared || p.Running == "" || len(p.Changed)+len(p.Added)+len(p.Removed) != 0 || p.Image == nil || !p.Image.Exists || !p.Image.Running {
+		t.Errorf("preview of the same = %+v (image %+v)", p, p.Image)
+	}
+
+	// A changed value, an added one, a removed one, a renamed variable.
+	edited := strings.Replace(pipelineApp, "LOG_LEVEL: info", "LOG_LEVEL: debug\n  NEW_FLAG: on", 1)
+	edited = strings.Replace(edited, "${DATABASE_URL}", "${DB_URL}", 1)
+	edited = strings.Replace(edited, "healthcheck:\n  path: /health\n", "", 1)
+	p = preview(edited, digest("b"))
+	if !p.OK || !slices.Equal(p.Changed, []string{"env.DATABASE_URL", "env.LOG_LEVEL"}) || !slices.Equal(p.Added, []string{"env.NEW_FLAG"}) || !slices.Equal(p.Removed, []string{"healthcheck.path"}) {
+		t.Errorf("preview of an edited file = %+v", p)
+	}
+	if p.Image == nil || !p.Image.Exists || p.Image.Running || !slices.Equal(p.Variables, []string{"DB_URL"}) {
+		t.Errorf("preview image %+v, variables %v", p.Image, p.Variables)
+	}
+
+	// What is wrong is the answer, not an error.
+	p = preview(strings.Replace(pipelineApp, "port: 3000", "port: 0", 1), digest("c"))
+	if p.OK || len(p.Problems) != 2 || !strings.Contains(p.Problems[0], "port") || !strings.Contains(p.Problems[1], "not in the registry") {
+		t.Errorf("preview of a broken definition = %+v", p)
+	}
+	p = preview(strings.Replace(pipelineApp, "domain: api.example.com", "domain: evil.example.com", 1), "")
+	if p.OK || len(p.Problems) != 1 || !strings.Contains(p.Problems[0], "registered with api.example.com") {
+		t.Errorf("preview with another domain = %+v", p)
+	}
+
+	// Nothing was deployed or recorded by any of it.
+	if len(h.Engine.Specs) != starts {
+		t.Errorf("a preview started %d containers", len(h.Engine.Specs)-starts)
+	}
+	if entries, _ := h.Client.Audit(ctx(), "orders-api", 10); len(entries) != 1 {
+		t.Errorf("audit has %d entries; want the one deploy", len(entries))
+	}
+}
+
+func TestPreviewKeysPreviewOnly(t *testing.T) {
+	h, deployKey, _ := registered(t)
+	key, _ := previewKey(t, h, "orders-pr")
+
+	if status, body := trigger(t, h, key, jsonOf(t, triggerReq(digest("a"), pipelineApp, "x"))); status != http.StatusForbidden || !strings.Contains(body, "preview key") {
+		t.Errorf("a preview key on /hooks/deploy = %d %s; want 403", status, body)
+	}
+	if status, body := statusOf(t, h, key, http.MethodGet, "/v1/apps"); status != http.StatusForbidden || !strings.Contains(body, "preview key") {
+		t.Errorf("a preview key on the API = %d %s; want 403", status, body)
+	}
+	post := func(token, body string) (int, string) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, h.HookURL+"/hooks/preview", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode, string(b)
+	}
+	// A deploy key may preview; an admin token may not.
+	clean := jsonOf(t, api.TriggerRequest{App: "orders-api", Definition: pipelineApp})
+	if status, body := post(deployKey, clean); status != http.StatusOK {
+		t.Errorf("a deploy key previewing = %d %s", status, body)
+	}
+	if status, _ := post(h.Client.Token, clean); status != http.StatusForbidden {
+		t.Errorf("an admin token previewing = %d; want 403", status)
+	}
+	// Secrets are refused, so that nobody wires them into a pull request.
+	if status, body := post(key, jsonOf(t, triggerReq("", pipelineApp, "secret"))); status != http.StatusBadRequest || !strings.Contains(body, "takes no variable values") {
+		t.Errorf("a preview with variable values = %d %s; want 400", status, body)
 	}
 }

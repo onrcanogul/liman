@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,16 +35,17 @@ const maxTriggerBytes = maxDefinitionBytes + 64<<10
 // loop must not keep the server busy deploying.
 const triggersPerMinute = 6
 
-// HookHandler returns the handler for the trigger endpoint: POST
-// /hooks/deploy, and nothing else. It is meant for a listener of its own
-// that a reverse proxy exposes to the internet, so that the management API
-// stays local whatever that proxy is told.
+// HookHandler returns the handler for the endpoints pipelines call: POST
+// /hooks/deploy and POST /hooks/preview, and nothing else. It is meant for
+// a listener of its own that a reverse proxy exposes to the internet, so
+// that the management API stays local whatever that proxy is told.
 func (s *Server) HookHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /hooks/deploy", s.handleTrigger)
+	mux.HandleFunc("POST /hooks/preview", s.handlePreview)
 
 	// The same middleware as the API, in the same order (see Handler),
-	// except that only deploy keys get through.
+	// except that only deploy and preview keys get through.
 	var h http.Handler = mux
 	h = s.authenticate(h, triggerEndpoint)
 	h = s.rejectBrowsers(h)
@@ -54,45 +56,44 @@ func (s *Server) HookHandler() http.Handler {
 	return h
 }
 
-// handleTrigger deploys a registered app with the definition and the
-// image a pipeline sends: app.yaml from the repository, the values of the
-// variables it refers to, and the digest of the image it pushed.
-func (s *Server) handleTrigger(w http.ResponseWriter, r *http.Request) {
+// pipelineRequest reads what both hooks take, and checks what they share:
+// the body, the app and the key's right to it, the key's rate, and the
+// registration. It has answered the client when ok is false.
+func (s *Server) pipelineRequest(w http.ResponseWriter, r *http.Request, needDigest bool) (req api.TriggerRequest, reg store.Registration, ok bool) {
 	ctx := r.Context()
 	// Without its key the checksum would be a plain hash, which gives
 	// short secrets away.
 	if len(s.ChecksumKey) == 0 {
 		writeError(w, http.StatusInternalServerError, errors.New("this daemon has no checksum key; triggers are off"))
-		return
+		return req, reg, false
 	}
 
 	body, err := s.readBody(w, r, maxTriggerBytes)
 	if err != nil {
-		writeError(w, bodyErrorStatus(err), fmt.Errorf("read trigger: %w", err))
-		return
+		writeError(w, bodyErrorStatus(err), fmt.Errorf("read request: %w", err))
+		return req, reg, false
 	}
-	var req api.TriggerRequest
 	dec := json.NewDecoder(bytes.NewReader(body))
 	// A misspelled field ("digets") is an error, not an empty digest.
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("read trigger: %w", err))
-		return
+		writeError(w, http.StatusBadRequest, fmt.Errorf("read request: %w", err))
+		return req, reg, false
 	}
 	if dec.Decode(&struct{}{}) != io.EOF {
-		writeError(w, http.StatusBadRequest, errors.New("read trigger: one JSON object expected"))
-		return
+		writeError(w, http.StatusBadRequest, errors.New("read request: one JSON object expected"))
+		return req, reg, false
 	}
 	if !app.ValidName(req.App) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid app name %q", req.App))
-		return
+		return req, reg, false
 	}
-	if !engine.ValidDigest(req.Digest) {
+	if (needDigest || req.Digest != "") && !engine.ValidDigest(req.Digest) {
 		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid digest %q: want sha256: and 64 hexadecimal digits", req.Digest))
-		return
+		return req, reg, false
 	}
 	if !s.mayUse(w, r, req.App) {
-		return
+		return req, reg, false
 	}
 
 	// Counted from here, whatever the outcome: asking the registry about
@@ -100,23 +101,47 @@ func (s *Server) handleTrigger(w http.ResponseWriter, r *http.Request) {
 	m := metaOf(ctx)
 	if wait, ok := s.triggers.allow(m.token+"\x00"+m.created.Format(time.RFC3339Nano), time.Now()); !ok {
 		w.Header().Set("Retry-After", retryAfter(wait))
-		writeError(w, http.StatusTooManyRequests, fmt.Errorf("this key may trigger %d deploys a minute; try again in %s", triggersPerMinute, wait.Round(time.Second)))
-		return
+		writeError(w, http.StatusTooManyRequests, fmt.Errorf("this key may be used %d times a minute; try again in %s", triggersPerMinute, wait.Round(time.Second)))
+		return req, reg, false
 	}
 
 	reg, found, err := s.Store.Registration(ctx, req.App)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
-		return
+		return req, reg, false
 	}
 	if !found {
 		writeError(w, http.StatusNotFound, fmt.Errorf("%s is not registered; register it on the server with: limand app create %s --repo <repository> --domain <domain>", req.App, req.App))
+		return req, reg, false
+	}
+	return req, reg, true
+}
+
+// handleTrigger deploys a registered app with the definition and the
+// image a pipeline sends: app.yaml from the repository, the values of the
+// variables it refers to, and the digest of the image it pushed.
+func (s *Server) handleTrigger(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	// The hooks listener takes preview keys too; they deploy nothing.
+	if metaOf(ctx).scope != store.ScopeDeploy {
+		writeError(w, http.StatusForbidden, errors.New("this is a preview key; it can only preview (liman preview), not deploy"))
+		return
+	}
+	req, reg, ok := s.pipelineRequest(w, r, true)
+	if !ok {
 		return
 	}
 
-	a, status, err := s.triggeredApp(req, reg)
+	a, status, err := s.checkDefinition(req, reg)
 	if err != nil {
 		writeError(w, status, err)
+		return
+	}
+	// As written, ${NAME} and all, for previews to compare with; then
+	// with the values it runs with.
+	templates := s.keyedFields(a.Fields())
+	if err := a.FillEnv(req.Vars); err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 
@@ -174,26 +199,111 @@ func (s *Server) handleTrigger(w http.ResponseWriter, r *http.Request) {
 		changed: changed,
 		onSuccess: func(ctx context.Context, release string) error {
 			return s.Store.SaveDeployState(ctx, store.DeployState{
-				App: a.Name, Release: release, Image: image, Checksum: checksum, Fields: keyed,
+				App: a.Name, Release: release, Image: image, Checksum: checksum, Fields: keyed, Templates: templates,
 			})
 		},
 	})
 }
 
-// triggeredApp decodes the definition of a trigger, checks it against the
-// registration and fills in its variables. The status goes with the error.
-func (s *Server) triggeredApp(req api.TriggerRequest, reg store.Registration) (*app.App, int, error) {
+// zeroDigest stands in for the digest of a preview without one: the
+// definition is validated with it, and nothing is asked about it.
+var zeroDigest = "sha256:" + strings.Repeat("0", 64)
+
+// handlePreview says what a deploy of this definition would change, and
+// what is wrong with it, without deploying or recording anything. It is
+// for pull requests: it needs no secrets, only the names of the variables
+// it compares. The image is checked only when its digest is given.
+func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	req, reg, ok := s.pipelineRequest(w, r, false)
+	if !ok {
+		return
+	}
+	// A pull request's pipeline must not hold the secrets: refusing them
+	// says so to whoever wires it up.
+	if len(req.Vars) > 0 {
+		writeError(w, http.StatusBadRequest, errors.New("a preview takes no variable values: it compares app.yaml as written, and a pull request's pipeline should not hold the secrets"))
+		return
+	}
+
+	p := api.Preview{App: req.App}
+	reply := func() {
+		p.OK = len(p.Problems) == 0
+		writeJSON(w, http.StatusOK, p)
+	}
+
+	// What is wrong with the definition is the answer, not an error.
+	a, _, err := s.checkDefinition(req, reg)
+	if err != nil {
+		p.Problems = append(p.Problems, err.Error())
+		reply()
+		return
+	}
+	values := make([]string, 0, len(a.Env))
+	for _, v := range a.Env {
+		values = append(values, v)
+	}
+	p.Variables = app.Variables([]byte(strings.Join(values, "\n")))
+	templates := s.keyedFields(a.Fields())
+
+	digest := req.Digest
+	if digest == "" {
+		digest = zeroDigest
+	}
+	image := reg.Repo + "@" + digest
+	a.Image = image
+	if err := a.Validate(); err != nil {
+		p.Problems = append(p.Problems, strings.Split(err.Error(), "\n")...)
+	}
+
+	last, haveLast, err := s.Store.DeployStateOf(ctx, a.Name)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	if haveLast {
+		p.Running = last.Release
+		// A state saved before templates were kept has nothing to compare.
+		if len(last.Templates) > 0 {
+			p.Compared = true
+			p.Changed, p.Added, p.Removed = splitChanges(last.Templates, templates)
+		}
+	}
+
+	if req.Digest != "" {
+		eng, err := s.Connect(ctx)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		exists, err := eng.ImageExists(ctx, image)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		p.Image = &api.PreviewImage{Digest: req.Digest, Exists: exists, Running: haveLast && last.Image == image}
+		if !exists {
+			p.Problems = append(p.Problems, fmt.Sprintf("%s is not in the registry", image))
+		}
+	}
+	reply()
+}
+
+// checkDefinition decodes the definition a pipeline sent and checks it
+// against the registration. Its variables are not filled in, and its
+// image is the registered repository. The status goes with the error.
+func (s *Server) checkDefinition(req api.TriggerRequest, reg store.Registration) (*app.App, int, error) {
 	if req.Definition == "" {
-		return nil, http.StatusBadRequest, errors.New("the trigger has no definition; send app.yaml with it (liman trigger --file app.yaml)")
+		return nil, http.StatusBadRequest, errors.New("no definition was sent; send app.yaml with it (--file app.yaml)")
 	}
 	a, err := app.Decode([]byte(req.Definition))
 	if err != nil {
 		return nil, http.StatusBadRequest, err
 	}
 	if a.Name != req.App {
-		return nil, http.StatusBadRequest, fmt.Errorf("the definition is for %q, the trigger for %q", a.Name, req.App)
+		return nil, http.StatusBadRequest, fmt.Errorf("the definition is for %q, the request for %q", a.Name, req.App)
 	}
-	// What a deploy key may not change. The answer says what the
+	// What a pipeline may not change. The answer says what the
 	// registration holds: the key's owner may know it, and it says what
 	// to fix.
 	if repo := engine.Repository(a.Image); repo != reg.Repo {
@@ -202,11 +312,31 @@ func (s *Server) triggeredApp(req api.TriggerRequest, reg store.Registration) (*
 	if a.Domain != reg.Domain {
 		return nil, http.StatusForbidden, fmt.Errorf("domain: %s is registered with %s, not %q; that is changed on the server, not by a pipeline", reg.Name, reg.Domain, a.Domain)
 	}
-	if err := a.FillEnv(req.Vars); err != nil {
-		return nil, http.StatusBadRequest, err
-	}
 	a.Image = reg.Repo
 	return a, http.StatusOK, nil
+}
+
+// splitChanges sorts the paths that differ between before and after into
+// changed, added and removed ones, each sorted.
+func splitChanges(before, after map[string]string) (changed, added, removed []string) {
+	for path, v := range after {
+		old, ok := before[path]
+		switch {
+		case !ok:
+			added = append(added, path)
+		case old != v:
+			changed = append(changed, path)
+		}
+	}
+	for path := range before {
+		if _, ok := after[path]; !ok {
+			removed = append(removed, path)
+		}
+	}
+	slices.Sort(changed)
+	slices.Sort(added)
+	slices.Sort(removed)
+	return changed, added, removed
 }
 
 // checksum is the HMAC of data with the checksum key, in hexadecimal.

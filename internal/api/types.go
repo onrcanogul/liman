@@ -82,6 +82,43 @@ type TriggerRequest struct {
 	Vars map[string]string `json:"vars,omitempty"`
 }
 
+// Preview is the answer to POST /hooks/preview: what a deploy of a
+// definition would change, and what is wrong with it. Nothing was deployed.
+type Preview struct {
+	App string `json:"app"`
+	// OK is true when nothing is wrong: a deploy of it would be accepted.
+	OK bool `json:"ok"`
+	// Problems says what is wrong, one per line.
+	Problems []string `json:"problems,omitempty"`
+
+	// Running is the release the last triggered deploy left running;
+	// absent when there is none to compare with.
+	Running string `json:"running,omitempty"`
+	// Compared is true when the definition was compared with the one that
+	// runs. Values are compared as written, ${NAME} and all: whether a
+	// secret's value changed is not known here.
+	Compared bool     `json:"compared"`
+	Changed  []string `json:"changed,omitempty"`
+	Added    []string `json:"added,omitempty"`
+	Removed  []string `json:"removed,omitempty"`
+
+	// Variables names the variables the definition's env values refer to:
+	// the secrets the deploy's pipeline must have.
+	Variables []string `json:"variables,omitempty"`
+
+	// Image is present when a digest was given.
+	Image *PreviewImage `json:"image,omitempty"`
+}
+
+// PreviewImage is what a preview found out about the image.
+type PreviewImage struct {
+	Digest string `json:"digest"`
+	// Exists says whether the app's repository has it.
+	Exists bool `json:"exists"`
+	// Running says whether it is the image running now.
+	Running bool `json:"running"`
+}
+
 // ConfirmRequest is the body of POST /v1/confirmations/{id}.
 type ConfirmRequest struct {
 	Approve bool `json:"approve"`
