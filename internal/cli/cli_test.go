@@ -709,30 +709,47 @@ func TestStatusNotesAVersionDifference(t *testing.T) {
 
 func TestTrigger(t *testing.T) {
 	h := newHarness(t, "")
-	if code := h.run("deploy", writeFile(t, validDefinition)); code != exitOK {
-		t.Fatal(h.stderr.String())
-	}
+	h.Register(t, "orders-api", "ghcr.io/user/orders-api", "api.example.com")
 	d := "sha256:" + strings.Repeat("0a", 32)
 	h.Engine.Registry = map[string]bool{"ghcr.io/user/orders-api@" + d: true}
 	_, key := h.DeployKey(t, "ci", "orders-api")
 	h.cli.API = key
-	h.stdout.Reset()
+	env := map[string]string{"DATABASE_URL": "postgres://db/x", "UNRELATED": "not sent", "IN_A_COMMENT": "nor this"}
+	h.cli.LookupEnv = func(k string) (string, bool) { v, ok := env[k]; return v, ok }
+	file := writeFile(t, `
+# ${IN_A_COMMENT}
+name: orders-api
+image: ghcr.io/user/orders-api
+domain: api.example.com
+port: 3000
+env:
+  DATABASE_URL: ${DATABASE_URL}
+`)
 
-	if code := h.run("trigger", "--app", "orders-api", "--digest", d); code != exitOK {
+	if code := h.run("trigger", "--digest", d, "--file", file); code != exitOK {
 		t.Fatalf("trigger: code %d, stderr %s", code, h.stderr.String())
 	}
-	if !strings.Contains(h.stdout.String(), "orders-api is running release r2, image "+d) {
+	if !strings.Contains(h.stdout.String(), "orders-api is running release r1, image "+d) {
 		t.Errorf("stdout = %s", h.stdout.String())
 	}
+	if got := h.Engine.Specs[0].Env; got["DATABASE_URL"] != "postgres://db/x" || len(got) != 1 {
+		t.Errorf("env = %v", got)
+	}
+	h.stdout.Reset()
+	if code := h.run("trigger", "--digest", d, "--file", file, "--app", "orders-api"); code != exitOK || !strings.Contains(h.stdout.String(), "nothing to do") {
+		t.Errorf("the same again: code %d, stdout %s", code, h.stdout.String())
+	}
 
+	delete(env, "DATABASE_URL")
 	for _, tt := range []struct {
 		args []string
 		code int
 		want string
 	}{
-		{[]string{"trigger", "--app", "orders-api"}, exitUsage, "usage: liman trigger"},
-		{[]string{"trigger", "--app", "orders-api", "--digest", "latest"}, exitError, "invalid digest"},
-		{[]string{"trigger", "--app", "orders-api", "--digest", "sha256:" + strings.Repeat("ff", 32)}, exitError, "not in the registry"},
+		{[]string{"trigger", "--digest", d}, exitUsage, "usage: liman trigger"},
+		{[]string{"trigger", "--file", file, "--digest", "latest"}, exitError, "invalid digest"},
+		{[]string{"trigger", "--file", file, "--digest", d, "--app", "billing"}, exitError, `not "billing"`},
+		{[]string{"trigger", "--file", file, "--digest", d}, exitError, "DATABASE_URL, not set"},
 	} {
 		h.stderr.Reset()
 		if code := h.run(tt.args...); code != tt.code || !strings.Contains(h.stderr.String(), tt.want) {

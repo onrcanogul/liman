@@ -47,11 +47,13 @@ Commands:
   plan <file>          Same as deploy --dry-run
   rollback [--dry-run] [--step] <app>
                        Put the previous release back into service
-  trigger --app <app> --digest <sha256:...>
-                       From a CI pipeline, after pushing an image: deploy the
-                       app again with the image of its repository that has
-                       this digest. Needs a deploy key (LIMAN_TOKEN) and the
-                       trigger endpoint's address (LIMAN_URL)
+  trigger --digest <sha256:...> --file <app.yaml> [--app <app>]
+                       From a CI pipeline, after pushing an image: deploy a
+                       registered app with this definition and the image of
+                       its repository that has this digest. ${NAME} in env
+                       values is filled from the environment. Needs a deploy
+                       key (LIMAN_TOKEN) and the trigger endpoint's address
+                       (LIMAN_URL)
   ps                   List containers managed by liman
   logs [-f] <app>      Show the logs of an app (-f keeps following)
   stop <app>           Stop and remove an app
@@ -83,6 +85,10 @@ type CLI struct {
 
 	// API is the connection to the daemon.
 	API *api.Client
+
+	// LookupEnv reads an environment variable, for the values a
+	// definition refers to. Nil means os.LookupEnv.
+	LookupEnv func(string) (string, bool)
 
 	// Version is this CLI's version, compared with the daemon's by status.
 	// Empty means buildinfo.Version.
@@ -215,25 +221,56 @@ func (c *CLI) runDeploy(ctx context.Context, args []string, planOnly bool) int {
 }
 
 func (c *CLI) runTrigger(ctx context.Context, args []string) int {
-	const synopsis = "liman trigger --app <app> --digest <sha256:...>"
+	const synopsis = "liman trigger --digest <sha256:...> --file <app.yaml> [--app <app>]"
 
 	fs := flag.NewFlagSet("trigger", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	name := fs.String("app", "", "the app to deploy again")
+	file := fs.String("file", "", "the app's definition, app.yaml")
 	digest := fs.String("digest", "", "the digest of the pushed image")
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *name == "" || *digest == "" {
+	name := fs.String("app", "", "the app; checked against the definition's name")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *file == "" || *digest == "" {
 		return c.usageError(synopsis)
 	}
 	// Checked here so a pipeline with an empty or garbled variable fails
 	// with a clear message; the daemon checks again.
-	if !app.ValidName(*name) {
-		return c.fail(fmt.Errorf("invalid app name %q", *name))
-	}
 	if !engine.ValidDigest(*digest) {
 		return c.fail(fmt.Errorf("invalid digest %q: want sha256: and 64 hexadecimal digits, as docker push prints it", *digest))
 	}
+	definition, err := os.ReadFile(*file)
+	if err != nil {
+		return c.fail(fmt.Errorf("read app definition: %w", err))
+	}
+	a, err := app.Decode(definition)
+	if err != nil {
+		return c.fail(fmt.Errorf("%s: %w", *file, err))
+	}
+	if *name != "" && *name != a.Name {
+		return c.fail(fmt.Errorf("%s is the definition of %q, not %q", *file, a.Name, *name))
+	}
+	if !app.ValidName(a.Name) {
+		return c.fail(fmt.Errorf("%s: invalid app name %q", *file, a.Name))
+	}
 
-	res, err := c.API.Trigger(ctx, *name, *digest, c.Stdout)
+	// The values of the variables the env values refer to, from this
+	// process's environment: the pipeline's secrets. Only those: a
+	// variable named in a comment is not sent anywhere. One that is not
+	// set is left out, and the daemon names it.
+	lookup := c.LookupEnv
+	if lookup == nil {
+		lookup = os.LookupEnv
+	}
+	values := make([]string, 0, len(a.Env))
+	for _, v := range a.Env {
+		values = append(values, v)
+	}
+	vars := map[string]string{}
+	for _, v := range app.Variables([]byte(strings.Join(values, "\n"))) {
+		if value, ok := lookup(v); ok {
+			vars[v] = value
+		}
+	}
+
+	res, err := c.API.Trigger(ctx, api.TriggerRequest{App: a.Name, Digest: *digest, Definition: string(definition), Vars: vars}, c.Stdout)
 	if err != nil {
 		if errors.Is(err, api.ErrDeployFailed) && res != nil {
 			fmt.Fprintf(c.Stderr, "liman: %s\n", res.Error)
@@ -241,7 +278,13 @@ func (c *CLI) runTrigger(ctx context.Context, args []string) int {
 		}
 		return c.fail(err)
 	}
+	if res.Unchanged {
+		return exitOK
+	}
 	fmt.Fprintf(c.Stdout, "\n%s is running release %s, image %s\n", res.App, res.Release, *digest)
+	if len(res.Changed) > 0 {
+		fmt.Fprintf(c.Stdout, "Changed in the definition: %s\n", strings.Join(res.Changed, ", "))
+	}
 	return exitOK
 }
 

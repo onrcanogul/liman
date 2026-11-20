@@ -155,6 +155,29 @@ var migrations = []string{
 		updated_at TEXT NOT NULL
 	);
 	`,
+
+	// 10: apps are registered, and a pipeline sends the whole definition
+	// with every deploy; nothing is deployed by hand first. A registration
+	// fixes what a deploy key cannot change: the image's repository and
+	// the domain. app_state remembers what the last triggered deploy ran,
+	// as checksums only: the values (secrets among them) are not kept.
+	`
+	DROP TABLE app_definitions;
+	CREATE TABLE apps (
+		name       TEXT PRIMARY KEY,
+		repo       TEXT NOT NULL,
+		domain     TEXT NOT NULL UNIQUE,
+		created_at TEXT NOT NULL
+	);
+	CREATE TABLE app_state (
+		app        TEXT PRIMARY KEY,
+		release    TEXT NOT NULL,
+		image      TEXT NOT NULL,
+		checksum   TEXT NOT NULL,
+		fields     TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	);
+	`,
 }
 
 // SchemaVersion is the schema version this build reads and writes.

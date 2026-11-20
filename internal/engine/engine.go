@@ -184,6 +184,17 @@ func WithDigest(image, digest string) (string, error) {
 	if !ValidDigest(digest) {
 		return "", fmt.Errorf("invalid digest %q: want sha256: and 64 hexadecimal digits", digest)
 	}
+	repo := Repository(image)
+	if repo == "" {
+		return "", fmt.Errorf("image %q has no repository", image)
+	}
+	return repo + "@" + digest, nil
+}
+
+// Repository returns image without its tag and digest:
+// ghcr.io/user/api:1.4 and ghcr.io/user/api@sha256:… are both
+// ghcr.io/user/api.
+func Repository(image string) string {
 	repo := image
 	if i := strings.Index(repo, "@"); i >= 0 {
 		repo = repo[:i]
@@ -193,10 +204,7 @@ func WithDigest(image, digest string) (string, error) {
 	if i := strings.LastIndex(repo, ":"); i > strings.LastIndex(repo, "/") {
 		repo = repo[:i]
 	}
-	if repo == "" {
-		return "", fmt.Errorf("image %q has no repository", image)
-	}
-	return repo + "@" + digest, nil
+	return repo
 }
 
 // ForApp returns the containers in list that belong to app, keeping their

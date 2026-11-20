@@ -703,7 +703,7 @@ func TestTokenCreateReadOnly(t *testing.T) {
 	}
 }
 
-func TestDeployKeyTriggersOnTheHooksListenerOnly(t *testing.T) {
+func TestRegisteredAppIsDeployedFromItsPipelineOnly(t *testing.T) {
 	td := newTestDaemon(t)
 	writeConfig(t, td.Home, "daemon:\n  listen: 127.0.0.1:0\nhooks:\n  listen: 127.0.0.1:0\n")
 	ctx := context.Background()
@@ -713,11 +713,11 @@ func TestDeployKeyTriggersOnTheHooksListenerOnly(t *testing.T) {
 	if code := td.Run(ctx, []string{"token", "create", "dev", "--write-client", adminFile}); code != exitOK {
 		t.Fatal(td.stderr.String())
 	}
-	if code := td.Run(ctx, []string{"token", "create", "web-ci", "--deploy", "--app", "web", "--write-client", keyFile}); code != exitOK {
+	if code := td.Run(ctx, []string{"app", "create", "web", "--repo", "registry.example.com/web", "--domain", "web.example.com", "--write-client", keyFile}); code != exitOK {
 		t.Fatal(td.stderr.String())
 	}
-	if !strings.Contains(td.stdout.String(), `deploy key "web-ci" for web`) {
-		t.Errorf("token create --deploy says: %q", td.stdout.String())
+	if out := td.stdout.String(); !strings.Contains(out, `deploy key "web-ci" for web`) || !strings.Contains(out, "Registered web") {
+		t.Errorf("app create says: %q", out)
 	}
 	if code := td.Run(ctx, []string{"token", "list"}); code != exitOK || !regexp.MustCompile(`(?m)^web-ci\s+deploy\s+web\s`).MatchString(td.stdout.String()) {
 		t.Errorf("token list does not show the deploy key:\n%s", td.stdout.String())
@@ -732,29 +732,27 @@ func TestDeployKeyTriggersOnTheHooksListenerOnly(t *testing.T) {
 	td.HooksReady = func(a string) { hooks <- a }
 	addr, stop, exit := startServing(t, td)
 	hooksAddr := <-hooks
-	// Written before the port was known; the test points the client at
-	// the real one.
-	if !strings.HasPrefix(key.URL, "http://127.0.0.1:") {
-		t.Errorf("the deploy key's client.yaml points at %s; want the hooks listener", key.URL)
-	}
 
-	api1 := &api.Client{BaseURL: "http://" + addr, Token: admin.Token}
-	if _, err := api1.Deploy(ctx, []byte("name: web\nimage: web:1.0\ndomain: web.example.com\nport: 80\n"), api.DeployOptions{}, io.Discard); err != nil {
-		t.Fatal(err)
-	}
 	d := "sha256:" + strings.Repeat("ab", 32)
-	td.engine.Registry = map[string]bool{"web@" + d: true}
-
+	td.engine.Registry = map[string]bool{"registry.example.com/web@" + d: true}
 	ci := &api.Client{BaseURL: "http://" + hooksAddr, Token: key.Token}
-	if res, err := ci.Trigger(ctx, "web", d, io.Discard); err != nil || !res.OK {
+	req := api.TriggerRequest{
+		App: "web", Digest: d,
+		Definition: "name: web\nimage: registry.example.com/web\ndomain: web.example.com\nport: 80\nenv:\n  TOKEN: ${TOKEN}\n",
+		Vars:       map[string]string{"TOKEN": "t0p"},
+	}
+	if res, err := ci.Trigger(ctx, req, io.Discard); err != nil || !res.OK {
 		t.Errorf("Trigger() = %+v, %v", res, err)
+	}
+	if res, err := ci.Trigger(ctx, req, io.Discard); err != nil || !res.Unchanged {
+		t.Errorf("the same Trigger() again = %+v, %v; want unchanged", res, err)
 	}
 	// The key does nothing on the API, and the API's tokens nothing on
 	// the hooks listener.
 	if _, err := (&api.Client{BaseURL: "http://" + addr, Token: key.Token}).Apps(ctx); err == nil {
 		t.Error("the deploy key listed the apps")
 	}
-	if _, err := (&api.Client{BaseURL: "http://" + hooksAddr, Token: admin.Token}).Trigger(ctx, "web", d, io.Discard); err == nil {
+	if _, err := (&api.Client{BaseURL: "http://" + hooksAddr, Token: admin.Token}).Trigger(ctx, req, io.Discard); err == nil {
 		t.Error("an admin token triggered a deploy")
 	}
 
@@ -762,19 +760,59 @@ func TestDeployKeyTriggersOnTheHooksListenerOnly(t *testing.T) {
 	if code := <-exit; code != exitOK {
 		t.Errorf("exit code = %d: %s", code, td.stderr.String())
 	}
-	if strings.Contains(td.stderr.String(), key.Token) {
-		t.Error("the log contains the deploy key")
+	for _, secret := range []string{key.Token, "t0p"} {
+		if strings.Contains(td.stderr.String(), secret) {
+			t.Errorf("the log contains %q", secret)
+		}
+	}
+
+	if code := td.Run(ctx, []string{"app", "list"}); code != exitOK || !regexp.MustCompile(`(?m)^web\s+registry.example.com/web\s+web.example.com\s.*\s\S+ at `).MatchString(td.stdout.String()) {
+		t.Errorf("app list:\n%s", td.stdout.String())
+	}
+	if code := td.Run(ctx, []string{"app", "delete", "web"}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	if code := td.Run(ctx, []string{"app", "list"}); code != exitOK || !strings.Contains(td.stdout.String(), "No apps registered") {
+		t.Errorf("app list after delete:\n%s", td.stdout.String())
 	}
 }
 
-func TestDeployKeyClientFileNeedsTheHooksListener(t *testing.T) {
+func TestAppCreateRefusals(t *testing.T) {
 	td := newTestDaemon(t)
-	file := filepath.Join(t.TempDir(), "ci.yaml")
-	if code := td.Run(context.Background(), []string{"token", "create", "ci", "--deploy", "--app", "web", "--write-client", file}); code != exitError || !strings.Contains(td.stderr.String(), "hooks.listen is not set") {
-		t.Errorf("code %d, stderr %q", code, td.stderr.String())
+	ctx := context.Background()
+	for _, tt := range []struct {
+		args []string
+		code int
+		want string
+	}{
+		{[]string{"app", "create", "web", "--repo", "r.example.com/web"}, exitUsage, "usage: limand app create"},
+		{[]string{"app", "create", "Web", "--repo", "r.example.com/web", "--domain", "w.example.com"}, exitUsage, "not a valid app name"},
+		{[]string{"app", "create", "web", "--repo", "r.example.com/web:1.0", "--domain", "w.example.com"}, exitUsage, "without a tag"},
+		{[]string{"app", "create", "web", "--repo", "r.example.com/web", "--domain", "localhost"}, exitUsage, "not a valid domain"},
+		// Without hooks.listen there is no address to write: nothing is
+		// left behind.
+		{[]string{"app", "create", "web", "--repo", "r.example.com/web", "--domain", "w.example.com", "--write-client", filepath.Join(t.TempDir(), "c.yaml")}, exitError, "hooks.listen is not set"},
+	} {
+		td.stderr.buf.Reset()
+		if code := td.Run(ctx, tt.args); code != tt.code || !strings.Contains(td.stderr.String(), tt.want) {
+			t.Errorf("%v: code %d, stderr %q; want %d and %q", tt.args, code, td.stderr.String(), tt.code, tt.want)
+		}
 	}
-	// Refused, so not kept either.
-	if code := td.Run(context.Background(), []string{"token", "list"}); code != exitOK || strings.Contains(td.stdout.String(), "ci ") {
-		t.Errorf("the refused key was kept:\n%s", td.stdout.String())
+	if code := td.Run(ctx, []string{"app", "list"}); code != exitOK || !strings.Contains(td.stdout.String(), "No apps registered") {
+		t.Errorf("a refused app was kept:\n%s", td.stdout.String())
+	}
+	if code := td.Run(ctx, []string{"token", "list"}); code != exitOK || strings.Contains(td.stdout.String(), "web-ci") {
+		t.Errorf("a refused app's key was kept:\n%s", td.stdout.String())
+	}
+
+	// A deploy key needs a registered app; a domain belongs to one app.
+	if code := td.Run(ctx, []string{"token", "create", "ci", "--deploy", "--app", "web"}); code != exitError || !strings.Contains(td.stderr.String(), "not registered") {
+		t.Errorf("deploy key for an app that is not registered: code %d, stderr %q", code, td.stderr.String())
+	}
+	if code := td.Run(ctx, []string{"app", "create", "web", "--repo", "r.example.com/web", "--domain", "w.example.com"}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	if code := td.Run(ctx, []string{"app", "create", "api", "--repo", "r.example.com/api", "--domain", "w.example.com"}); code != exitError || !strings.Contains(td.stderr.String(), "registered to web") {
+		t.Errorf("a taken domain: code %d, stderr %q", code, td.stderr.String())
 	}
 }

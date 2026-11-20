@@ -90,10 +90,11 @@ func New(t *testing.T, options ...func(*server.Server)) *Harness {
 	h := &Harness{Engine: enginetest.New(), Store: st, KeyPath: keyPath, BackupDir: filepath.Join(t.TempDir(), "backups")}
 
 	h.Server = &server.Server{
-		Store:   st,
-		Secrets: vault,
-		Backups: &backup.Service{Store: st, Dir: h.BackupDir, KeyPath: keyPath},
-		Audit:   &audit.Recorder{Store: st, Keys: audit.KeysAt(keyPath)},
+		ChecksumKey: secrets.Derive(key, server.ChecksumLabel),
+		Store:       st,
+		Secrets:     vault,
+		Backups:     &backup.Service{Store: st, Dir: h.BackupDir, KeyPath: keyPath},
+		Audit:       &audit.Recorder{Store: st, Keys: audit.KeysAt(keyPath)},
 		Connect: func(context.Context) (engine.Engine, error) {
 			if h.ConnectErr != nil {
 				return nil, h.ConnectErr
@@ -132,8 +133,17 @@ func New(t *testing.T, options ...func(*server.Server)) *Harness {
 	return h
 }
 
-// DeployKey creates a deploy key named name for apps and returns its token
-// and a client for the trigger endpoint that uses it.
+// Register registers app with its image repository and domain.
+func (h *Harness) Register(t *testing.T, app, repo, domain string) {
+	t.Helper()
+	if err := h.Store.Register(context.Background(), store.Registration{Name: app, Repo: repo, Domain: domain}); err != nil {
+		t.Fatalf("register %s: %v", app, err)
+	}
+}
+
+// DeployKey creates a deploy key named name for apps, which must be
+// registered, and returns its token and a client for the trigger endpoint
+// that uses it.
 func (h *Harness) DeployKey(t *testing.T, name string, apps ...string) (string, *api.Client) {
 	t.Helper()
 	token, err := h.Store.CreateScopedToken(context.Background(), name, store.ScopeDeploy, time.Time{}, apps...)

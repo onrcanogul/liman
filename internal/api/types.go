@@ -56,6 +56,14 @@ type DeployResult struct {
 	Routed bool   `json:"routed"`
 
 	DryRun bool `json:"dry_run"`
+
+	// Unchanged is set when a trigger brought the definition and the image
+	// that already run: nothing was deployed, and Release is the one
+	// running.
+	Unchanged bool `json:"unchanged,omitempty"`
+	// Changed names the values of the definition that differ from the
+	// last triggered deploy's ("port", "env.LOG_LEVEL"), never the values.
+	Changed []string `json:"changed,omitempty"`
 }
 
 // TriggerRequest is the body of POST /hooks/deploy: deploy app again, with
@@ -65,6 +73,13 @@ type TriggerRequest struct {
 	// Digest is the image's content hash, sha256: and 64 hexadecimal
 	// digits, as docker push prints it.
 	Digest string `json:"digest"`
+	// Definition is app.yaml as it is in the repository. Its env values
+	// may refer to variables, ${NAME}, whose values are in Vars.
+	Definition string `json:"definition"`
+	// Vars holds the values of the variables the definition refers to,
+	// taken from the pipeline's environment: the secrets the repository
+	// does not contain.
+	Vars map[string]string `json:"vars,omitempty"`
 }
 
 // ConfirmRequest is the body of POST /v1/confirmations/{id}.

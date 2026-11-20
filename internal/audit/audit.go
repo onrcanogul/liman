@@ -47,6 +47,8 @@ const (
 	SecretDelete  = "secret.delete"
 	TokenCreate   = "token.create"
 	TokenRevoke   = "token.revoke"
+	AppRegister   = "app.register"
+	AppUnregister = "app.unregister"
 	BackupCreate  = "backup.create"
 	BackupRestore = "backup.restore"
 	KeyRotate     = "key.rotate"

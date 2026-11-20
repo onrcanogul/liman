@@ -60,11 +60,11 @@ func (c *Client) Rollback(ctx context.Context, app string, opts DeployOptions, o
 	return c.runStreamed(ctx, "/v1/apps/"+url.PathEscape(app)+"/rollback", "", nil, opts, out)
 }
 
-// Trigger asks the daemon's trigger endpoint to deploy app again with the
-// image of its repository that has digest, and copies the progress output
-// to out. The client's token must be a deploy key for app.
-func (c *Client) Trigger(ctx context.Context, app, digest string, out io.Writer) (*DeployResult, error) {
-	body, err := json.Marshal(TriggerRequest{App: app, Digest: digest})
+// Trigger sends a definition and the digest of the image to run to the
+// daemon's trigger endpoint, and copies the progress output to out. The
+// client's token must be a deploy key for the app.
+func (c *Client) Trigger(ctx context.Context, req TriggerRequest, out io.Writer) (*DeployResult, error) {
+	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}

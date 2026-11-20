@@ -110,6 +110,12 @@ type Server struct {
 	// KeyRotationUnfinished is reported by GET /v1/info.
 	KeyRotationUnfinished bool
 
+	// ChecksumKey is the key of the HMAC taken over the definitions that
+	// pipelines send, derived from the master key. A plain hash of a
+	// definition would give away a short secret in it to anyone who can
+	// guess it: one of six digits takes seconds.
+	ChecksumKey []byte
+
 	// Certs obtains a certificate after a deploy for a domain that has
 	// none. Nil means HTTPS only comes from certificates already on disk.
 	Certs deploy.Certs
@@ -369,9 +375,13 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 
 	query := r.URL.Query()
 	run := deployRun{
-		dryRun:     query.Get("dry_run") == "true",
-		step:       query.Get("step") == "true",
-		definition: body,
+		dryRun: query.Get("dry_run") == "true",
+		step:   query.Get("step") == "true",
+		// What runs is no longer what the last trigger brought: the next
+		// trigger must deploy, even with the same definition and image.
+		onSuccess: func(ctx context.Context, _ string) error {
+			return s.Store.ForgetDeployState(ctx, a.Name)
+		},
 	}
 	if run.dryRun && run.step {
 		writeError(w, http.StatusBadRequest, errors.New("dry_run and step cannot be combined"))
@@ -383,11 +393,12 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 // deployRun is how runDeploy deploys.
 type deployRun struct {
 	dryRun, step bool
-	// definition, when set, is kept as the app's definition once the
-	// deploy has succeeded: a deploy triggered from a pipeline starts from
-	// it. A triggered deploy sets none, and the definition written by hand
-	// stays.
-	definition []byte
+	// onSuccess, when set, runs after a deploy that succeeded, with its
+	// release, before the client learns the result.
+	onSuccess func(ctx context.Context, release string) error
+	// changed names the values of the definition that differ from the
+	// last deploy's, for the result and the audit trail.
+	changed []string
 }
 
 // runDeploy deploys a, whose name the request's token has been checked
@@ -470,17 +481,22 @@ func (s *Server) runDeploy(w http.ResponseWriter, r *http.Request, a *app.App, r
 		result.Error = err.Error()
 	}
 
+	result.Changed = run.changed
 	if !dryRun {
 		s.recordRelease(a, res.Release, started, err)
-		s.record(r, audit.Deploy, a.Name, releaseTarget(res.Release, a.Image), err)
+		target := releaseTarget(res.Release, a.Image)
+		if len(run.changed) > 0 {
+			// The names of what changed, never the values.
+			target += "; changed: " + strings.Join(run.changed, ", ")
+		}
+		s.record(r, audit.Deploy, a.Name, target, err)
 	}
 	// Before the lock is released, so that a trigger right after this
-	// deploy finds what it deployed. A failure leaves the app running and
-	// only the trigger without the newest definition: it is logged, and
-	// the deploy still succeeded.
-	if err == nil && !dryRun && run.definition != nil {
-		if err := s.Store.SaveDefinition(context.WithoutCancel(ctx), a.Name, run.definition); err != nil {
-			s.logger().Warn("deployed, but could not keep the definition for triggered deploys", "app", a.Name, "error", err.Error())
+	// deploy sees what it left. A failure is logged: the deploy itself
+	// succeeded, and at worst the next trigger deploys once more.
+	if err == nil && !dryRun && run.onSuccess != nil {
+		if err := run.onSuccess(context.WithoutCancel(ctx), res.Release); err != nil {
+			s.logger().Warn("deployed, but could not note it for triggered deploys", "app", a.Name, "error", err.Error())
 		}
 	}
 
@@ -550,6 +566,13 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	res, err := deployer.Rollback(ctx, name, opts)
 	if !dryRun {
 		s.record(r, audit.Rollback, name, res.Release, err)
+	}
+	// What runs now is an older release: a trigger with the newest
+	// definition and image must deploy them again, not find them running.
+	if err == nil && !dryRun {
+		if err := s.Store.ForgetDeployState(context.WithoutCancel(ctx), name); err != nil {
+			s.logger().Warn("rolled back, but could not note it for triggered deploys", "app", name, "error", err.Error())
+		}
 	}
 
 	result := &api.DeployResult{
@@ -724,10 +747,10 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	var stopErr error
 	defer func() { s.record(r, audit.Stop, name, strings.Join(result.Removed, ", "), stopErr) }()
 
-	// A stopped app must stay stopped: the next push to its registry would
-	// otherwise bring it back through a trigger. So the definition goes
-	// first, and if it cannot, nothing else is touched.
-	if err := s.Store.DeleteDefinition(ctx, name); err != nil {
+	// What the last trigger ran is no longer running: the next trigger
+	// deploys again, whatever it brings. First, so that a failure leaves
+	// nothing half done.
+	if err := s.Store.ForgetDeployState(ctx, name); err != nil {
 		stopErr = err
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -946,6 +969,15 @@ func (s *Server) claimDomain(ctx context.Context, eng engine.Engine, r *http.Req
 			return fmt.Errorf("domain %s is used by app %s; stop it, or give it another domain, first", a.Domain, other)
 		}
 		return fmt.Errorf("domain %s is used by another app", a.Domain)
+	}
+
+	// A domain registered to an app is that app's, deployed or not.
+	owner, err := s.Store.DomainOwner(ctx, domain)
+	if err != nil {
+		return nil, err
+	}
+	if owner != "" && owner != a.Name {
+		return nil, taken(owner)
 	}
 
 	s.mu.Lock()

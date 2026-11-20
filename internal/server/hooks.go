@@ -2,21 +2,32 @@ package server
 
 import (
 	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/app"
 	"github.com/onrcanogul/liman/internal/engine"
+	"github.com/onrcanogul/liman/internal/store"
 )
 
-// maxTriggerBytes bounds the body of a trigger, which is two short strings.
-const maxTriggerBytes = 4 << 10
+// ChecksumLabel is what the checksum key is derived from the master key
+// with.
+const ChecksumLabel = "liman definition checksum v1"
+
+// maxTriggerBytes bounds the body of a trigger: a definition, as large as
+// one sent to POST /v1/deploys may be, and the values of its variables.
+const maxTriggerBytes = maxDefinitionBytes + 64<<10
 
 // triggersPerMinute is how many deploys one deploy key may ask for in a
 // minute. A pipeline pushes a few times an hour at most; a leaked key in a
@@ -43,11 +54,17 @@ func (s *Server) HookHandler() http.Handler {
 	return h
 }
 
-// handleTrigger deploys an app again with another image of its own
-// repository: the one with the digest in the body. Everything else comes
-// from the app's last deploy made by hand.
+// handleTrigger deploys a registered app with the definition and the
+// image a pipeline sends: app.yaml from the repository, the values of the
+// variables it refers to, and the digest of the image it pushed.
 func (s *Server) handleTrigger(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// Without its key the checksum would be a plain hash, which gives
+	// short secrets away.
+	if len(s.ChecksumKey) == 0 {
+		writeError(w, http.StatusInternalServerError, errors.New("this daemon has no checksum key; triggers are off"))
+		return
+	}
 
 	body, err := s.readBody(w, r, maxTriggerBytes)
 	if err != nil {
@@ -87,25 +104,34 @@ func (s *Server) handleTrigger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	definition, found, err := s.Store.Definition(ctx, req.App)
+	reg, found, err := s.Store.Registration(ctx, req.App)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if !found {
-		writeError(w, http.StatusNotFound, fmt.Errorf("%s has no deploy to repeat: deploy it once with liman deploy (a stopped app needs that too)", req.App))
+		writeError(w, http.StatusNotFound, fmt.Errorf("%s is not registered; register it on the server with: limand app create %s --repo <repository> --domain <domain>", req.App, req.App))
 		return
 	}
-	a, err := app.Parse(definition)
+
+	a, status, err := s.triggeredApp(req, reg)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("the kept definition of %s: %w; deploy it again with liman deploy", req.App, err))
+		writeError(w, status, err)
 		return
 	}
-	// The repository is the one in the definition, never one from the
-	// request: a deploy key can choose an image of its app, not any image.
-	image, err := engine.WithDigest(a.Image, req.Digest)
+
+	// The checksum covers the definition with the image's repository, not
+	// its digest: whether the image changed is a question of its own.
+	fields := a.Fields()
+	checksum := s.checksum(app.Canonical(fields))
+	image, err := engine.WithDigest(reg.Repo, req.Digest)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	a.Image = image
+	if err := a.Validate(); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("invalid app definition:\n%w", err))
 		return
 	}
 
@@ -114,18 +140,125 @@ func (s *Server) handleTrigger(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
+
+	last, haveLast, err := s.Store.DeployStateOf(ctx, a.Name)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	// The same definition and the same image, still running: a pipeline
+	// run again. Nothing to do, and nothing to record.
+	if haveLast && last.Checksum == checksum && last.Image == image && s.running(ctx, eng, a.Name, last.Release) {
+		stream := newEventStream(w)
+		stream.send(api.DeployEvent{Type: api.EventOutput, Text: fmt.Sprintf("%s already runs this definition and image (release %s); nothing to do\n", a.Name, last.Release)})
+		stream.send(api.DeployEvent{Type: api.EventResult, Result: &api.DeployResult{OK: true, App: a.Name, Release: last.Release, Domain: a.Domain, Unchanged: true}})
+		return
+	}
+
 	exists, err := eng.ImageExists(ctx, image)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
 	if !exists {
-		writeError(w, http.StatusUnprocessableEntity, fmt.Errorf("%s is not in the registry: push the image first, to the repository in the app's definition", image))
+		writeError(w, http.StatusUnprocessableEntity, fmt.Errorf("%s is not in the registry: push the image first, to %s", image, reg.Repo))
 		return
 	}
 
-	a.Image = image
-	s.runDeploy(w, r, a, deployRun{})
+	keyed := s.keyedFields(fields)
+	var changed []string
+	if haveLast {
+		changed = changedFields(last.Fields, keyed)
+	}
+	s.runDeploy(w, r, a, deployRun{
+		changed: changed,
+		onSuccess: func(ctx context.Context, release string) error {
+			return s.Store.SaveDeployState(ctx, store.DeployState{
+				App: a.Name, Release: release, Image: image, Checksum: checksum, Fields: keyed,
+			})
+		},
+	})
+}
+
+// triggeredApp decodes the definition of a trigger, checks it against the
+// registration and fills in its variables. The status goes with the error.
+func (s *Server) triggeredApp(req api.TriggerRequest, reg store.Registration) (*app.App, int, error) {
+	if req.Definition == "" {
+		return nil, http.StatusBadRequest, errors.New("the trigger has no definition; send app.yaml with it (liman trigger --file app.yaml)")
+	}
+	a, err := app.Decode([]byte(req.Definition))
+	if err != nil {
+		return nil, http.StatusBadRequest, err
+	}
+	if a.Name != req.App {
+		return nil, http.StatusBadRequest, fmt.Errorf("the definition is for %q, the trigger for %q", a.Name, req.App)
+	}
+	// What a deploy key may not change. The answer says what the
+	// registration holds: the key's owner may know it, and it says what
+	// to fix.
+	if repo := engine.Repository(a.Image); repo != reg.Repo {
+		return nil, http.StatusForbidden, fmt.Errorf("image: %s is registered with repository %s, not %q; that is changed on the server, not by a pipeline", reg.Name, reg.Repo, repo)
+	}
+	if a.Domain != reg.Domain {
+		return nil, http.StatusForbidden, fmt.Errorf("domain: %s is registered with %s, not %q; that is changed on the server, not by a pipeline", reg.Name, reg.Domain, a.Domain)
+	}
+	if err := a.FillEnv(req.Vars); err != nil {
+		return nil, http.StatusBadRequest, err
+	}
+	a.Image = reg.Repo
+	return a, http.StatusOK, nil
+}
+
+// checksum is the HMAC of data with the checksum key, in hexadecimal.
+func (s *Server) checksum(data []byte) string {
+	mac := hmac.New(sha256.New, s.ChecksumKey)
+	mac.Write(data)
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// keyedFields replaces each value by its HMAC, so that what is kept says
+// whether a value changed, never what it is.
+func (s *Server) keyedFields(fields map[string]string) map[string]string {
+	keyed := make(map[string]string, len(fields))
+	for path, value := range fields {
+		// The path is part of what is signed: the same value under two
+		// names must not look the same.
+		keyed[path] = s.checksum([]byte(path + "\x00" + value))
+	}
+	return keyed
+}
+
+// changedFields lists the paths whose value differs between before and
+// after, added and removed ones included, sorted.
+func changedFields(before, after map[string]string) []string {
+	var changed []string
+	for path, v := range after {
+		if before[path] != v {
+			changed = append(changed, path)
+		}
+	}
+	for path := range before {
+		if _, ok := after[path]; !ok {
+			changed = append(changed, path)
+		}
+	}
+	slices.Sort(changed)
+	return changed
+}
+
+// running reports whether release of app is the running container. An
+// app whose container was removed behind liman's back is deployed again.
+func (s *Server) running(ctx context.Context, eng engine.Engine, name, release string) bool {
+	all, err := eng.List(ctx)
+	if err != nil {
+		return false
+	}
+	for _, c := range engine.ForApp(all, name) {
+		if c.Release == release && c.State == "running" {
+			return true
+		}
+	}
+	return false
 }
 
 // triggerLimiter allows each key triggersPerMinute triggers in any minute.

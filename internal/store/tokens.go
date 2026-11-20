@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"regexp"
 	"slices"
@@ -121,6 +122,21 @@ func (s *Store) CreateScopedToken(ctx context.Context, name, scope string, expir
 		return "", fmt.Errorf("store token: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+
+	// A deploy key is for registered apps: the registration is what fixes
+	// the repository and the domain it cannot change.
+	if scope == ScopeDeploy {
+		for _, a := range apps {
+			var one int
+			err := tx.QueryRowContext(ctx, `SELECT 1 FROM apps WHERE name = ?`, a).Scan(&one)
+			if errors.Is(err, sql.ErrNoRows) {
+				return "", fmt.Errorf("token %q: app %s is not registered; register it first with: limand app create %s --repo <repository> --domain <domain>", name, a, a)
+			}
+			if err != nil {
+				return "", fmt.Errorf("store token: %w", err)
+			}
+		}
+	}
 
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO tokens (name, hash, scope, created_at, expires_at) VALUES (?, ?, ?, ?, ?)

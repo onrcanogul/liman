@@ -978,28 +978,56 @@ func TestEventsAndReleasesOfASetOfApps(t *testing.T) {
 	}
 }
 
-func TestDefinitions(t *testing.T) {
+func TestRegistrations(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()
-	if _, found, err := s.Definition(ctx, "web"); err != nil || found {
-		t.Fatalf("Definition() of nothing = %v, %v", found, err)
-	}
-	for _, def := range []string{"name: web\nimage: a:1\n", "name: web\nimage: a:2\n"} {
-		if err := s.SaveDefinition(ctx, "web", []byte(def)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if def, found, err := s.Definition(ctx, "web"); err != nil || !found || string(def) != "name: web\nimage: a:2\n" {
-		t.Errorf("Definition() = %q, %v, %v; want the second", def, found, err)
-	}
-	if err := s.DeleteDefinition(ctx, "web"); err != nil {
+	web := Registration{Name: "web", Repo: "ghcr.io/team/web", Domain: "web.example.com"}
+	if err := s.Register(ctx, web); err != nil {
 		t.Fatal(err)
 	}
-	if _, found, _ := s.Definition(ctx, "web"); found {
-		t.Error("the definition survived DeleteDefinition")
+	if err := s.Register(ctx, web); !errors.Is(err, ErrExists) {
+		t.Errorf("Register() twice = %v; want ErrExists", err)
 	}
-	if err := s.DeleteDefinition(ctx, "web"); err != nil {
-		t.Errorf("DeleteDefinition() of nothing = %v", err)
+	if err := s.Register(ctx, Registration{Name: "api", Repo: "ghcr.io/team/api", Domain: "web.example.com"}); !errors.Is(err, ErrDomainTaken) {
+		t.Errorf("Register() with a taken domain = %v; want ErrDomainTaken", err)
+	}
+	if r, found, err := s.Registration(ctx, "web"); err != nil || !found || r.Repo != web.Repo || r.Domain != web.Domain || r.CreatedAt.IsZero() {
+		t.Errorf("Registration() = %+v, %v, %v", r, found, err)
+	}
+	if owner, err := s.DomainOwner(ctx, "web.example.com"); err != nil || owner != "web" {
+		t.Errorf("DomainOwner() = %q, %v", owner, err)
+	}
+	if list, err := s.Registrations(ctx); err != nil || len(list) != 1 {
+		t.Errorf("Registrations() = %+v, %v", list, err)
+	}
+
+	st := DeployState{App: "web", Release: "r1", Image: "ghcr.io/team/web@sha256:x", Checksum: "c1", Fields: map[string]string{"port": "f1"}}
+	if err := s.SaveDeployState(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	st.Release, st.Checksum = "r2", "c2"
+	if err := s.SaveDeployState(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	if got, found, err := s.DeployStateOf(ctx, "web"); err != nil || !found || got.Release != "r2" || got.Checksum != "c2" || got.Fields["port"] != "f1" {
+		t.Errorf("DeployStateOf() = %+v, %v, %v", got, found, err)
+	}
+	if err := s.ForgetDeployState(ctx, "web"); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := s.DeployStateOf(ctx, "web"); found {
+		t.Error("the state survived ForgetDeployState")
+	}
+
+	_ = s.SaveDeployState(ctx, st)
+	if err := s.Unregister(ctx, "web"); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := s.DeployStateOf(ctx, "web"); found {
+		t.Error("the state survived Unregister")
+	}
+	if err := s.Unregister(ctx, "web"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("Unregister() twice = %v; want ErrNotFound", err)
 	}
 }
 
@@ -1008,6 +1036,12 @@ func TestDeployKeysNameTheirApps(t *testing.T) {
 	ctx := context.Background()
 	if _, err := s.CreateScopedToken(ctx, "ci", ScopeDeploy, time.Time{}); err == nil {
 		t.Error("a deploy key for every app was created")
+	}
+	if _, err := s.CreateScopedToken(ctx, "ci", ScopeDeploy, time.Time{}, "web"); err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Errorf("a deploy key for an app that is not registered: %v", err)
+	}
+	if err := s.Register(ctx, Registration{Name: "web", Repo: "web", Domain: "web.example.com"}); err != nil {
+		t.Fatal(err)
 	}
 	tok, err := s.CreateScopedToken(ctx, "ci", ScopeDeploy, time.Time{}, "web")
 	if err != nil {

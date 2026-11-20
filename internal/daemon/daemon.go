@@ -63,6 +63,16 @@ Usage:
                                   pipeline) needs --app and can do one
                                   thing: trigger deploys of those apps on
                                   the hooks.listen endpoint
+  limand app create <name> --repo <repository> --domain <domain>
+                      [--key <name>] [--write-client <file>] [--url <url>]
+                                  Register an app for deploys from CI: its
+                                  image repository (no tag) and its domain,
+                                  which its pipeline cannot change. Creates
+                                  its deploy key, named <name>-ci unless
+                                  --key, printed once
+  limand app list                 List registered apps and their last trigger
+  limand app delete <name>        Unregister an app; its containers keep
+                                  running until stopped
   limand token list               List tokens, when they expire and were last used
   limand token revoke <name>      Revoke a token
   limand audit verify             Check the audit trail: that no entry was
@@ -155,6 +165,8 @@ func (d *Daemon) Run(ctx context.Context, args []string) int {
 		return d.serve(ctx)
 	case "token":
 		return d.runToken(ctx, args[1:])
+	case "app":
+		return d.runApp(ctx, args[1:])
 	case "backup":
 		return d.runBackup(ctx, args[1:])
 	case "cert":
@@ -210,6 +222,13 @@ func (d *Daemon) serve(ctx context.Context) int {
 		log.Info("audit", "seq", head[0].Seq, "action", head[0].Action, "mac", hex.EncodeToString(head[0].MAC), "head", true)
 	}
 	srv := &server.Server{Store: st, Connect: connect, Log: log, Locks: locks, Secrets: vault, Started: time.Now(), Audit: recorder}
+	// The checksums of triggered deploys are HMACs with a key of their
+	// own, derived from the master key that seals.
+	ring, err := secrets.LoadKeyring(d.keyPath(cfg))
+	if err != nil {
+		return d.fail(err)
+	}
+	srv.ChecksumKey, _ = ring.Derive(ring.Primary(), server.ChecksumLabel)
 	srv.Keys = d.keysForAPI(cfg)
 	srv.KeyRotationUnfinished = d.rotationUnfinished
 	if cfg.Nginx.CertDir != "" {
@@ -730,37 +749,52 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 		what += fmt.Sprintf(" (expires %s)", expiresAt.Local().Format("2006-01-02 15:04"))
 	}
 
-	if *writeClient != "" {
-		client := config.Client{URL: *url, Token: token}
+	return d.handOver(ctx, st, newToken{name: name, token: token, what: what, writeClient: *writeClient, url: *url, deployKey: *deployKey})
+}
+
+// newToken is a token just created, to be handed to its user.
+type newToken struct {
+	name, token string
+	// what describes it: `token "laptop"`, `deploy key "web-ci" for web`.
+	what string
+	// writeClient and url are the flags of the same names.
+	writeClient, url string
+	deployKey        bool
+}
+
+// handOver prints a new token once, or writes it into a client.yaml. A
+// token that cannot be handed over is revoked again: it exists, but
+// nobody has it.
+func (d *Daemon) handOver(ctx context.Context, st *store.Store, t newToken) int {
+	if t.writeClient != "" {
+		client := config.Client{URL: t.url, Token: t.token}
 		if client.URL == "" {
 			cfg, err := config.Load(filepath.Join(d.Home, "config.yaml"))
 			if err != nil {
-				_ = st.RevokeToken(ctx, name)
+				_ = st.RevokeToken(ctx, t.name)
 				return d.fail(err)
 			}
 			client.URL = "http://" + cfg.Daemon.Listen
 			// A deploy key works on the trigger endpoint only.
-			if *deployKey {
+			if t.deployKey {
 				if !cfg.Hooks.Enabled() {
-					_ = st.RevokeToken(ctx, name)
+					_ = st.RevokeToken(ctx, t.name)
 					return d.fail(errors.New("hooks.listen is not set, so there is no trigger endpoint to write into the file; set it, or give --url"))
 				}
 				client.URL = "http://" + cfg.Hooks.Listen
 			}
 		}
-		if err := config.SaveClient(*writeClient, client); err != nil {
-			// The token exists but nobody has it; remove it again rather
-			// than leave an unusable entry behind.
-			_ = st.RevokeToken(ctx, name)
+		if err := config.SaveClient(t.writeClient, client); err != nil {
+			_ = st.RevokeToken(ctx, t.name)
 			return d.fail(err)
 		}
 		// The token itself is deliberately not printed in this mode.
-		fmt.Fprintf(d.Stdout, "Created %s and wrote it to %s\n", what, *writeClient)
+		fmt.Fprintf(d.Stdout, "Created %s and wrote it to %s\n", t.what, t.writeClient)
 		return exitOK
 	}
 
-	fmt.Fprintf(d.Stdout, "Created %s. It is shown only this once:\n\n  %s\n\n", what, token)
-	if *deployKey {
+	fmt.Fprintf(d.Stdout, "Created %s. It is shown only this once:\n\n  %s\n\n", t.what, t.token)
+	if t.deployKey {
 		fmt.Fprintln(d.Stdout, "Store it as a secret variable of your CI (LIMAN_TOKEN), next to LIMAN_URL: the public address of the trigger endpoint.")
 		return exitOK
 	}
