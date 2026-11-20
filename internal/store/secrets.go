@@ -90,3 +90,61 @@ func (s *Store) CountSecrets(ctx context.Context) (int, error) {
 	}
 	return n, nil
 }
+
+// ResealSecrets passes every stored secret to fn and stores what it
+// returns, all in one transaction: if fn fails for any of them, nothing is
+// changed. fn reports whether it changed a value; the count of those is
+// returned. updated_at is left alone: the value it describes is the same.
+//
+// It implements secrets.Resealer, which a key rotation uses.
+func (s *Store) ResealSecrets(ctx context.Context, fn func(app, name string, sealed []byte) ([]byte, bool, error)) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("reseal secrets: %w", err)
+	}
+	// Rollback after a Commit does nothing; on every other way out it
+	// undoes whatever was written.
+	defer func() { _ = tx.Rollback() }()
+
+	// All rows are read before any is written: the one connection is
+	// busy with a query until its rows are closed.
+	type row struct {
+		app, name string
+		sealed    []byte
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT app, name, value FROM secrets ORDER BY app, name`)
+	if err != nil {
+		return 0, fmt.Errorf("reseal secrets: %w", err)
+	}
+	var all []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.app, &r.name, &r.sealed); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("reseal secrets: %w", err)
+		}
+		all = append(all, r)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return 0, fmt.Errorf("reseal secrets: %w", err)
+	}
+
+	changed := 0
+	for _, r := range all {
+		sealed, ok, err := fn(r.app, r.name, r.sealed)
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE secrets SET value = ? WHERE app = ? AND name = ?`, sealed, r.app, r.name); err != nil {
+			return 0, fmt.Errorf("reseal secrets: %w", err)
+		}
+		changed++
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("reseal secrets: %w", err)
+	}
+	return changed, nil
+}

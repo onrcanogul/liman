@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -192,9 +193,9 @@ func TestBackupVerify(t *testing.T) {
 	if code := td.Run(ctx, []string{"backup", "verify", file}); code != exitError {
 		t.Errorf("verify with the wrong key: code %d, want %d", code, exitError)
 	}
-	// The signature is checked first, and with another key it is wrong;
-	// the file is then not even opened.
-	if out := td.stdout.String(); !strings.Contains(out, "signature WRONG") {
+	// The signature is checked first, and it names a key this server does
+	// not have; the file is then not even opened.
+	if out := td.stdout.String(); !strings.Contains(out, "which this server does not have") {
 		t.Errorf("verify with the wrong key does not report the signature:\n%s", out)
 	}
 
@@ -345,7 +346,7 @@ func TestBackupRestoreRefusesABackupItCannotUse(t *testing.T) {
 	untouched("a text file")
 
 	replaceKey(t, td.Home)
-	if code := td.Run(ctx, []string{"backup", "restore", file}); code != exitError || !strings.Contains(td.stderr.String(), "does not match its signature") {
+	if code := td.Run(ctx, []string{"backup", "restore", file}); code != exitError || !strings.Contains(td.stderr.String(), "which this server does not have") {
 		t.Errorf("restore with the wrong key: code %d, stderr %q", code, td.stderr.String())
 	}
 	untouched("the wrong key")
@@ -675,5 +676,101 @@ func TestFreeAsideName(t *testing.T) {
 	}
 	if got := freeAsideName(base); got != base+"-3" {
 		t.Errorf("freeAsideName with two taken = %q, want %q", got, base+"-3")
+	}
+}
+
+// rotateByHand does what a rotation does to the key files: the current key
+// moves to master.key.old/<id>.key and a new one takes its place. It
+// returns the old and the new ID.
+func rotateByHand(t *testing.T, home string) (oldID, newID secrets.KeyID) {
+	t.Helper()
+	path := filepath.Join(home, "master.key")
+	old, err := secrets.LoadKey(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(secrets.OldKeysDir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, filepath.Join(secrets.OldKeysDir(path), secrets.IDOf(old).String()+".key")); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := secrets.CreateKey(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return secrets.IDOf(old), secrets.IDOf(fresh)
+}
+
+func TestOldBackupsVerifyAndRestoreAfterTheKeyChanged(t *testing.T) {
+	td := newTestDaemon(t)
+	seed(t, td)
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	if code := td.Run(ctx, []string{"backup", "create", dir}); code != exitOK {
+		t.Fatalf("backup create: %q", td.stderr.String())
+	}
+	file := filepath.Join(dir, backupsIn(t, dir)[0])
+	oldID, newID := rotateByHand(t, td.Home)
+
+	if code := td.Run(ctx, []string{"backup", "verify", file}); code != exitOK {
+		t.Fatalf("verify after the key changed: code %d, stderr %q\n%s", code, td.stderr.String(), td.stdout.String())
+	}
+	if out := td.stdout.String(); !strings.Contains(out, "what key "+oldID.String()) || !strings.Contains(out, "the one secret can be decrypted") {
+		t.Errorf("verify does not name the old key or cannot open the secret:\n%s", out)
+	}
+
+	if code := td.Run(ctx, []string{"backup", "restore", file}); code != exitOK {
+		t.Fatalf("restore after the key changed: code %d, stderr %q", code, td.stderr.String())
+	}
+	if !strings.Contains(td.stdout.String(), "Sealed 1 secret again with the current master key") {
+		t.Errorf("restore does not say it sealed the secret again:\n%s", td.stdout.String())
+	}
+
+	// The restored secret is sealed with the new key and opens with it.
+	st, err := store.Open(ctx, filepath.Join(td.Home, "liman.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	refs, err := st.SecretRefs(ctx)
+	if err != nil || len(refs) != 1 {
+		t.Fatalf("SecretRefs() = %v, %v", refs, err)
+	}
+	sealed, _, err := st.GetSecret(ctx, refs[0].App, refs[0].Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, ok := secrets.SealedWith(sealed); !ok || id != newID {
+		t.Errorf("the restored secret is sealed with %s (v2: %v), want the new key %s", id, ok, newID)
+	}
+}
+
+func TestBackupsWithAV1SignatureStillVerify(t *testing.T) {
+	td := newTestDaemon(t)
+	seed(t, td)
+	dir := t.TempDir()
+	ctx := context.Background()
+	if code := td.Run(ctx, []string{"backup", "create", dir}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	file := filepath.Join(dir, backupsIn(t, dir)[0])
+
+	// What a version before key IDs wrote: no key in the signature.
+	key, err := secrets.LoadKey(filepath.Join(td.Home, "master.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(file)
+	mac := hmac.New(sha256.New, secrets.Derive(key, "liman backup signature v1"))
+	mac.Write(data)
+	if err := os.WriteFile(file+".sig", []byte("liman-backup-v1 hmac-sha256 "+hex.EncodeToString(mac.Sum(nil))+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldID, _ := rotateByHand(t, td.Home)
+
+	if code := td.Run(ctx, []string{"backup", "verify", file}); code != exitOK || !strings.Contains(td.stdout.String(), "what key "+oldID.String()) {
+		t.Errorf("verify of a v1 signature: code %d, stdout:\n%s", code, td.stdout.String())
 	}
 }

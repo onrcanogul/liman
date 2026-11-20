@@ -28,35 +28,38 @@ import (
 // SigSuffix is appended to a backup's file name for its signature file.
 const SigSuffix = ".sig"
 
-// sigHeader starts a signature file. It names the format, so that a later
+// Signature file formats. The first line names the format, so that a later
 // version can change the algorithm and still read old signatures.
-const sigHeader = "liman-backup-v1 hmac-sha256 "
+const (
+	// v1: "liman-backup-v1 hmac-sha256 <mac>". It does not say which key
+	// signed; every key in the keyring is tried.
+	sigHeaderV1 = "liman-backup-v1 hmac-sha256 "
+	// v2: "liman-backup-v2 hmac-sha256 <key ID> <mac>".
+	sigHeaderV2 = "liman-backup-v2 hmac-sha256 "
+)
+
+// sigLabel derives the signing key from a master key. The master key
+// itself seals the secrets; using one key for two different jobs is how
+// keys end up broken in ways neither job would have allowed alone.
+const sigLabel = "liman backup signature v1"
 
 // Signature states of a backup.
 const (
-	// SigValid: the file is exactly what this master key signed.
+	// SigValid: the file is exactly what one of the master keys signed.
 	SigValid = "valid"
 	// SigMissing: there is no signature file. The backup was made by an
 	// older version, without a master key, or the file was left behind.
 	SigMissing = "missing"
-	// SigInvalid: the file, or its signature, is not what was written, or
-	// it was signed with another master key.
+	// SigInvalid: the file, or its signature, is not what was written. (A
+	// v1 signature also ends up here when the key that made it is gone,
+	// since it does not say which key that was.)
 	SigInvalid = "invalid"
+	// SigUnknownKey: the signature names a key the server does not have,
+	// one that was retired or never was here.
+	SigUnknownKey = "unknown-key"
 	// SigUnchecked: there is a signature but no master key to check it with.
 	SigUnchecked = "unchecked"
 )
-
-// signingKey derives the key that signs backups from the master key.
-//
-// The master key itself encrypts the secrets. Using one key for two
-// different jobs is how keys end up broken in ways neither job would have
-// allowed alone; deriving a second key with a fixed label keeps the two
-// apart while still needing only one key to be kept safe.
-func signingKey(master []byte) []byte {
-	mac := hmac.New(sha256.New, master)
-	mac.Write([]byte("liman backup signature v1"))
-	return mac.Sum(nil)
-}
 
 // fileMAC computes the HMAC of the file at path.
 func fileMAC(path string, key []byte) ([]byte, error) {
@@ -75,26 +78,25 @@ func fileMAC(path string, key []byte) ([]byte, error) {
 	return mac.Sum(nil), nil
 }
 
-// loadSigningKey returns the signing key, or nil if there is no master key.
-func loadSigningKey(keyPath string) ([]byte, error) {
+// loadKeyring returns the keyring at keyPath, or nil if there is no
+// master key.
+func loadKeyring(keyPath string) (*secrets.Keyring, error) {
 	exists, err := secrets.KeyExists(keyPath)
 	if err != nil || !exists {
 		return nil, err
 	}
-	master, err := secrets.LoadKey(keyPath)
-	if err != nil {
-		return nil, err
-	}
-	return signingKey(master), nil
+	return secrets.LoadKeyring(keyPath)
 }
 
-// Sign writes the signature file for the backup at path. It reports false
-// if there is no master key to sign with.
+// Sign writes the signature file for the backup at path, with the primary
+// key. It reports false if there is no master key to sign with.
 func Sign(path, keyPath string) (bool, error) {
-	key, err := loadSigningKey(keyPath)
-	if err != nil || key == nil {
+	ring, err := loadKeyring(keyPath)
+	if err != nil || ring == nil {
 		return false, err
 	}
+	id := ring.Primary()
+	key, _ := ring.Derive(id, sigLabel)
 	sum, err := fileMAC(path, key)
 	if err != nil {
 		return false, fmt.Errorf("sign backup: %w", err)
@@ -106,7 +108,7 @@ func Sign(path, keyPath string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("sign backup: %w", err)
 	}
-	_, writeErr := tmp.WriteString(sigHeader + hex.EncodeToString(sum) + "\n")
+	_, writeErr := tmp.WriteString(sigHeaderV2 + id.String() + " " + hex.EncodeToString(sum) + "\n")
 	if err := errors.Join(writeErr, tmp.Sync(), tmp.Close()); err != nil {
 		_ = os.Remove(tmp.Name())
 		return false, fmt.Errorf("sign backup: %w", err)
@@ -119,46 +121,73 @@ func Sign(path, keyPath string) (bool, error) {
 }
 
 // signatureState compares the file at dataPath with the signature at
-// sigPath. The two are separate arguments because a restore checks its own
-// private copy of the data against the signature that came with the
-// original.
-func signatureState(dataPath, sigPath, keyPath string) (string, error) {
+// sigPath, using the keyring at keyPath. The two paths are separate
+// because a restore checks its own private copy of the data against the
+// signature that came with the original.
+func signatureState(dataPath, sigPath, keyPath string) (state, signedBy string, err error) {
+	if _, err := os.Stat(sigPath); errors.Is(err, fs.ErrNotExist) {
+		return SigMissing, "", nil
+	}
+	ring, err := loadKeyring(keyPath)
+	if err != nil {
+		return "", "", err
+	}
+	if ring == nil {
+		return SigUnchecked, "", nil
+	}
+	return SignatureWith(dataPath, sigPath, ring)
+}
+
+// SignatureWith checks the signature at sigPath of the file at dataPath
+// against the keys in ring. signedBy is the ID of the key that signed it,
+// as far as is known: the key that matched, or the one a v2 signature
+// names.
+func SignatureWith(dataPath, sigPath string, ring *secrets.Keyring) (state, signedBy string, err error) {
 	raw, err := os.ReadFile(sigPath)
 	if errors.Is(err, fs.ErrNotExist) {
-		return SigMissing, nil
+		return SigMissing, "", nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("read signature: %w", err)
-	}
-
-	key, err := loadSigningKey(keyPath)
-	if err != nil {
-		return "", err
-	}
-	if key == nil {
-		return SigUnchecked, nil
+		return "", "", fmt.Errorf("read signature: %w", err)
 	}
 
 	// Anything that is not a well-formed signature is an invalid one: the
 	// caller should not have to tell "damaged" from "forged".
-	text, ok := strings.CutPrefix(strings.TrimSpace(string(raw)), sigHeader)
-	if !ok {
-		return SigInvalid, nil
+	line := strings.TrimSpace(string(raw))
+	var candidates []secrets.KeyID
+	var macHex string
+	if rest, ok := strings.CutPrefix(line, sigHeaderV2); ok {
+		idText, m, found := strings.Cut(rest, " ")
+		id, err := secrets.ParseKeyID(idText)
+		if !found || err != nil {
+			return SigInvalid, "", nil
+		}
+		if !ring.Has(id) {
+			return SigUnknownKey, id.String(), nil
+		}
+		candidates, macHex, signedBy = []secrets.KeyID{id}, m, id.String()
+	} else if m, ok := strings.CutPrefix(line, sigHeaderV1); ok {
+		candidates, macHex = ring.IDs(), m
+	} else {
+		return SigInvalid, signedBy, nil
 	}
-	want, err := hex.DecodeString(text)
+	want, err := hex.DecodeString(macHex)
 	if err != nil || len(want) != sha256.Size {
-		return SigInvalid, nil
+		return SigInvalid, signedBy, nil
 	}
 
-	got, err := fileMAC(dataPath, key)
-	if err != nil {
-		return "", fmt.Errorf("check signature: %w", err)
+	for _, id := range candidates {
+		key, _ := ring.Derive(id, sigLabel)
+		got, err := fileMAC(dataPath, key)
+		if err != nil {
+			return "", "", fmt.Errorf("check signature: %w", err)
+		}
+		// hmac.Equal compares in constant time. With an ordinary
+		// comparison the time taken would tell an attacker how many
+		// leading bytes of a guessed signature were right.
+		if hmac.Equal(got, want) {
+			return SigValid, id.String(), nil
+		}
 	}
-	// hmac.Equal compares in constant time. With an ordinary comparison
-	// the time taken would tell an attacker how many leading bytes of a
-	// guessed signature were right.
-	if !hmac.Equal(got, want) {
-		return SigInvalid, nil
-	}
-	return SigValid, nil
+	return SigInvalid, signedBy, nil
 }

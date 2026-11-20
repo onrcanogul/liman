@@ -823,3 +823,45 @@ func TestTokensFromBeforeExpiryNeverExpire(t *testing.T) {
 		t.Errorf("the old token after migration = %+v, %v, %v; want it valid, read, never expiring", info, ok, err)
 	}
 }
+
+func TestResealSecretsIsAllOrNothing(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	for _, n := range []string{"A", "B", "C"} {
+		if err := s.PutSecret(ctx, "web", n, []byte("old-"+n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Fails at the second value: the first one must not stay changed.
+	_, err := s.ResealSecrets(ctx, func(_, name string, _ []byte) ([]byte, bool, error) {
+		if name == "B" {
+			return nil, false, errors.New("cannot open B")
+		}
+		return []byte("new-" + name), true, nil
+	})
+	if err == nil {
+		t.Fatal("ResealSecrets() error = nil, want the failure")
+	}
+	for _, n := range []string{"A", "B", "C"} {
+		if got, _, _ := s.GetSecret(ctx, "web", n); string(got) != "old-"+n {
+			t.Errorf("%s = %q after a failed reseal, want it unchanged", n, got)
+		}
+	}
+
+	// Succeeds, leaving C alone.
+	n, err := s.ResealSecrets(ctx, func(_, name string, sealed []byte) ([]byte, bool, error) {
+		if name == "C" {
+			return sealed, false, nil
+		}
+		return []byte("new-" + name), true, nil
+	})
+	if err != nil || n != 2 {
+		t.Fatalf("ResealSecrets() = %d, %v; want 2", n, err)
+	}
+	for n, want := range map[string]string{"A": "new-A", "B": "new-B", "C": "old-C"} {
+		if got, _, _ := s.GetSecret(ctx, "web", n); string(got) != want {
+			t.Errorf("%s = %q, want %q", n, got, want)
+		}
+	}
+}

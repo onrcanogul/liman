@@ -1691,8 +1691,8 @@ func TestBackupsOverTheAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	rep, err = h.Client.VerifyBackup(ctx(), res.Backup.Name)
-	if err != nil || rep.OK || rep.Signature != "invalid" {
-		t.Errorf("VerifyBackup() with another key = %+v, %v; want not ok with an invalid signature", rep, err)
+	if err != nil || rep.OK || rep.Signature != "unknown-key" || rep.SignedBy == "" {
+		t.Errorf("VerifyBackup() with another key = %+v, %v; want not ok, signed with a key the daemon lacks", rep, err)
 	}
 }
 

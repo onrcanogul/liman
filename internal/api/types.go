@@ -242,12 +242,19 @@ type BackupReport struct {
 	KeyChecked bool `json:"key_checked"`
 	// Signature says whether the file is what the daemon's master key
 	// signed: "valid", "missing" (made before backups were signed),
-	// "invalid" (changed since, or from another key) or "unchecked" (the
-	// daemon has no master key).
+	// "invalid" (changed since, or from another key), "unknown-key" (signed
+	// with a key the daemon does not have) or "unchecked" (the daemon has
+	// no master key).
 	Signature string `json:"signature"`
 	// Undecryptable names the secrets the master key does not open, as
 	// app/name. Names only: no value ever leaves the daemon.
 	Undecryptable []string `json:"undecryptable,omitempty"`
+	// SignedBy is the ID of the master key that signed the file, when
+	// known; with Signature "unknown-key" it is the key the daemon lacks.
+	SignedBy string `json:"signed_by,omitempty"`
+	// MissingKeys are the IDs of keys secrets in the file were sealed with
+	// and the daemon does not have.
+	MissingKeys []string `json:"missing_keys,omitempty"`
 }
 
 // BackupResult is the answer to POST /v1/backups.

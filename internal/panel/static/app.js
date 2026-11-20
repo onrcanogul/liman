@@ -396,6 +396,7 @@ function ensureExtras() {
 function reportText(rep) {
   var sig = str(rep && rep.signature);
   if (sig === 'invalid') return 'its signature does not match: the file was changed after it was written, or it belongs to another master key. Do not restore it';
+  if (sig === 'unknown-key') return 'it was signed with master key ' + str(rep.signed_by, 32) + ', which this server does not have (retired, or from another server). It cannot be checked or restored without that key';
   return (sig === 'valid' ? 'signed, ' : sig === 'missing' ? 'not signed, ' : sig === 'unchecked' ? 'signature not checked, ' : '') + contentText(rep);
 }
 function contentText(rep) {

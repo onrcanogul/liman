@@ -17,6 +17,7 @@ import (
 
 	"github.com/onrcanogul/liman/internal/backup"
 	"github.com/onrcanogul/liman/internal/config"
+	"github.com/onrcanogul/liman/internal/secrets"
 	"github.com/onrcanogul/liman/internal/store"
 )
 
@@ -62,7 +63,7 @@ func (d *Daemon) checkBackup(ctx context.Context, path string, cfg config.Config
 func (d *Daemon) printReport(rep backupReport, cfg config.Config) {
 	switch rep.Signature {
 	case backup.SigValid:
-		fmt.Fprintln(d.Stdout, "  signature valid: the file is what this master key signed")
+		fmt.Fprintf(d.Stdout, "  signature valid: the file is what key %s signed\n", rep.SignedBy)
 	case backup.SigMissing:
 		fmt.Fprintln(d.Stdout, "  NOT signed: there is no signature file, so changes to it could not be noticed")
 	case backup.SigUnchecked:
@@ -70,6 +71,9 @@ func (d *Daemon) printReport(rep backupReport, cfg config.Config) {
 	case backup.SigInvalid:
 		fmt.Fprintln(d.Stdout, "  signature WRONG: the file was changed after it was written, or it belongs to another master key")
 		// Such a file is not opened; there is nothing more to report.
+		return
+	case backup.SigUnknownKey:
+		fmt.Fprintf(d.Stdout, "  signed with key %s, which this server does not have (retired, or from another server)\n", rep.SignedBy)
 		return
 	}
 
@@ -95,10 +99,13 @@ func (d *Daemon) printReport(rep backupReport, cfg config.Config) {
 	case len(rep.Undecryptable) > 0:
 		fmt.Fprintf(d.Stdout, "  %d of %s can NOT be decrypted with %s: %s\n",
 			len(rep.Undecryptable), count(rep.Secrets, "secret"), d.keyPath(cfg), strings.Join(rep.Undecryptable, ", "))
+		if len(rep.MissingKeys) > 0 {
+			fmt.Fprintf(d.Stdout, "  they were sealed with key %s, which this server does not have\n", strings.Join(rep.MissingKeys, ", "))
+		}
 	case rep.Secrets == 1:
-		fmt.Fprintf(d.Stdout, "  the one secret can be decrypted with %s\n", d.keyPath(cfg))
+		fmt.Fprintf(d.Stdout, "  the one secret can be decrypted with the keys at %s\n", d.keyPath(cfg))
 	default:
-		fmt.Fprintf(d.Stdout, "  all %d secrets can be decrypted with %s\n", rep.Secrets, d.keyPath(cfg))
+		fmt.Fprintf(d.Stdout, "  all %d secrets can be decrypted with the keys at %s\n", rep.Secrets, d.keyPath(cfg))
 	}
 }
 
@@ -179,10 +186,15 @@ func (d *Daemon) backupVerify(ctx context.Context, args []string) int {
 	if err != nil {
 		return d.fail(err)
 	}
-	if rep.Signature == backup.SigInvalid {
+	switch rep.Signature {
+	case backup.SigInvalid:
 		fmt.Fprintf(d.Stdout, "%s\n", args[0])
 		d.printReport(rep, cfg)
 		return d.fail(errors.New("do not restore this backup: its signature does not match"))
+	case backup.SigUnknownKey:
+		fmt.Fprintf(d.Stdout, "%s\n", args[0])
+		d.printReport(rep, cfg)
+		return d.fail(fmt.Errorf("this backup cannot be checked without key %s; if you still have it, put it at %s", rep.SignedBy, filepath.Join(secrets.OldKeysDir(d.keyPath(cfg)), rep.SignedBy+".key")))
 	}
 	fmt.Fprintf(d.Stdout, "%s is intact\n", args[0])
 	d.printReport(rep, cfg)
@@ -241,6 +253,8 @@ func (d *Daemon) backupRestore(ctx context.Context, args []string) int {
 	switch rep.Signature {
 	case backup.SigInvalid:
 		return d.fail(fmt.Errorf("%s does not match its signature: it was changed after it was written, or it belongs to another master key. Nothing was restored", source))
+	case backup.SigUnknownKey:
+		return d.fail(fmt.Errorf("%s was signed with key %s, which this server does not have. If you still have that key, put it at %s and try again. Nothing was restored", source, rep.SignedBy, filepath.Join(secrets.OldKeysDir(d.keyPath(cfg)), rep.SignedBy+".key")))
 	case backup.SigMissing, backup.SigUnchecked:
 		// The tokens in a backup become valid tokens. Without a checked
 		// signature nothing says the file is the one that was written, so
@@ -287,8 +301,29 @@ func (d *Daemon) backupRestore(ctx context.Context, args []string) int {
 	}
 	defer func() { _ = st.Close() }()
 
+	// 6. The secrets come back sealed with whatever key was the master key
+	// when the backup was made. Sealing them again with today's makes the
+	// database independent of the old keys, so that they can one day be
+	// retired.
+	resealed := 0
+	if rep.Secrets > 0 {
+		ring, err := secrets.LoadKeyring(d.keyPath(cfg))
+		if err != nil {
+			return d.fail(fmt.Errorf("the backup was restored, but the keyring does not load: %w", err))
+		}
+		resealed, err = st.ResealSecrets(ctx, func(app, name string, sealed []byte) ([]byte, bool, error) {
+			return secrets.Reseal(ring, ring, app, name, sealed)
+		})
+		if err != nil {
+			return d.fail(fmt.Errorf("the backup was restored, but sealing its secrets with the current key failed (they still open with the old one): %w", err))
+		}
+	}
+
 	fmt.Fprintf(d.Stdout, "Restored %s\n", source)
 	d.printReport(rep, cfg)
+	if resealed > 0 {
+		fmt.Fprintf(d.Stdout, "Sealed %s again with the current master key\n", count(resealed, "secret"))
+	}
 	if aside != "" {
 		fmt.Fprintf(d.Stdout, "The previous database was kept as %s\n", aside)
 	}

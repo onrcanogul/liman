@@ -46,15 +46,20 @@ type Report struct {
 	KeyChecked bool
 	// Undecryptable names the secrets the master key does not open.
 	Undecryptable []string
+	// MissingKeys are the IDs of keys some of the secrets were sealed with
+	// and the keyring does not hold.
+	MissingKeys []string
 	// Signature is one of the Sig constants.
 	Signature string
+	// SignedBy is the ID of the key that signed the file, when known.
+	SignedBy string
 }
 
 // Usable reports whether the backup can be relied on: its signature is not
 // wrong, and every secret in it can be decrypted. A missing signature does
 // not make a backup unusable by itself; a restore decides about that.
 func (r Report) Usable() bool {
-	return r.Signature != SigInvalid && len(r.Undecryptable) == 0 && (r.Secrets == 0 || r.KeyChecked)
+	return r.Signature != SigInvalid && r.Signature != SigUnknownKey && len(r.Undecryptable) == 0 && (r.Secrets == 0 || r.KeyChecked)
 }
 
 // Entry describes one backup file.
@@ -80,12 +85,12 @@ func CheckWithSignature(ctx context.Context, path, sigPath, keyPath string) (Rep
 	// The signature comes first. A file that fails it is not opened as a
 	// database at all: parsing is exactly what should not be done with
 	// bytes somebody may have crafted.
-	sig, err := signatureState(path, sigPath, keyPath)
+	sig, signedBy, err := signatureState(path, sigPath, keyPath)
 	if err != nil {
 		return Report{}, err
 	}
-	rep := Report{Signature: sig}
-	if sig == SigInvalid {
+	rep := Report{Signature: sig, SignedBy: signedBy}
+	if sig == SigInvalid || sig == SigUnknownKey {
 		return rep, nil
 	}
 
@@ -108,28 +113,24 @@ func CheckWithSignature(ctx context.Context, path, sigPath, keyPath string) (Rep
 		return rep, nil
 	}
 
-	exists, err := secrets.KeyExists(keyPath)
-	if err != nil {
+	ring, err := loadKeyring(keyPath)
+	if err != nil || ring == nil {
 		return rep, err
 	}
-	if !exists {
-		return rep, nil
-	}
-	key, err := secrets.LoadKey(keyPath)
-	if err != nil {
-		return rep, err
-	}
-	vault, err := secrets.NewVault(key, st)
-	if err != nil {
-		return rep, err
-	}
+	vault := secrets.NewVaultWithKeyring(ring, st)
 
 	rep.KeyChecked = true
+	missing := map[string]bool{}
 	for _, ref := range refs {
 		// The value is decrypted and dropped at once; only whether it
-		// worked is kept.
+		// worked is kept, and, if a key is missing, which one.
 		if _, err := vault.Get(ctx, ref.App, ref.Name); err != nil {
 			rep.Undecryptable = append(rep.Undecryptable, ref.App+"/"+ref.Name)
+			var unknown *secrets.UnknownKeyError
+			if errors.As(err, &unknown) && !missing[unknown.ID.String()] {
+				missing[unknown.ID.String()] = true
+				rep.MissingKeys = append(rep.MissingKeys, unknown.ID.String())
+			}
 		}
 	}
 	return rep, nil

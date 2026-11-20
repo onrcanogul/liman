@@ -814,6 +814,8 @@ func backupReport(rep backup.Report) api.BackupReport {
 		Secrets:       rep.Secrets,
 		KeyChecked:    rep.KeyChecked,
 		Undecryptable: rep.Undecryptable,
+		SignedBy:      rep.SignedBy,
+		MissingKeys:   rep.MissingKeys,
 	}
 }
 
