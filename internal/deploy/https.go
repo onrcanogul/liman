@@ -3,7 +3,8 @@ package deploy
 import (
 	"context"
 	"fmt"
-	"strings"
+
+	"github.com/onrcanogul/liman/internal/certs"
 )
 
 // Certs obtains certificates for the domains the proxy serves. It is
@@ -17,13 +18,6 @@ type Certs interface {
 	Obtain(ctx context.Context, domain string, progress func(format string, args ...any)) error
 }
 
-// wantsCertificate reports whether a CA could issue a certificate for
-// domain. Nothing can prove control of a .localhost name from outside, so
-// asking would only fail; such a domain stays on plain HTTP quietly.
-func wantsCertificate(domain string) bool {
-	return domain != "" && domain != "localhost" && !strings.HasSuffix(domain, ".localhost")
-}
-
 // enableHTTPS gets a certificate for the app's domain if it has none yet,
 // and then writes the config again, which now includes HTTPS.
 //
@@ -33,7 +27,7 @@ func wantsCertificate(domain string) bool {
 // take a working release out of service. The app keeps running over plain
 // HTTP, the output says why, and the daemon tries again later.
 func (d *Deployer) enableHTTPS(ctx context.Context, st *state) {
-	if d.Proxy == nil || d.Certs == nil || !wantsCertificate(st.domain) || d.Certs.Has(st.domain) {
+	if d.Proxy == nil || d.Certs == nil || !certs.Issuable(st.domain) || d.Certs.Has(st.domain) {
 		return
 	}
 	fmt.Fprintf(d.out, "==> HTTPS for %s\n", st.domain)

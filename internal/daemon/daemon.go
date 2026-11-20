@@ -67,6 +67,12 @@ Usage:
                                   daemon must be stopped. A backup whose
                                   signature cannot be checked is refused
                                   unless --allow-unsigned is given
+  limand cert list                List the certificates in nginx.cert_dir and
+                                  when they expire
+  limand cert renew <domain>      Get a new certificate for <domain> now, over
+                                  ACME (acme in config.yaml), and reload Nginx.
+                                  The daemon renews by itself; this is for
+                                  when that keeps failing or cannot wait
   limand version                  Print version information
   limand help                     Show this help
 
@@ -110,6 +116,8 @@ func (d *Daemon) Run(ctx context.Context, args []string) int {
 		return d.runToken(ctx, args[1:])
 	case "backup":
 		return d.runBackup(ctx, args[1:])
+	case "cert":
+		return d.runCert(ctx, args[1:])
 	case "version":
 		fmt.Fprintln(d.Stdout, buildinfo.String())
 		return exitOK
@@ -167,13 +175,32 @@ func (d *Daemon) serve(ctx context.Context) int {
 	}
 	// Only assign the proxy when it is enabled. Assigning a nil
 	// *nginx.Manager to the interface field would make the field non-nil.
+	var proxy *nginx.Manager
 	if cfg.Nginx.Enabled() {
-		srv.Proxy = nginx.New(cfg.Nginx)
+		proxy = nginx.New(cfg.Nginx)
+		srv.Proxy = proxy
 	}
+
+	// The certificate renewer runs like the monitor, in a goroutine of its
+	// own that is stopped (and waited for) before the daemon exits.
+	certsCtx, stopCerts := context.WithCancel(context.Background())
+	defer stopCerts()
+	certsDone := make(chan struct{})
 	// The same check for the issuer: a nil *certs.Issuer in the interface
-	// would look like one that is there.
-	if is := d.issuer(cfg); is != nil {
+	// would look like one that is there. acme is only valid together with
+	// nginx, so proxy is set whenever is is.
+	if is := d.issuer(cfg); is != nil && proxy != nil {
 		srv.Certs = deployCerts{is: is}
+		renewer := &certRenewer{
+			store: is.Store, obtain: is.Obtain, proxy: proxy,
+			connect: connect, locks: locks, log: log, now: time.Now,
+		}
+		go func() {
+			defer close(certsDone)
+			renewer.run(certsCtx, certCheckFirst, certCheckEvery)
+		}()
+	} else {
+		close(certsDone)
 	}
 
 	// The monitor runs for as long as the daemon does, in a goroutine of
@@ -278,6 +305,11 @@ func (d *Daemon) serve(ctx context.Context) int {
 	// on its way out.
 	stopMonitor()
 	<-monitorDone
+	// The same for the certificate renewer: an order in progress is cut
+	// off (the CA forgets it), but a half-written certificate cannot
+	// happen, since files are only ever renamed into place.
+	stopCerts()
+	<-certsDone
 
 	// ctx is already cancelled, so the shutdown needs a context of its own.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), timeout)

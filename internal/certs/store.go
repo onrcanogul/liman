@@ -23,6 +23,13 @@ import (
 	"github.com/onrcanogul/liman/internal/app"
 )
 
+// Issuable reports whether a CA could issue a certificate for domain.
+// Nothing can prove control of a .localhost name from outside, so asking
+// would only fail; such domains stay on plain HTTP quietly.
+func Issuable(domain string) bool {
+	return domain != "" && domain != "localhost" && !strings.HasSuffix(domain, ".localhost") && app.ValidDomain(domain)
+}
+
 // ErrNoCertificate is returned for a domain without a certificate on disk.
 var ErrNoCertificate = errors.New("no certificate")
 
