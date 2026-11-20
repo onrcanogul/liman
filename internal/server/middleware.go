@@ -47,12 +47,25 @@ func metaOf(ctx context.Context) *requestMeta {
 	return &requestMeta{}
 }
 
-// authenticate rejects requests that do not carry a valid token.
-func (s *Server) authenticate(next http.Handler) http.Handler {
+// audience says which tokens a handler is for.
+type audience int
+
+const (
+	// managementAPI takes every token except deploy keys.
+	managementAPI audience = iota
+	// triggerEndpoint takes deploy keys and nothing else. It is the one
+	// part of liman meant to be reachable from the internet: a token that
+	// can do more must not work there, so that a leaked admin token is no
+	// more use from outside than a wrong one.
+	triggerEndpoint
+)
+
+// authenticate rejects requests that do not carry a valid token for aud.
+func (s *Server) authenticate(next http.Handler, aud audience) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// The health check must work without credentials: monitoring and
 		// "is the daemon up?" checks have none.
-		if r.URL.Path == "/v1/health" {
+		if aud == managementAPI && r.URL.Path == "/v1/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -119,11 +132,24 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		meta.token, meta.scope, meta.expires, meta.apps, meta.created = info.Name, info.Scope, info.ExpiresAt, info.Apps, info.CreatedAt
 		s.recordUse(r.Context(), info)
 
+		switch {
+		case aud == triggerEndpoint && info.Scope != store.ScopeDeploy:
+			// Somebody put a token that can do far more into a pipeline,
+			// or tried one from outside. Either way the owner should know.
+			s.logger().Warn("a token that is not a deploy key was used on the trigger endpoint",
+				"token", info.Name, "scope", info.Scope, "remote", r.RemoteAddr)
+			writeError(w, http.StatusForbidden, errors.New("only deploy keys are accepted here; create one with: limand token create <name> --app <app> --deploy"))
+			return
+		case aud == managementAPI && info.Scope == store.ScopeDeploy:
+			// Not even GET: a deploy key sits in a CI system's settings,
+			// and must not be able to read what runs here either.
+			writeError(w, http.StatusForbidden, errors.New("this is a deploy key; it only triggers deploys, on the hooks listener"))
+			return
 		// A read-only token may look and nothing else. The rule is about
 		// the method, not a list of paths: an endpoint added later is
 		// covered without anybody remembering to add it here, as long as
 		// it follows HTTP (GET never changes anything, and it does not).
-		if info.Scope != store.ScopeAdmin && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		case aud == managementAPI && info.Scope != store.ScopeAdmin && r.Method != http.MethodGet && r.Method != http.MethodHead:
 			writeError(w, http.StatusForbidden, errors.New("this token is read-only; the request needs a token created without --read-only"))
 			return
 		}

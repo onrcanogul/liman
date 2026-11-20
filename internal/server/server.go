@@ -148,6 +148,10 @@ type Server struct {
 	// used remembers when each token's last use was written to the
 	// database, so that it is written at most once a minute.
 	used readLog
+
+	// triggers counts the deploys each deploy key triggered lately. Its
+	// zero value is ready to use.
+	triggers triggerLimiter
 }
 
 // authFailures returns the failed-authentication limiter.
@@ -292,7 +296,7 @@ func (s *Server) Handler() http.Handler {
 	//   rejectBrowsers    cheap, and before authentication
 	//   authenticate      last: everything behind it is trusted
 	var h http.Handler = mux
-	h = s.authenticate(h)
+	h = s.authenticate(h, managementAPI)
 	h = s.rejectBrowsers(h)
 	h = s.logRequests(h)
 	h = s.limitConcurrency(h)
@@ -343,8 +347,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
 	body, err := s.readBody(w, r, maxDefinitionBytes)
 	if err != nil {
 		writeError(w, bodyErrorStatus(err), fmt.Errorf("read app definition: %w", err))
@@ -366,12 +368,33 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	query := r.URL.Query()
-	dryRun := query.Get("dry_run") == "true"
-	stepMode := query.Get("step") == "true"
-	if dryRun && stepMode {
+	run := deployRun{
+		dryRun:     query.Get("dry_run") == "true",
+		step:       query.Get("step") == "true",
+		definition: body,
+	}
+	if run.dryRun && run.step {
 		writeError(w, http.StatusBadRequest, errors.New("dry_run and step cannot be combined"))
 		return
 	}
+	s.runDeploy(w, r, a, run)
+}
+
+// deployRun is how runDeploy deploys.
+type deployRun struct {
+	dryRun, step bool
+	// definition, when set, is kept as the app's definition once the
+	// deploy has succeeded: a deploy triggered from a pipeline starts from
+	// it. A triggered deploy sets none, and the definition written by hand
+	// stays.
+	definition []byte
+}
+
+// runDeploy deploys a, whose name the request's token has been checked
+// for, and streams the progress and the result to the client.
+func (s *Server) runDeploy(w http.ResponseWriter, r *http.Request, a *app.App, run deployRun) {
+	ctx := r.Context()
+	dryRun, stepMode := run.dryRun, run.step
 
 	// Add the app's secrets to its environment. This comes before anything
 	// is locked, connected or started: a deploy that cannot have its
@@ -450,6 +473,15 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	if !dryRun {
 		s.recordRelease(a, res.Release, started, err)
 		s.record(r, audit.Deploy, a.Name, releaseTarget(res.Release, a.Image), err)
+	}
+	// Before the lock is released, so that a trigger right after this
+	// deploy finds what it deployed. A failure leaves the app running and
+	// only the trigger without the newest definition: it is logged, and
+	// the deploy still succeeded.
+	if err == nil && !dryRun && run.definition != nil {
+		if err := s.Store.SaveDefinition(context.WithoutCancel(ctx), a.Name, run.definition); err != nil {
+			s.logger().Warn("deployed, but could not keep the definition for triggered deploys", "app", a.Name, "error", err.Error())
+		}
 	}
 
 	// Release the app before telling the client that the deploy is over.
@@ -691,6 +723,15 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	// with what was removed by then.
 	var stopErr error
 	defer func() { s.record(r, audit.Stop, name, strings.Join(result.Removed, ", "), stopErr) }()
+
+	// A stopped app must stay stopped: the next push to its registry would
+	// otherwise bring it back through a trigger. So the definition goes
+	// first, and if it cannot, nothing else is touched.
+	if err := s.Store.DeleteDefinition(ctx, name); err != nil {
+		stopErr = err
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 
 	// Take the app out of the proxy first. The other way round there would
 	// be a moment in which Nginx forwards requests to a container that is

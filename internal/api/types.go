@@ -58,6 +58,15 @@ type DeployResult struct {
 	DryRun bool `json:"dry_run"`
 }
 
+// TriggerRequest is the body of POST /hooks/deploy: deploy app again, with
+// the image of its repository that has this digest.
+type TriggerRequest struct {
+	App string `json:"app"`
+	// Digest is the image's content hash, sha256: and 64 hexadecimal
+	// digits, as docker push prints it.
+	Digest string `json:"digest"`
+}
+
 // ConfirmRequest is the body of POST /v1/confirmations/{id}.
 type ConfirmRequest struct {
 	Approve bool `json:"approve"`

@@ -37,6 +37,8 @@ type Harness struct {
 	Client *api.Client
 	// URL is the server's base address.
 	URL string
+	// HookURL is the address of the trigger endpoint's own server.
+	HookURL string
 
 	Engine *enginetest.Fake
 	Store  *store.Store
@@ -121,9 +123,24 @@ func New(t *testing.T, options ...func(*server.Server)) *Harness {
 	srv := httptest.NewServer(h.Server.Handler())
 	t.Cleanup(srv.Close)
 
+	hooks := httptest.NewServer(h.Server.HookHandler())
+	t.Cleanup(hooks.Close)
+
 	h.URL = srv.URL
+	h.HookURL = hooks.URL
 	h.Client = &api.Client{BaseURL: srv.URL, Token: token}
 	return h
+}
+
+// DeployKey creates a deploy key named name for apps and returns its token
+// and a client for the trigger endpoint that uses it.
+func (h *Harness) DeployKey(t *testing.T, name string, apps ...string) (string, *api.Client) {
+	t.Helper()
+	token, err := h.Store.CreateScopedToken(context.Background(), name, store.ScopeDeploy, time.Time{}, apps...)
+	if err != nil {
+		t.Fatalf("create deploy key: %v", err)
+	}
+	return token, &api.Client{BaseURL: h.HookURL, Token: token}
 }
 
 // WithProxy gives the server a real nginx.Manager that writes into a
