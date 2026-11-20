@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -43,6 +44,17 @@ type TokenInfo struct {
 	// LastUsedAt is when the token was last accepted, to within a minute.
 	// The zero time means not since liman started keeping track.
 	LastUsedAt time.Time
+	// Apps are the apps the token is limited to, sorted. Empty means every
+	// app: the only kind there was before limits existed.
+	Apps []string
+}
+
+// Limited reports whether the token is limited to some apps.
+func (t TokenInfo) Limited() bool { return len(t.Apps) > 0 }
+
+// MayUse reports whether the token may act on app.
+func (t TokenInfo) MayUse(app string) bool {
+	return !t.Limited() || slices.Contains(t.Apps, app)
 }
 
 // Expired reports whether the token has stopped working at now.
@@ -61,7 +73,11 @@ func (s *Store) CreateToken(ctx context.Context, name string) (string, error) {
 // stops working at expiresAt; the zero time means never. A time that has
 // already passed is accepted (the token is then useless from the start):
 // deciding what a sensible lifetime is belongs to the caller.
-func (s *Store) CreateScopedToken(ctx context.Context, name, scope string, expiresAt time.Time) (string, error) {
+//
+// With apps the token is limited to those apps; without, it may use every
+// app. The names are stored as given: checking that they are valid app
+// names is the caller's business, as is deciding the scope.
+func (s *Store) CreateScopedToken(ctx context.Context, name, scope string, expiresAt time.Time, apps ...string) (string, error) {
 	if name == "" {
 		return "", fmt.Errorf("token name must not be empty")
 	}
@@ -74,6 +90,11 @@ func (s *Store) CreateScopedToken(ctx context.Context, name, scope string, expir
 	if scope != ScopeAdmin && scope != ScopeRead {
 		return "", fmt.Errorf("unknown token scope %q", scope)
 	}
+	for _, a := range apps {
+		if a == "" {
+			return "", fmt.Errorf("token %q: an app name must not be empty", name)
+		}
+	}
 
 	// crypto/rand reads from the operating system's secure random source.
 	// math/rand must never be used for secrets: its output is predictable.
@@ -83,7 +104,16 @@ func (s *Store) CreateScopedToken(ctx context.Context, name, scope string, expir
 	}
 	token := TokenPrefix + hex.EncodeToString(raw)
 
-	res, err := s.db.ExecContext(ctx,
+	// The token and its apps are written together: a token that exists
+	// without the limits it was meant to have would be one that may use
+	// every app.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("store token: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx,
 		`INSERT INTO tokens (name, hash, scope, created_at, expires_at) VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT (name) DO NOTHING`,
 		name, hashToken(token), scope, formatTime(time.Now()), formatOptionalTime(expiresAt))
@@ -94,6 +124,15 @@ func (s *Store) CreateScopedToken(ctx context.Context, name, scope string, expir
 	// zero rows.
 	if n, _ := res.RowsAffected(); n == 0 {
 		return "", fmt.Errorf("token %q: %w", name, ErrExists)
+	}
+	for _, a := range apps {
+		// OR IGNORE: naming an app twice is not worth an error.
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO token_apps (token, app) VALUES (?, ?)`, name, a); err != nil {
+			return "", fmt.Errorf("store token: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("store token: %w", err)
 	}
 	return token, nil
 }
@@ -142,6 +181,14 @@ func (s *Store) LookupToken(ctx context.Context, token string) (info TokenInfo, 
 	if err := rows.Err(); err != nil {
 		return TokenInfo{}, false, fmt.Errorf("read tokens: %w", err)
 	}
+	if valid {
+		// An error here fails the request. Reading "no rows" into a
+		// token that has some would turn it into one that may use every
+		// app.
+		if info.Apps, err = s.tokenApps(ctx, info.Name); err != nil {
+			return TokenInfo{}, false, err
+		}
+	}
 	// The clock is read once, after the loop: whether a token has expired
 	// must not depend on where in the table it happens to be.
 	if valid && info.Expired(time.Now()) {
@@ -169,7 +216,49 @@ func (s *Store) Tokens(ctx context.Context) ([]TokenInfo, error) {
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("read tokens: %w", err)
 	}
+	_ = rows.Close()
+
+	limits, err := s.db.QueryContext(ctx, `SELECT token, app FROM token_apps ORDER BY token, app`)
+	if err != nil {
+		return nil, fmt.Errorf("read token apps: %w", err)
+	}
+	defer func() { _ = limits.Close() }()
+	apps := map[string][]string{}
+	for limits.Next() {
+		var token, app string
+		if err := limits.Scan(&token, &app); err != nil {
+			return nil, fmt.Errorf("read token apps: %w", err)
+		}
+		apps[token] = append(apps[token], app)
+	}
+	if err := limits.Err(); err != nil {
+		return nil, fmt.Errorf("read token apps: %w", err)
+	}
+	for i := range tokens {
+		tokens[i].Apps = apps[tokens[i].Name]
+	}
 	return tokens, nil
+}
+
+// tokenApps returns the apps the token called name is limited to, sorted.
+func (s *Store) tokenApps(ctx context.Context, name string) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT app FROM token_apps WHERE token = ? ORDER BY app`, name)
+	if err != nil {
+		return nil, fmt.Errorf("read token apps: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var apps []string
+	for rows.Next() {
+		var app string
+		if err := rows.Scan(&app); err != nil {
+			return nil, fmt.Errorf("read token apps: %w", err)
+		}
+		apps = append(apps, app)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read token apps: %w", err)
+	}
+	return apps, nil
 }
 
 // RevokeToken deletes the token stored under name.

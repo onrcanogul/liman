@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -879,6 +880,101 @@ func TestTouchToken(t *testing.T) {
 	// was valid when it arrived.
 	if err := s.TouchToken(ctx, "gone", at); err != nil {
 		t.Errorf("TouchToken() of a missing token = %v, want nil", err)
+	}
+}
+
+func TestTokensLimitedToApps(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+
+	ci, err := s.CreateScopedToken(ctx, "ci", ScopeAdmin, time.Time{}, "orders-api", "billing", "orders-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	all, err := s.CreateToken(ctx, "laptop")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info, ok, err := s.LookupToken(ctx, ci)
+	if err != nil || !ok || !slices.Equal(info.Apps, []string{"billing", "orders-api"}) || !info.Limited() {
+		t.Fatalf("LookupToken(ci) = %+v, %v, %v; want limited to billing and orders-api, sorted, once each", info, ok, err)
+	}
+	if !info.MayUse("orders-api") || info.MayUse("shop") {
+		t.Errorf("MayUse: orders-api %v, shop %v; want true, false", info.MayUse("orders-api"), info.MayUse("shop"))
+	}
+	info, _, _ = s.LookupToken(ctx, all)
+	if info.Limited() || !info.MayUse("anything") {
+		t.Errorf("a token without apps = %+v; want it to use every app", info)
+	}
+
+	tokens, err := s.Tokens(ctx)
+	if err != nil || len(tokens) != 2 || !slices.Equal(tokens[0].Apps, []string{"billing", "orders-api"}) || tokens[1].Apps != nil {
+		t.Errorf("Tokens() = %+v, %v; want ci limited and laptop not", tokens, err)
+	}
+
+	if _, err := s.CreateScopedToken(ctx, "bad", ScopeAdmin, time.Time{}, ""); err == nil {
+		t.Error("CreateScopedToken accepts an empty app name")
+	}
+
+	// Revoking takes the limits along. A token created again under the
+	// same name must not inherit them, in either direction.
+	if err := s.RevokeToken(ctx, "ci"); err != nil {
+		t.Fatal(err)
+	}
+	var left int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM token_apps`).Scan(&left); err != nil || left != 0 {
+		t.Errorf("token_apps rows after revoking = %d, %v; want 0", left, err)
+	}
+	again, err := s.CreateToken(ctx, "ci")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info, _, _ := s.LookupToken(ctx, again); info.Limited() {
+		t.Errorf("a new token under a revoked name = %+v; want no limits", info)
+	}
+}
+
+func TestEventsAndReleasesOfASetOfApps(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	now := time.Now()
+	for _, app := range []string{"a", "b", "c"} {
+		if err := s.AppendEvent(ctx, Event{Time: now, App: app, Release: "r1", Step: "Pull", Action: "run", OK: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.RecordRelease(ctx, Release{App: app, Release: "r1", Image: app + ":1", Status: "succeeded", StartedAt: now, FinishedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	apps := func(evs []Event) []string {
+		var out []string
+		for _, e := range evs {
+			out = append(out, e.App)
+		}
+		return out
+	}
+
+	if got, err := s.EventsOf(ctx, nil, 10); err != nil || len(got) != 3 {
+		t.Errorf("EventsOf(nil) = %v, %v; want every app", apps(got), err)
+	}
+	if got, err := s.EventsOf(ctx, []string{"a", "c"}, 10); err != nil || !slices.Equal(apps(got), []string{"a", "c"}) {
+		t.Errorf("EventsOf(a, c) = %v, %v", apps(got), err)
+	}
+	// The limit counts matching rows only: a limited caller is not left
+	// with less than it asked for because other apps were busier.
+	if got, _ := s.EventsOf(ctx, []string{"a"}, 1); len(got) != 1 || got[0].App != "a" {
+		t.Errorf("EventsOf(a, limit 1) = %v", apps(got))
+	}
+	// An empty set is no app, not every app.
+	if got, err := s.EventsOf(ctx, []string{}, 10); err != nil || len(got) != 0 {
+		t.Errorf("EventsOf(empty) = %v, %v; want nothing", apps(got), err)
+	}
+	if got, err := s.ReleasesOf(ctx, []string{"b"}, 10); err != nil || len(got) != 1 || got[0].App != "b" {
+		t.Errorf("ReleasesOf(b) = %+v, %v", got, err)
+	}
+	if got, err := s.ReleasesOf(ctx, []string{}, 10); err != nil || len(got) != 0 {
+		t.Errorf("ReleasesOf(empty) = %+v, %v; want nothing", got, err)
 	}
 }
 

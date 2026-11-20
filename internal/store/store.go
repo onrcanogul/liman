@@ -5,6 +5,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -110,6 +111,17 @@ var migrations = []string{
 	// the upgrade may well have been used before it.
 	`
 	ALTER TABLE tokens ADD COLUMN last_used_at TEXT;
+	`,
+
+	// 7: the apps a token is limited to. A token without rows here may use
+	// every app, which is what every token that already exists keeps. The
+	// rows go with their token when it is revoked.
+	`
+	CREATE TABLE token_apps (
+		token TEXT NOT NULL REFERENCES tokens (name) ON DELETE CASCADE,
+		app   TEXT NOT NULL,
+		PRIMARY KEY (token, app)
+	);
 	`,
 }
 
@@ -291,14 +303,24 @@ func (s *Store) AppendEvent(ctx context.Context, ev Event) error {
 // Events returns the newest limit events, oldest first. An empty app
 // returns events of all apps.
 func (s *Store) Events(ctx context.Context, app string, limit int) ([]Event, error) {
+	return s.EventsOf(ctx, oneApp(app), limit)
+}
+
+// EventsOf is Events for a set of apps; nil means every app, and an empty
+// non-nil set no app at all.
+func (s *Store) EventsOf(ctx context.Context, apps []string, limit int) ([]Event, error) {
+	filter, err := appFilter(apps)
+	if err != nil {
+		return nil, err
+	}
 	// The inner query picks the newest rows; the outer one puts them back
-	// in chronological order. "? = ''" makes the filter optional without
-	// building the SQL text dynamically.
+	// in chronological order. The filter is one parameter, a JSON array
+	// (or NULL for every app), so the SQL text never changes with it.
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT time, app, release, step, action, ok, error, duration_ms FROM (
-			SELECT * FROM events WHERE (? = '' OR app = ?) ORDER BY id DESC LIMIT ?
+			SELECT * FROM events WHERE (? IS NULL OR app IN (SELECT value FROM json_each(?))) ORDER BY id DESC LIMIT ?
 		 ) ORDER BY id ASC`,
-		app, app, limit)
+		filter, filter, limit)
 	if err != nil {
 		return nil, fmt.Errorf("read events: %w", err)
 	}
@@ -360,10 +382,19 @@ func (s *Store) RecordRelease(ctx context.Context, r Release) error {
 // Releases returns the newest limit releases, newest first. An empty app
 // returns releases of all apps.
 func (s *Store) Releases(ctx context.Context, app string, limit int) ([]Release, error) {
+	return s.ReleasesOf(ctx, oneApp(app), limit)
+}
+
+// ReleasesOf is Releases for a set of apps, as in EventsOf.
+func (s *Store) ReleasesOf(ctx context.Context, apps []string, limit int) ([]Release, error) {
+	filter, err := appFilter(apps)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT app, release, image, status, error, started_at, finished_at
-		 FROM releases WHERE (? = '' OR app = ?) ORDER BY id DESC LIMIT ?`,
-		app, app, limit)
+		 FROM releases WHERE (? IS NULL OR app IN (SELECT value FROM json_each(?))) ORDER BY id DESC LIMIT ?`,
+		filter, filter, limit)
 	if err != nil {
 		return nil, fmt.Errorf("read releases: %w", err)
 	}
@@ -399,6 +430,29 @@ var ErrNotFound = errors.New("not found")
 // Times are stored as text in a fixed UTC format. Fixed-width UTC strings
 // sort in chronological order, and remain readable in the sqlite3 shell.
 const timeLayout = "2006-01-02T15:04:05.000000000Z"
+
+// oneApp turns the single-app filter of Events and Releases into a set:
+// "" is every app.
+func oneApp(app string) []string {
+	if app == "" {
+		return nil
+	}
+	return []string{app}
+}
+
+// appFilter encodes a set of apps for "app IN (SELECT value FROM
+// json_each(?))": nil (every app) becomes NULL, anything else a JSON array,
+// so an empty set matches nothing rather than everything.
+func appFilter(apps []string) (any, error) {
+	if apps == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(apps)
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
+}
 
 func formatTime(t time.Time) string {
 	return t.UTC().Format(timeLayout)

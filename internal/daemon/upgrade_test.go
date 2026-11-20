@@ -17,7 +17,7 @@ import (
 var oldSchema = store.SchemaVersion() - 1
 
 // downgrade turns the database in home back into what the previous schema
-// version left: the last migration (token last use) undone. A new
+// version left: the last migration (token apps) undone. A new
 // migration has to be undone here instead.
 func downgrade(t *testing.T, home string) {
 	t.Helper()
@@ -27,7 +27,7 @@ func downgrade(t *testing.T, home string) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	for _, q := range []string{"ALTER TABLE tokens DROP COLUMN last_used_at", fmt.Sprintf("PRAGMA user_version = %d", oldSchema)} {
+	for _, q := range []string{"DROP TABLE token_apps", fmt.Sprintf("PRAGMA user_version = %d", oldSchema)} {
 		if _, err := db.ExecContext(ctx, q); err != nil {
 			t.Fatalf("%s: %v", q, err)
 		}
