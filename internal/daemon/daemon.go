@@ -73,6 +73,10 @@ Usage:
                                   ACME (acme in config.yaml), and reload Nginx.
                                   The daemon renews by itself; this is for
                                   when that keeps failing or cannot wait
+  limand key rotate               Replace the master key and seal every secret
+                                  again with the new one. The old key is kept
+                                  for older backups. The daemon must be
+                                  stopped
   limand version                  Print version information
   limand help                     Show this help
 
@@ -118,6 +122,8 @@ func (d *Daemon) Run(ctx context.Context, args []string) int {
 		return d.runBackup(ctx, args[1:])
 	case "cert":
 		return d.runCert(ctx, args[1:])
+	case "key":
+		return d.runKey(ctx, args[1:])
 	case "version":
 		fmt.Fprintln(d.Stdout, buildinfo.String())
 		return exitOK
