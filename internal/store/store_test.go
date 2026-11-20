@@ -865,3 +865,54 @@ func TestResealSecretsIsAllOrNothing(t *testing.T) {
 		}
 	}
 }
+
+func TestOpenCurrentDoesNotUpgrade(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "liman.db")
+
+	// Nothing there yet: 0, and a new database is set up by either.
+	if v, err := SchemaVersionOf(ctx, path); err != nil || v != 0 {
+		t.Fatalf("SchemaVersionOf(missing) = %d, %v", v, err)
+	}
+	s, err := OpenCurrent(ctx, path)
+	if err != nil {
+		t.Fatalf("OpenCurrent() of a new file = %v", err)
+	}
+	_ = s.Close()
+	if v, _ := SchemaVersionOf(ctx, path); v != SchemaVersion() {
+		t.Fatalf("schema after OpenCurrent of a new file = %d, want %d", v, SchemaVersion())
+	}
+
+	// A database an older version left behind.
+	old := filepath.Join(t.TempDir(), "old.db")
+	db, err := sql.Open("sqlite", "file:"+old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := db.ExecContext(ctx, migrations[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, "PRAGMA user_version = 3"); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	_, err = OpenCurrent(ctx, old)
+	var oldErr *OldSchemaError
+	if !errors.As(err, &oldErr) || oldErr.Have != 3 || oldErr.Want != SchemaVersion() {
+		t.Fatalf("OpenCurrent() of an old database = %v, want an OldSchemaError 3 -> %d", err, SchemaVersion())
+	}
+	if v, _ := SchemaVersionOf(ctx, old); v != 3 {
+		t.Errorf("OpenCurrent changed the schema to %d", v)
+	}
+	s, err = Open(ctx, old)
+	if err != nil {
+		t.Fatalf("Open() of an old database = %v", err)
+	}
+	_ = s.Close()
+	if v, _ := SchemaVersionOf(ctx, old); v != SchemaVersion() {
+		t.Errorf("schema after Open = %d, want %d", v, SchemaVersion())
+	}
+}

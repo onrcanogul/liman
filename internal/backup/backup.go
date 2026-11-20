@@ -139,6 +139,26 @@ func CheckWithSignature(ctx context.Context, path, sigPath, keyPath string) (Rep
 // Create writes a backup of st into dir, reads it back and checks it. It
 // returns the path of the new file.
 func Create(ctx context.Context, st *store.Store, dir, keyPath string) (string, Report, error) {
+	return create(ctx, st, dir, keyPath, false)
+}
+
+// CreateBeforeUpgrade backs up the database at path exactly as it is,
+// before a newer liman upgrades its schema. It does not open the database
+// for writing, so nothing about it changes.
+//
+// The backup is what going back to the previous version restores, so that
+// version must be able to check it: the signature is written in format v1,
+// which every version that signs backups reads.
+func CreateBeforeUpgrade(ctx context.Context, path, dir, keyPath string) (string, Report, error) {
+	st, err := store.OpenReadOnly(ctx, path)
+	if err != nil {
+		return "", Report{}, err
+	}
+	defer func() { _ = st.Close() }()
+	return create(ctx, st, dir, keyPath, true)
+}
+
+func create(ctx context.Context, st *store.Store, dir, keyPath string, legacySignature bool) (string, Report, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", Report{}, fmt.Errorf("create backup directory: %w", err)
 	}
@@ -154,7 +174,7 @@ func Create(ctx context.Context, st *store.Store, dir, keyPath string) (string, 
 		return "", Report{}, err
 	}
 
-	if _, err := Sign(dest, keyPath); err != nil {
+	if _, err := sign(dest, keyPath, legacySignature); err != nil {
 		return dest, Report{}, err
 	}
 

@@ -293,9 +293,10 @@ func (d *Daemon) backupRestore(ctx context.Context, args []string) int {
 	}
 	placed = true
 
-	// 5. Open it the normal way. That brings an older schema up to date and
+	// 5. Open it the way the daemon does. That brings a backup made by an
+	// older version up to date (restoring it is the decision to do so) and
 	// proves the daemon will be able to start.
-	st, err := d.openStore(ctx)
+	st, err := store.Open(ctx, target)
 	if err != nil {
 		return d.fail(fmt.Errorf("the restored database does not open: %w", err))
 	}

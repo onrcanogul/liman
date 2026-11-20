@@ -154,15 +154,15 @@ func (d *Daemon) serve(ctx context.Context) int {
 		return d.fail(err)
 	}
 
-	st, err := d.openStore(ctx)
+	// slog writes structured log lines: a message plus key=value pairs.
+	// Under systemd they go to the journal; nothing else is needed.
+	log := slog.New(slog.NewTextHandler(d.Stderr, nil))
+
+	st, err := d.openStoreForServe(ctx, cfg, log)
 	if err != nil {
 		return d.fail(err)
 	}
 	defer func() { _ = st.Close() }()
-
-	// slog writes structured log lines: a message plus key=value pairs.
-	// Under systemd they go to the journal; nothing else is needed.
-	log := slog.New(slog.NewTextHandler(d.Stderr, nil))
 
 	connect := connectOnce(d.Connect)
 	// One set of locks for everything that changes an app: the API handlers
@@ -679,8 +679,42 @@ func (d *Daemon) tokenRevoke(ctx context.Context, args []string) int {
 	return exitOK
 }
 
+// openStore opens the database for a command. One that an older version
+// wrote is not upgraded here: that is the daemon's start, which backs it up
+// first (see openStoreForServe).
 func (d *Daemon) openStore(ctx context.Context) (*store.Store, error) {
-	return store.Open(ctx, filepath.Join(d.Home, "liman.db"))
+	return store.OpenCurrent(ctx, filepath.Join(d.Home, "liman.db"))
+}
+
+// openStoreForServe opens the database for the daemon. A database an older
+// version wrote is first backed up as it is, and only then upgraded: that
+// backup and the previous binary are the way back, since the previous
+// version cannot read an upgraded database. Without the backup there is no
+// upgrade; the daemon does not start, and says why.
+func (d *Daemon) openStoreForServe(ctx context.Context, cfg config.Config, log *slog.Logger) (*store.Store, error) {
+	path := filepath.Join(d.Home, "liman.db")
+	have, err := store.SchemaVersionOf(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	want := store.SchemaVersion()
+	upgrading := have > 0 && have < want
+	if upgrading {
+		file, _, err := backup.CreateBeforeUpgrade(ctx, path, d.backupDir(cfg), d.keyPath(cfg))
+		if err != nil {
+			return nil, fmt.Errorf("the database has schema %d and this limand uses %d, but backing it up before the upgrade failed, so nothing was changed: %w", have, want, err)
+		}
+		log.Info("backed up the database before upgrading it; to go back to the previous version, restore this backup with it",
+			"backup", file, "from_schema", have, "to_schema", want)
+	}
+	st, err := store.Open(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if upgrading {
+		log.Info("upgraded the database", "from_schema", have, "to_schema", want, "version", buildinfo.Version)
+	}
+	return st, nil
 }
 
 func (d *Daemon) fail(err error) int {

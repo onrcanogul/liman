@@ -91,6 +91,12 @@ func loadKeyring(keyPath string) (*secrets.Keyring, error) {
 // Sign writes the signature file for the backup at path, with the primary
 // key. It reports false if there is no master key to sign with.
 func Sign(path, keyPath string) (bool, error) {
+	return sign(path, keyPath, false)
+}
+
+// sign writes a signature in format v2, or in format v1 when legacy is
+// set: v1 does not name the key, but versions before key IDs can read it.
+func sign(path, keyPath string, legacy bool) (bool, error) {
 	ring, err := loadKeyring(keyPath)
 	if err != nil || ring == nil {
 		return false, err
@@ -108,7 +114,11 @@ func Sign(path, keyPath string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("sign backup: %w", err)
 	}
-	_, writeErr := tmp.WriteString(sigHeaderV2 + id.String() + " " + hex.EncodeToString(sum) + "\n")
+	line := sigHeaderV2 + id.String() + " " + hex.EncodeToString(sum) + "\n"
+	if legacy {
+		line = sigHeaderV1 + hex.EncodeToString(sum) + "\n"
+	}
+	_, writeErr := tmp.WriteString(line)
 	if err := errors.Join(writeErr, tmp.Sync(), tmp.Close()); err != nil {
 		_ = os.Remove(tmp.Name())
 		return false, fmt.Errorf("sign backup: %w", err)

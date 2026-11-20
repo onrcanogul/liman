@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -108,9 +109,53 @@ var migrations = []string{
 // SchemaVersion is the schema version this build reads and writes.
 func SchemaVersion() int { return len(migrations) }
 
+// OldSchemaError is returned by OpenCurrent for a database an older
+// version of liman wrote.
+type OldSchemaError struct {
+	Path       string
+	Have, Want int
+}
+
+func (e *OldSchemaError) Error() string {
+	return fmt.Sprintf("%s has schema version %d and this limand uses %d; start the daemon once (it backs the database up first, then upgrades it), then run this again", e.Path, e.Have, e.Want)
+}
+
+// SchemaVersionOf returns the schema version of the database at path
+// without changing anything: 0 for a file that does not exist yet.
+func SchemaVersionOf(ctx context.Context, path string) (int, error) {
+	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	st, err := OpenReadOnly(ctx, path)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = st.Close() }()
+	var version int
+	if err := st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		return 0, fmt.Errorf("read schema version: %w", err)
+	}
+	return version, nil
+}
+
 // Open opens the database at path, creating it and its directory if
-// needed, and brings the schema up to date.
+// needed, and brings the schema up to date, whatever version wrote it.
+//
+// Upgrading a database is a step back versions cannot undo: an older liman
+// refuses a newer schema. Only the daemon calls Open on a database that may
+// be old, and it backs it up first. Everything else uses OpenCurrent.
 func Open(ctx context.Context, path string) (*Store, error) {
+	return open(ctx, path, true)
+}
+
+// OpenCurrent is Open for everything but the daemon's start: a new, empty
+// database is set up, but one an older version wrote is not upgraded; that
+// returns an *OldSchemaError.
+func OpenCurrent(ctx context.Context, path string) (*Store, error) {
+	return open(ctx, path, false)
+}
+
+func open(ctx context.Context, path string, upgrade bool) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create database directory: %w", err)
 	}
@@ -155,7 +200,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	}
 
 	s := &Store{db: db}
-	if err := s.migrate(ctx); err != nil {
+	if err := s.migrate(ctx, path, upgrade); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -167,13 +212,18 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) migrate(ctx context.Context) error {
+func (s *Store) migrate(ctx context.Context, path string, upgrade bool) error {
 	var version int
 	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return fmt.Errorf("read schema version: %w", err)
 	}
 	if version > len(migrations) {
 		return fmt.Errorf("database schema version %d is newer than this liman understands (%d)", version, len(migrations))
+	}
+	// Version 0 is a database that was just created: nothing in it to
+	// lose, so it is set up whoever opens it.
+	if version > 0 && version < len(migrations) && !upgrade {
+		return &OldSchemaError{Path: path, Have: version, Want: len(migrations)}
 	}
 
 	for i := version; i < len(migrations); i++ {
