@@ -30,6 +30,10 @@ const (
 	// dashboard on a wall, or a panel opened on a machine that is not
 	// entirely trusted, should be given.
 	ScopeRead = "read"
+	// ScopeDeploy may trigger deploys of its apps from a pipeline and
+	// nothing else: it is refused everywhere but on the trigger endpoint,
+	// which in turn takes no other kind. It always names its apps.
+	ScopeDeploy = "deploy"
 )
 
 // TokenInfo describes a token without revealing it.
@@ -87,8 +91,13 @@ func (s *Store) CreateScopedToken(ctx context.Context, name, scope string, expir
 	if len(name) > 64 || !tokenNameRe.MatchString(name) {
 		return "", fmt.Errorf("token name %q: use up to 64 letters, digits, dots, dashes and underscores", name)
 	}
-	if scope != ScopeAdmin && scope != ScopeRead {
+	if scope != ScopeAdmin && scope != ScopeRead && scope != ScopeDeploy {
 		return "", fmt.Errorf("unknown token scope %q", scope)
+	}
+	// A deploy key for every app would be a key that can roll out any
+	// image of any app from anywhere: it is always limited.
+	if scope == ScopeDeploy && len(apps) == 0 {
+		return "", fmt.Errorf("token %q: a deploy key must name its apps", name)
 	}
 	for _, a := range apps {
 		if a == "" {

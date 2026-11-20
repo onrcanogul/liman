@@ -143,6 +143,18 @@ var migrations = []string{
 	);
 	CREATE INDEX audit_app ON audit (app, seq);
 	`,
+
+	// 9: the app definition of the last successful deploy made by hand. A
+	// deploy triggered from a pipeline runs it again with another image;
+	// stopping the app removes it, so a stopped app is not brought back by
+	// the next push.
+	`
+	CREATE TABLE app_definitions (
+		app        TEXT PRIMARY KEY,
+		definition BLOB NOT NULL,
+		updated_at TEXT NOT NULL
+	);
+	`,
 }
 
 // SchemaVersion is the schema version this build reads and writes.

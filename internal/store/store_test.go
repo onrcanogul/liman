@@ -978,6 +978,46 @@ func TestEventsAndReleasesOfASetOfApps(t *testing.T) {
 	}
 }
 
+func TestDefinitions(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	if _, found, err := s.Definition(ctx, "web"); err != nil || found {
+		t.Fatalf("Definition() of nothing = %v, %v", found, err)
+	}
+	for _, def := range []string{"name: web\nimage: a:1\n", "name: web\nimage: a:2\n"} {
+		if err := s.SaveDefinition(ctx, "web", []byte(def)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if def, found, err := s.Definition(ctx, "web"); err != nil || !found || string(def) != "name: web\nimage: a:2\n" {
+		t.Errorf("Definition() = %q, %v, %v; want the second", def, found, err)
+	}
+	if err := s.DeleteDefinition(ctx, "web"); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := s.Definition(ctx, "web"); found {
+		t.Error("the definition survived DeleteDefinition")
+	}
+	if err := s.DeleteDefinition(ctx, "web"); err != nil {
+		t.Errorf("DeleteDefinition() of nothing = %v", err)
+	}
+}
+
+func TestDeployKeysNameTheirApps(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	if _, err := s.CreateScopedToken(ctx, "ci", ScopeDeploy, time.Time{}); err == nil {
+		t.Error("a deploy key for every app was created")
+	}
+	tok, err := s.CreateScopedToken(ctx, "ci", ScopeDeploy, time.Time{}, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info, ok, err := s.LookupToken(ctx, tok); err != nil || !ok || info.Scope != ScopeDeploy || !info.MayUse("web") || info.MayUse("api") {
+		t.Errorf("LookupToken() = %+v, %v, %v", info, ok, err)
+	}
+}
+
 func TestResealSecretsIsAllOrNothing(t *testing.T) {
 	s := openTest(t)
 	ctx := context.Background()
