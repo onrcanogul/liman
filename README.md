@@ -230,8 +230,7 @@ no API to read a secret back.
 
 ## The panel
 
-While it runs, the daemon serves a read-only web panel at `/ui/` on its
-listen address (`http://127.0.0.1:7070/ui/` by default):
+While it runs, the daemon serves a web panel at `/ui/` on its listen address (`http://127.0.0.1:7070/ui/` by default):
 
 - **Overview**: how many apps are fine, which ones need attention, a health
   timeline per app, deploys per day and the latest activity.
@@ -240,11 +239,25 @@ listen address (`http://127.0.0.1:7070/ui/` by default):
   deploys, the names of its secrets, its activity and its logs.
 - **Activity**, **Secrets** (names only) and **Daemon** (version, which
   parts are switched on).
+- **Backups**: the backups on the server, a button to make one now and a
+  check for each (is it intact, does the server's master key open it).
 
 Sign in with an API token (`limand token create panel`). The token is kept
-in that browser tab only and is forgotten when the tab closes. The panel
-cannot change anything: it only sends `GET` requests, and deploys, rollbacks
-and secrets stay with the command line.
+in that browser tab only and is forgotten when the tab closes.
+
+Besides looking, the panel can do these things, each on the page it belongs
+to:
+
+| Action | Where | Before it happens |
+|---|---|---|
+| Roll back | App page | A dialog shows the release in service and the one that replaces it; progress is shown step by step |
+| Stop and remove | App page | The app's name has to be typed |
+| Add or replace a secret | App page, Secrets | The value is typed into a hidden field, sent once and never shown again |
+| Remove a secret | App page, Secrets | A dialog says what stops working |
+| Back up now, check a backup | Backups | Nothing to confirm: neither can lose data |
+
+Deploying a new version and restoring a backup stay with the command line:
+the first needs an `app.yaml`, the second a stopped daemon.
 
 The files of the panel are compiled into `limand`; there is nothing to
 install next to it. They are served without a token, because they contain no
@@ -329,6 +342,9 @@ The environment variables `LIMAN_URL` and `LIMAN_TOKEN` take precedence.
 | `GET /v1/info` | Version, start time and which parts of the daemon are switched on |
 | `GET /v1/releases[?app=][&limit=]` | Deploys and how they ended, newest first |
 | `GET /v1/apps/{name}/health[?range=6h\|24h\|7d]` | Health checks of an app, summarised in 48 buckets |
+| `GET /v1/backups` | Backups on the server, newest first |
+| `POST /v1/backups` | Make a backup now and check it |
+| `POST /v1/backups/{name}/verify` | Check a backup: intact, and can its secrets be decrypted |
 | `GET /ui/` | The panel's files; no token needed, they contain no data |
 
 ## Security
@@ -339,12 +355,28 @@ is equivalent to root. The API is built around keeping everyone else out:
 - **Network.** Loopback or private network only, enforced on both sides (see
   above). Encryption is delegated to that network (WireGuard).
 - **Authentication.** Bearer tokens of 256 random bits; only their SHA-256 is
-  stored. Ten failed attempts from one address within a minute lock that
-  address out (429) until the minute is over, valid token or not.
-- **Browsers.** Requests carrying an `Origin` header are refused, so a web
+  stored. A token is either `admin` or, created with `--read-only`, `read`:
+  such a token can look at everything and is refused every request that is
+  not a `GET`. Give the panel a read-only token wherever it only needs to
+  show things. Every request is logged with the name of the token that made
+  it (never the token), so `journalctl -u limand` answers "who did that".
+  Ten failed attempts from one address (one /64 for IPv6) within a minute
+  lock that address out (429) until the minute is over. A request with a
+  valid token is never locked out: failures by someone else at the same
+  address cannot keep the operator away.
+- **Browsers.** Requests that a browser marks as coming from another site
+  (`Sec-Fetch-Site`) are refused, as are requests carrying an `Origin` header, so a web
   page open on the same machine cannot talk to a daemon on 127.0.0.1. The
-  daemon's own panel is not affected: it only reads, and browsers send no
-  `Origin` header with a same-origin `GET`.
+  one exception is the daemon's own panel: a request whose `Origin` is the
+  daemon's own address is accepted, provided that address is an IP or
+  `localhost` (a host name could be a hostile site pointed at 127.0.0.1).
+  The token is not a cookie, so a foreign page has nothing the browser
+  would attach for it; there is no session to ride on. A token typed into
+  the panel can do everything that token can do, so with an admin token the
+  panel is as sensitive as a terminal with the CLI configured. It signs
+  itself out after 30 minutes without a click or a key press, and its
+  content security policy also demands Trusted Types, which makes the
+  browser itself refuse to turn a string into markup.
 - **The panel.** Served with a content security policy that allows scripts,
   styles and connections from the daemon itself and nothing else, and
   forbids framing. The page builds everything from text nodes, so a
@@ -357,13 +389,20 @@ is equivalent to root. The API is built around keeping everyone else out:
 - **Input.** Every field of an app definition and every app name in a URL is
   checked against an allowlist of characters and a maximum length. Values are
   never concatenated into SQL, shell commands or file paths.
+- **Values read back.** What liman wrote onto a container as a label
+  (release, domain, health check path) is validated again when it is read:
+  anyone with Docker access can start a container with any labels, and an
+  image can declare labels of its own.
+- **Terminal output.** The CLI removes control characters from everything it
+  prints, so container logs and error messages cannot repaint the terminal.
 - **Files.** `liman.db`, `master.key` and `client.yaml` are readable by their
   owner only. Tokens, secrets and environment variable values are never
   written to logs.
 - **Secrets.** Encrypted at rest and write-only over the API (see Secrets).
 
-Known limits: no TLS of its own, no scopes (every token can do everything),
-tokens do not expire, and the failed-attempt limit is per address and kept in
+Known limits: the `liman` user's sudo rule makes root parse Nginx config that user
+writes, no TLS of its own, only two scopes (an `admin` token can do
+everything, for every app), tokens do not expire, and the failed-attempt limit is per address and kept in
 memory.
 
 ## Installing on a server
@@ -437,14 +476,75 @@ systemctl restart limand         # waits for running deploys, up to two minutes
 
 The unit restarts the daemon if it crashes and starts it at boot, after
 Docker and WireGuard. It is sandboxed: `/usr` and `/etc` are read-only for
-it (except `/etc/nginx/liman.d`), `/home` is hidden and it has a `/tmp` of
-its own. Membership of the `docker` group is still equivalent to root; the
+it (except `/etc/nginx/liman.d`), `/home` and device files are hidden, it
+has a `/tmp` of its own and may not create namespaces or touch kernel
+settings (`systemd-analyze security limand`). The backup unit is locked down
+much further: no capabilities, no network, a read-only file system except
+its two directories. Membership of the `docker` group is still equivalent to root; the
 dedicated user limits accidents, not a compromised daemon.
 
-Back up `/var/lib/liman/master.key` and, separately, `liman.db`.
+The installer also schedules a daily backup; see Backups.
 
 For private images, log in as the daemon's user:
 `sudo -u liman -H docker login ghcr.io`.
+
+## Backups
+
+Everything the daemon knows that cannot be recreated is in `liman.db`:
+tokens, encrypted secrets, the history. Containers, images and the Nginx
+config are not backed up; deploying again rebuilds them.
+
+```
+limand backup create /var/backups/liman --keep 14
+limand backup verify /var/backups/liman/liman-20261120-031500.db
+limand backup restore /var/backups/liman/liman-20261120-031500.db
+```
+
+- **create** writes `liman-<date>-<time>.db` into the directory and can run
+  while the daemon is working: the copy is made by SQLite itself and is the
+  state at one moment. (Copying `liman.db` with `cp` while the daemon runs
+  can produce a corrupt file.) The new file is then opened and checked, and
+  only after that are older backups removed.
+- **verify** checks a backup's signature, checks it for damage and tries
+  every secret in it against the master key. A backup is only known to be
+  good once it has been read.
+- **restore** needs the daemon stopped. It refuses a backup whose signature
+  is wrong, and one without a checkable signature unless `--allow-unsigned`
+  is given. It checks the backup first, keeps
+  the database it replaces as `liman.db.replaced-<date>-<time>`, and lists
+  the tokens that are valid afterwards: one that was revoked after the
+  backup was made is valid again.
+
+The panel's Backups page does `create` and `verify` from the browser. It
+uses the directory and count from `config.yaml`:
+
+```yaml
+# config.yaml
+backup:
+  dir: /var/backups/liman   # default: backups/ in $LIMAN_HOME
+  keep: 14                  # the default; 0 keeps them all
+```
+
+Restoring is deliberately not offered there: it replaces the database the
+daemon has open, so the daemon must be stopped.
+
+**Backups are signed.** Next to every `liman-….db` is a `liman-….db.sig`:
+an HMAC of the file, keyed from the master key. The tokens in a backup
+become valid tokens when it is restored, and a token row is only a hash that
+anyone can compute for a token of their own; the signature is what shows
+that a backup is still the file the daemon wrote. Keep the two files
+together when copying backups elsewhere.
+
+**The master key is not in the backup**, on purpose: a backup that carries
+its own key protects nothing. Copy `master.key` once, by hand, to a place
+that is not where the backups go. Without it the secrets in every backup are
+lost; `verify` and `restore` say so when the key does not match.
+
+On a server installed with `install.sh` a systemd timer takes a backup every
+day into `/var/backups/liman` and keeps the newest 14
+(`systemctl list-timers limand-backup`, `journalctl -u limand-backup`). Those
+files are on the server's own disk: copy them elsewhere with whatever you
+already use (rsync, restic), or they are lost together with the server.
 
 ### Practising on a throwaway server
 
@@ -593,6 +693,7 @@ internal/daemon/     the limand command: serving and token management
 internal/api/        wire types and the HTTP client (what the CLI links)
 internal/server/     HTTP handlers, streaming, auth, per-app locking
 internal/panel/      the web panel: static files embedded into limand
+internal/backup/     creating, listing and checking backups (command and API)
 internal/store/      SQLite: history, releases, tokens, sealed secrets, health samples
 internal/secrets/    encryption of secrets at rest and the master key file
 internal/app/        app definition: loading and validation
@@ -608,6 +709,6 @@ internal/applock/    per-app lock shared by the API and the monitor
 internal/textdiff/   line diff used to preview config changes
 internal/loadtest/   small load generator used by the load tests
 internal/buildinfo/  version metadata injected at build time
-deploy/              systemd unit and the server install script
+deploy/              systemd units (daemon, daily backup) and the server install script
 scripts/             local development helpers
 ```

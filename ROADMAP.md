@@ -101,4 +101,4 @@ collection.
 - [x] Stage 7
 - [x] Stage 8
   - [x] 8a: encrypted secret storage
-  - [x] 8b: read-only status panel
+  - [x] 8b: status panel (later extended: rollback, stop, secrets and backups from the browser)
