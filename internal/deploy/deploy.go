@@ -652,19 +652,23 @@ type indentWriter struct {
 }
 
 func (iw *indentWriter) Write(p []byte) (int, error) {
+	// The indented text is assembled first and passed on in one write. The
+	// first version wrote byte by byte; behind it sits a stream that turns
+	// every write into an event of its own, so a line of log output became
+	// eighty JSON objects and a multi-byte character was cut in pieces.
+	out := make([]byte, 0, len(p)+16)
 	for _, b := range p {
 		if iw.atLineStart {
-			if _, err := io.WriteString(iw.w, "    "); err != nil {
-				return 0, err
-			}
+			out = append(out, "    "...)
 			iw.atLineStart = false
 		}
-		if _, err := iw.w.Write([]byte{b}); err != nil {
-			return 0, err
-		}
+		out = append(out, b)
 		if b == '\n' {
 			iw.atLineStart = true
 		}
+	}
+	if _, err := iw.w.Write(out); err != nil {
+		return 0, err
 	}
 	// Report the caller's byte count, not the count including indentation;
 	// io.Writer requires n <= len(p).
