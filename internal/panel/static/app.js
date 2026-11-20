@@ -288,8 +288,36 @@ function refresh() {
   });
 }
 
+// rejected says why the daemon refused the token. It answers "token
+// expired" for a token that has run out and nothing more specific for any
+// other, so expiry is the one reason worth telling apart.
+function rejected(err) {
+  return /^token expired/.test(str(err && err.message, 100))
+    ? 'This token has expired. Create a new one on the server with limand token create.'
+    : 'The daemon rejected this token. It may have been revoked.';
+}
+
+// tokenLeft is how long the token has left, in milliseconds, or null when
+// it never expires. It is measured with the daemon's clock, not this
+// computer's: the daemon decides when the token stops working.
+var EXPIRY_WARNING = 14 * 86400000;
+function tokenLeft() {
+  var end = S.info ? time(S.info.token_expires_at) : null, now = S.info ? time(S.info.now) : null;
+  return end === null || now === null ? null : end - now;
+}
+// roughly says a span the way limand token list does: days and hours to
+// the nearest, each only from two of it upwards, so that 47 hours is never
+// "1 day" or "2 days".
+function roughly(ms) {
+  function n(v, unit) { return v + ' ' + unit + (v === 1 ? '' : 's'); }
+  if (ms >= 2 * 86400000) return n(Math.round(ms / 86400000), 'day');
+  if (ms >= 2 * 3600000) return n(Math.round(ms / 3600000), 'hour');
+  if (ms >= 60000) return n(Math.floor(ms / 60000), 'minute');
+  return 'less than a minute';
+}
+
 function connectionFailed(err) {
-  if (err.status === 401) { signOut('The daemon rejected this token. It may have been revoked.'); return; }
+  if (err.status === 401) { signOut(rejected(err)); return; }
   if (err.status === 429) { signOut(err.message); return; }
   // Unreachable, or an error of the daemon's own: keep what is on screen,
   // mark it as stale and keep trying.
@@ -385,7 +413,7 @@ function backUpNow() {
     S.backupNote = { kind: rep && rep.ok ? 'ok' : 'warn', text: 'Wrote ' + orDash(b.name, 80) + ' (' + size(b.size_bytes) + '): ' + reportText(rep) + '.' + (removed ? ' Removed ' + removed + ' older ' + (removed === 1 ? 'backup.' : 'backups.') : '') };
     if (b.name && rep) S.checks.set(str(b.name), { busy: false, report: rep, error: '' });
   }, function (e) {
-    if (e && e.status === 401) { signOut('The daemon rejected this token. It may have been revoked.'); return; }
+    if (e && e.status === 401) { signOut(rejected(e)); return; }
     S.backupNote = { kind: 'crit', text: 'No backup was made. ' + str(e && e.message, 300) };
   }).then(function () {
     S.backupBusy = false; S.backups = null;
@@ -398,7 +426,7 @@ function checkBackup(name) {
   send('POST', '/v1/backups/' + encodeURIComponent(name) + '/verify', null, 120000).then(function (rep) {
     S.checks.set(name, { busy: false, report: rep, error: '' });
   }, function (e) {
-    if (e && e.status === 401) { signOut('The daemon rejected this token. It may have been revoked.'); return; }
+    if (e && e.status === 401) { signOut(rejected(e)); return; }
     S.checks.set(name, { busy: false, report: null, error: str(e && e.message, 300) || 'The check failed.' });
   }).then(function () { if (S.token) render(); });
 }
@@ -556,6 +584,10 @@ function banners() {
     h('button', { class: 'btn small', onclick: function () { refresh(); } }, 'Try again')));
   else if (S.engineError) out.push(h('div', { class: 'banner crit', role: 'alert' }, h('div', { class: 'grow' }, h('b', { text: 'The daemon cannot reach Docker. ' }),
     'The app list below is the last one it could read. ' + str(S.engineError, 240))));
+  var left = tokenLeft();
+  if (S.mode === 'ready' && left !== null && left < EXPIRY_WARNING) out.push(h('div', { class: 'banner warn', role: 'status' }, h('div', { class: 'grow' },
+    h('b', { text: 'This token expires in ' + roughly(Math.max(left, 0)) + '. ' }),
+    'The panel signs out when it does. Create a new one on the server with ', h('code', { text: 'limand token create' }), ' and revoke this one.')));
   var skew = S.info ? time(S.info.now) : null;
   if (S.mode === 'ready' && skew !== null && Math.abs(skew - S.updated) > 120000) out.push(h('div', { class: 'banner warn' }, h('div', { class: 'grow' },
     'The clock of the server and the clock of this computer are ' + Math.round(Math.abs(skew - S.updated) / 60000) + ' minutes apart. Times such as “5m ago” are off by that much.')));
@@ -922,7 +954,7 @@ function cancelBtn(label) { return h('button', { type: 'button', class: 'btn', o
 // failed turns an error into what the user reads. A rejected token ends
 // the session; everything else is shown where the action was started.
 function failed(e) {
-  if (e && e.status === 401) { signOut('The daemon rejected this token. It may have been revoked.'); return null; }
+  if (e && e.status === 401) { signOut(rejected(e)); return null; }
   if (e && e.status === 409) return str(e.message, 300) || 'Another operation on this app is in progress. Try again when it has finished.';
   return str(e && e.message, 400) || 'The request failed.';
 }
@@ -1097,8 +1129,10 @@ function viewDaemon() {
       h('dt', { text: 'This panel' }), h('dd', null, 'Signed in as ', h('code', { text: orDash(d.token, 64) }), readOnly()
         ? ', a read-only token: this panel can look at everything and change nothing. The token is kept in this browser tab only.'
         : ', a token that can change things: this panel offers rollback, stop, secrets and backups, and asks before anything that removes something. The token is kept in this browser tab only.'),
+      h('dt', { text: 'Expires' }), h('dd', null, tokenLeft() === null ? 'Never: this token works until it is revoked.'
+        : h('span', null, abs(d.token_expires_at), h('span', { class: 'muted', text: ' · in ' + roughly(Math.max(tokenLeft(), 0)) }))),
       h('dt', { text: 'Signing out' }), h('dd', null, 'By hand, by closing the tab, or by itself after ' + Math.round(IDLE_LIMIT / 60000) + ' minutes without a click or a key press.'),
-      h('dt', { text: 'Tokens' }), h('dd', null, 'Created and revoked on the server: ', h('code', { text: 'limand token list' }), '. For a panel that should only look: ', h('code', { text: 'limand token create panel --read-only' }), '. Revoking a token signs its panel out at the next refresh.')),
+      h('dt', { text: 'Tokens' }), h('dd', null, 'Created and revoked on the server: ', h('code', { text: 'limand token list' }), '. For a panel that should only look: ', h('code', { text: 'limand token create panel --read-only' }), '; for one that stops working by itself, add ', h('code', { text: '--expires 30d' }), '. Revoking a token signs its panel out at the next refresh.')),
       { span: 'c12', side: h('button', { class: 'btn small', onclick: function () { signOut(''); } }, 'Sign out') }))];
 }
 

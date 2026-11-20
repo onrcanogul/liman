@@ -184,6 +184,10 @@ type Info struct {
 	// offer only what will be allowed.
 	Token string `json:"token"`
 	Scope string `json:"scope"`
+	// TokenExpiresAt is when that token stops working; absent when it
+	// never does. A pointer, because omitempty leaves out nil but not a
+	// zero time.Time: a struct is never "empty" to encoding/json.
+	TokenExpiresAt *time.Time `json:"token_expires_at,omitempty"`
 
 	// Proxy says whether the daemon manages a reverse proxy, Secrets whether
 	// it has secret storage, Backups whether it can make backups.

@@ -589,18 +589,23 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	meta := metaOf(r.Context())
+	var expires *time.Time
+	if !meta.expires.IsZero() {
+		expires = &meta.expires
+	}
 	writeJSON(w, http.StatusOK, api.Info{
-		Token:     meta.token,
-		Scope:     meta.scope,
-		Version:   buildinfo.Version,
-		Commit:    buildinfo.Commit,
-		Built:     buildinfo.Date,
-		StartedAt: s.Started,
-		Now:       time.Now(),
-		Proxy:     s.Proxy != nil,
-		Secrets:   s.Secrets != nil,
-		Backups:   s.Backups != nil,
-		Monitor:   s.Monitoring,
+		Token:          meta.token,
+		Scope:          meta.scope,
+		TokenExpiresAt: expires,
+		Version:        buildinfo.Version,
+		Commit:         buildinfo.Commit,
+		Built:          buildinfo.Date,
+		StartedAt:      s.Started,
+		Now:            time.Now(),
+		Proxy:          s.Proxy != nil,
+		Secrets:        s.Secrets != nil,
+		Backups:        s.Backups != nil,
+		Monitor:        s.Monitoring,
 	})
 }
 

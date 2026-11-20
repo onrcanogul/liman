@@ -2011,3 +2011,66 @@ func TestRefusedBrowserRequestsAreNotLoggedOneByOne(t *testing.T) {
 		t.Error("the log contains a path of thousands of characters")
 	}
 }
+
+// --- token expiry ----------------------------------------------------------------
+
+func TestExpiredTokenIsRefusedAndSaysSo(t *testing.T) {
+	var log lockedBuffer
+	h := servertest.New(t, func(s *server.Server) {
+		s.Log = slog.New(slog.NewTextHandler(&log, nil))
+	})
+
+	expired, err := h.Store.CreateScopedToken(ctx(), "old-ci", store.ScopeAdmin, time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = (&api.Client{BaseURL: h.URL, Token: expired}).Apps(ctx())
+	var apiErr *api.Error
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnauthorized || !strings.HasPrefix(apiErr.Message, "token expired;") {
+		t.Errorf("a request with an expired token: %v; want 401 token expired", err)
+	}
+
+	// An unknown token still gets the plain answer.
+	_, err = (&api.Client{BaseURL: h.URL, Token: store.TokenPrefix + strings.Repeat("0", 64)}).Apps(ctx())
+	if !errors.As(err, &apiErr) || !strings.HasPrefix(apiErr.Message, "invalid token;") {
+		t.Errorf("a request with an unknown token: %v; want 401 invalid token", err)
+	}
+
+	out := log.String()
+	if !strings.Contains(out, `msg="expired token used" token=old-ci`) {
+		t.Errorf("the log does not name the expired token:\n%s", out)
+	}
+	if strings.Contains(out, expired) {
+		t.Error("the log contains the token itself")
+	}
+}
+
+func TestInfoSaysWhenTheTokenExpires(t *testing.T) {
+	h := servertest.New(t)
+
+	at := time.Now().Add(72 * time.Hour)
+	token, err := h.Store.CreateScopedToken(ctx(), "ci", store.ScopeRead, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := (&api.Client{BaseURL: h.URL, Token: token}).Info(ctx())
+	if err != nil || info.TokenExpiresAt == nil || !info.TokenExpiresAt.Equal(at) {
+		t.Errorf("Info() with an expiring token = %+v, %v; want it to expire at %v", info, err, at)
+	}
+
+	// A token without an expiry leaves the field out altogether.
+	req, err := http.NewRequest(http.MethodGet, h.URL+"/v1/info", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+h.Client.Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if strings.Contains(string(body), "token_expires_at") {
+		t.Errorf("/v1/info for a token that never expires mentions an expiry: %s", body)
+	}
+}

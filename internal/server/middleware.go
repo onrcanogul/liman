@@ -24,6 +24,8 @@ type requestMeta struct {
 	// token is the name of the token the request was made with.
 	token string
 	scope string
+	// expires is when that token stops working; zero for never.
+	expires time.Time
 }
 
 // metaKey is the context key for *requestMeta. An unexported type of its
@@ -86,16 +88,29 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 			// The answer is the same whether the token is malformed,
 			// unknown or revoked: an attacker learns nothing from it.
 			w.Header().Set("WWW-Authenticate", "Bearer")
-			if !hasToken {
+			switch {
+			case !hasToken:
 				writeError(w, http.StatusUnauthorized, errors.New("missing bearer token"))
-			} else {
+			case info.Name != "":
+				// LookupToken names a token it refuses only when that token
+				// has expired. This one case does get its own answer: it
+				// can only be told by somebody who holds a real token, the
+				// token no longer opens anything, and "expired" is the one
+				// word that saves its owner from hunting for a revocation
+				// that never happened.
+				s.logger().Warn("expired token used",
+					"token", info.Name,
+					"expired_at", info.ExpiresAt.UTC().Format(time.RFC3339),
+					"remote", r.RemoteAddr)
+				writeError(w, http.StatusUnauthorized, errors.New("token expired"))
+			default:
 				writeError(w, http.StatusUnauthorized, errors.New("invalid token"))
 			}
 			return
 		}
 
 		meta := metaOf(r.Context())
-		meta.token, meta.scope = info.Name, info.Scope
+		meta.token, meta.scope, meta.expires = info.Name, info.Scope, info.ExpiresAt
 
 		// A read-only token may look and nothing else. The rule is about
 		// the method, not a list of paths: an endpoint added later is
