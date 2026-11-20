@@ -1,0 +1,52 @@
+# Takes one backup of the liman database and exits. Started by
+# limand-backup.timer; to take one right now:
+#
+#   systemctl start limand-backup
+#   journalctl -u limand-backup -n 20
+
+[Unit]
+Description=Back up the liman database
+Documentation=https://github.com/onrcanogul/liman
+
+[Service]
+# oneshot: the unit is "running" while the command runs and is done when it
+# exits. A non-zero exit marks the unit as failed, which is how a backup
+# that did not pass its own check becomes visible (systemctl --failed).
+Type=oneshot
+User=liman
+Group=liman
+Environment=LIMAN_HOME=/var/lib/liman
+
+# Safe while the daemon is running. --keep removes older backups only after
+# the new one has been written and checked.
+ExecStart=/usr/local/bin/limand backup create /var/backups/liman --keep 14
+
+# This command needs far less than the daemon: no Docker, no sudo, no
+# network. It reads one directory and writes another.
+NoNewPrivileges=true
+# No capability at all, whatever happens inside.
+CapabilityBoundingSet=
+# The whole file system is read-only except the two places it works in.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/liman /var/backups/liman
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+# Its own, empty network: it could not send a backup anywhere.
+PrivateNetwork=true
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# Only the system calls an ordinary service needs.
+SystemCallFilter=@system-service
+UMask=0077

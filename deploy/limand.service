@@ -61,11 +61,34 @@ ProtectHome=true
 PrivateTmp=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
+# No access to disks and other hardware as device files.
+PrivateDevices=true
+# It may not set the clock or the host name.
+ProtectClock=true
+ProtectHostname=true
+# It may not create containers of its own (Docker does that, in another
+# process), switch to a legacy execution mode or ask for real-time
+# scheduling, which could starve the machine.
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+# Only the kinds of socket it uses: local ones (Docker, systemd) and IP.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Only this machine's own instruction set; closes a route around system
+# call filters.
+SystemCallArchitectures=native
+# Files it creates are for its own user unless it says otherwise.
+UMask=0077
 # NoNewPrivileges is deliberately absent: the daemon runs "sudo nginx -t"
 # and "sudo systemctl reload nginx", which is the one thing that option
 # forbids. What it may run through sudo is limited to exactly those two
-# commands (see /etc/sudoers.d/liman).
+# commands (see /etc/sudoers.d/liman). That is not the same as "cannot
+# become root": root's Nginx reads the config files this user writes, and
+# an Nginx config can name files to read and to write. It adds nothing to
+# what the docker group already allows, but it is the reason the content of
+# those files is built only from validated values.
 
 [Install]
 # Start at boot.

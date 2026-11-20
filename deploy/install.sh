@@ -12,6 +12,7 @@
 #   4. creates /etc/nginx/liman.d and makes Nginx include it
 #   5. lets the liman user test and reload Nginx through sudo, nothing else
 #   6. installs and starts the systemd unit
+#   7. schedules a daily backup of the database into /var/backups/liman
 #
 # Requirements: Ubuntu or Debian with systemd, Docker and (unless --no-nginx
 # is given) Nginx installed. The script installs no packages.
@@ -21,6 +22,7 @@ BINARY=
 LISTEN=
 NGINX=yes
 STATE=/var/lib/liman
+BACKUPS=/var/backups/liman
 CONF_DIR=/etc/nginx/liman.d
 HERE=$(cd "$(dirname "$0")" && pwd)
 # Set once this run has written config.yaml, so a failed first start can
@@ -47,7 +49,9 @@ step() { echo "==> $*"; }
 
 [ "$(id -u)" -eq 0 ] || fail "run this as root (sudo)"
 [ -f "$BINARY" ] || fail "$BINARY does not exist"
-[ -f "$HERE/limand.service" ] || fail "limand.service must be next to this script"
+for unit in limand.service limand-backup.service limand-backup.timer; do
+    [ -f "$HERE/$unit" ] || fail "$unit must be next to this script"
+done
 command -v systemctl >/dev/null || fail "systemd is required"
 command -v docker >/dev/null || fail "Docker is not installed"
 getent group docker >/dev/null || fail "there is no docker group; is Docker installed from a package?"
@@ -89,6 +93,8 @@ else
         echo "# Written by install.sh. See the README for every setting."
         echo "daemon:"
         echo "  listen: $LISTEN"
+        echo "backup:"
+        echo "  dir: $BACKUPS"
         if [ "$NGINX" = yes ]; then
             echo "nginx:"
             echo "  conf_dir: $CONF_DIR"
@@ -119,7 +125,8 @@ if [ "$NGINX" = yes ]; then
     # Written to a temporary file and checked first: a syntax error in a
     # sudoers file locks everybody out of sudo.
     tmp=$(mktemp)
-    printf '# The liman daemon may test and reload Nginx, and nothing else.\nliman ALL=(root) NOPASSWD: /usr/sbin/nginx -t, /usr/bin/systemctl reload nginx\n' > "$tmp"
+    printf '# The liman daemon may run these two commands as root, with exactly these\n# arguments. Note what that still means: root then parses the files in\n# %s, which the liman user writes.\n' "$CONF_DIR" > "$tmp"
+    printf 'liman ALL=(root) NOPASSWD: /usr/sbin/nginx -t, /usr/bin/systemctl reload nginx\n' >> "$tmp"
     visudo -cf "$tmp" >/dev/null || { rm -f "$tmp"; fail "the sudo rule did not pass visudo"; }
     install -m 0440 -o root -g root "$tmp" /etc/sudoers.d/liman
     rm -f "$tmp"
@@ -148,6 +155,16 @@ else
     fail "limand did not stay up; its last log lines are above. Fix $STATE/config.yaml, then: systemctl restart limand"
 fi
 
+step "Daily backup"
+install -d -m 0700 -o liman -g liman "$BACKUPS"
+install -m 0644 "$HERE/limand-backup.service" /etc/systemd/system/limand-backup.service
+install -m 0644 "$HERE/limand-backup.timer" /etc/systemd/system/limand-backup.timer
+systemctl daemon-reload
+# A timer is enabled and started like a service; the service it triggers
+# is not enabled itself.
+systemctl enable --now limand-backup.timer >/dev/null 2>&1
+echo "    $BACKUPS, the newest 14 are kept"
+
 cat <<NEXT
 
 Done. Next:
@@ -159,8 +176,14 @@ Done. Next:
        url: http://$LISTEN
        token: <the token>
 
-  3. Back up $STATE/master.key somewhere that is not this server.
+  3. Copy $STATE/master.key to somewhere that is not this server, once.
+     It is not in the backups, and they are useless without it.
+
+  4. The backups in $BACKUPS are on this server's disk. Copy them
+     elsewhere regularly (rsync, restic, ...): a backup that dies with the
+     disk it protects is only half of one.
 
   Logs:    journalctl -u limand -f
   Status:  systemctl status limand
+  Backups: systemctl list-timers limand-backup
 NEXT

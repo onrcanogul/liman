@@ -1,0 +1,17 @@
+# Runs limand-backup.service once a day.
+#
+#   systemctl list-timers limand-backup     when it ran last and runs next
+
+[Unit]
+Description=Daily backup of the liman database
+
+[Timer]
+OnCalendar=daily
+# Not at midnight sharp, when everything else on the machine starts too.
+RandomizedDelaySec=30min
+# If the machine was off at the scheduled time, run once after boot instead
+# of silently skipping a day.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
