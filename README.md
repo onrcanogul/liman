@@ -190,6 +190,113 @@ Only one deploy or stop per app runs at a time; a second one is refused.
 Environment variable values are never printed. liman only lists and touches
 containers it started itself (label `liman.app`).
 
+## Deploying from CI
+
+A pipeline that builds and pushes an image can deploy it as its last step,
+whatever runs it (GitHub Actions, GitLab CI, Jenkins, a script) and
+whichever registry holds the image. It sends one request with the app's
+name and the **digest** of the image it just pushed:
+
+```
+docker push → digest (sha256:…) → POST /hooks/deploy {"app", "digest"} → liman deploys repo@digest
+```
+
+liman deploys the app again with everything from its last deploy made by
+hand, the image replaced by `<the app's repository>@<digest>`. A digest is
+the hash of the image's content: unlike a tag, it cannot be moved to
+another image while the deploy runs, and the release records exactly
+which image ran. Nobody edits `app.yaml` for a new version; it changes only
+when the domain, secrets or limits do, and is then deployed with
+`liman deploy` as before.
+
+**On the server**, turn the trigger endpoint on. It gets a listener of its
+own, which serves `POST /hooks/deploy` and nothing else:
+
+```yaml
+# config.yaml
+hooks:
+  listen: 127.0.0.1:7443
+```
+
+Make that one path reachable over HTTPS, in a server block of your own
+(liman writes only the apps' files):
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name ops.example.com;
+    ssl_certificate     /etc/liman/certs/ops.example.com/fullchain.pem;
+    ssl_certificate_key /etc/liman/certs/ops.example.com/privkey.pem;
+
+    location = /hooks/deploy {
+        proxy_pass http://127.0.0.1:7443;
+        proxy_buffering off;      # the progress arrives as it happens
+        proxy_read_timeout 15m;   # a deploy takes as long as it takes
+    }
+    location / {
+        return 404;
+    }
+}
+```
+
+Even a mistake in that file cannot expose the management API: it is not
+served on that listener.
+
+**Per app**, deploy it once by hand (that is the definition triggers
+repeat), and create a deploy key for its pipeline:
+
+```
+liman deploy app.yaml
+limand token create orders-ci --deploy --app orders-api
+```
+
+Store the key as a secret variable of the CI system, `LIMAN_TOKEN`, and the
+public address as `LIMAN_URL` (`https://ops.example.com`).
+
+**In the pipeline**, with GitHub Actions:
+
+```yaml
+- uses: docker/build-push-action@v6
+  id: build
+  with:
+    push: true
+    tags: ghcr.io/user/orders-api:${{ github.sha }}
+- name: Deploy
+  env:
+    LIMAN_URL: ${{ secrets.LIMAN_URL }}
+    LIMAN_TOKEN: ${{ secrets.LIMAN_TOKEN }}
+  run: liman trigger --app orders-api --digest "${{ steps.build.outputs.digest }}"
+```
+
+Anywhere else, `docker buildx build --push --metadata-file meta.json` writes
+the digest to `containerimage.digest` in `meta.json`, and plain `curl`
+does what `liman trigger` does:
+
+```
+curl -fsS -N https://ops.example.com/hooks/deploy \
+  -H "Authorization: Bearer $LIMAN_TOKEN" \
+  -d "{\"app\":\"orders-api\",\"digest\":\"$DIGEST\"}"
+```
+
+The answer streams the deploy's progress like `liman deploy`; the last line
+is the result. `liman trigger` exits non-zero when the deploy failed (and
+was rolled back), so the pipeline fails with it.
+
+What liman checks before anything changes:
+
+| Check | Answer |
+|---|---|
+| The token is a deploy key, for this app | 401 / 403 |
+| The body is `{"app","digest"}` and nothing else, at most 4 KiB; the digest is `sha256:` and 64 hexadecimal digits | 400 |
+| The key has triggered fewer than 6 deploys in the last minute | 429 with `Retry-After` |
+| The app has a deploy made by hand to repeat, and has not been stopped since | 404 |
+| The registry has that digest in the app's own repository (asked without downloading, with the credentials of `docker login`) | 422; 502 if the registry cannot be asked |
+| No other deploy of the app is running | 409 |
+
+The repository always comes from the app's definition, never from the
+request: a deploy key chooses an image of its app, not any image. Stopping
+an app forgets its definition, so the next push does not bring it back.
+
 ## Secrets
 
 Passwords and API keys do not belong in `app.yaml`, which is committed to a
@@ -374,6 +481,7 @@ limand token create <name>                         # prints the token once
 limand token create <name> --write-client <file>   # writes a client.yaml instead
 limand token create <name> --expires 90d           # stops working after 90 days (or 12h)
 limand token create <name> --app orders-api        # only this app; repeat --app for more
+limand token create <name> --deploy --app orders-api  # a deploy key for a pipeline
 limand token list                                  # with scope, apps, expiry and last use
 limand token revoke <name>
 ```
@@ -465,6 +573,7 @@ The environment variables `LIMAN_URL` and `LIMAN_TOKEN` take precedence.
 | `GET /v1/audit[?app=][&limit=]` | The audit trail: who changed what, oldest first; a token limited to apps sees theirs |
 | `GET /v1/audit/verify` | Check the whole audit trail |
 | `GET /ui/` | The panel's files; no token needed, they contain no data |
+| `POST /hooks/deploy` | On the `hooks.listen` listener only, with a deploy key. Body: `{"app","digest"}`. Deploys the app again with that image; streams like a deploy |
 
 ## Audit trail
 
@@ -542,6 +651,18 @@ is equivalent to root. The API is built around keeping everyone else out:
   another are closed for every token: a deploy is refused when its domain
   belongs to another app (see Routing with Nginx), and a question of a
   step-by-step deploy can only be answered by the token that started it.
+- **Deploy keys.** The trigger endpoint is the one part of liman meant to
+  be reachable from the internet, and it takes deploy keys
+  (`--deploy`) only: a leaked admin token is no more use there than a
+  wrong one. A deploy key is in turn refused by the whole management API,
+  `GET` included, since it lives in a CI system's settings. It always
+  names its apps, and can only deploy an image that is in the app's own
+  repository: a leaked key can deploy what anyone with push access to
+  that repository could, an older version included, at most six times a
+  minute. Revoke it and create another; the audit trail shows what it
+  deployed. Behind Nginx every caller has Nginx's address, so the lockout
+  after failed attempts counts them all together; a valid key is never
+  locked out. Limit per caller in Nginx (`limit_req`) if you want that.
 - **Audit trail.** Every change is recorded with who made it (see Audit
   trail), in a chain where a record changed or removed later shows.
 - **Browsers.** Requests that a browser marks as coming from another site

@@ -1310,7 +1310,7 @@ function viewTokens() {
       else expires = h('span', { title: abs(t.expires_at), text: now === null ? abs(t.expires_at) : 'in ' + roughly(Math.max(end - now, 0)) });
       return h('tr', null,
         h('td', { class: 'name' }, h('span', { class: 'hstack' }, h('span', { class: 'mono trunc', text: str(t.name, 64) }), t.current === true ? pill({ key: 'info', label: 'This panel' }) : null)),
-        h('td', { class: 'nowrap' }, t.scope === 'admin' ? pill({ key: 'warn', label: 'Change things' }) : pill({ key: 'none', label: 'Look only' })),
+        h('td', { class: 'nowrap' }, t.scope === 'admin' ? pill({ key: 'warn', label: 'Change things' }) : t.scope === 'deploy' ? pill({ key: 'info', label: 'Deploy only' }) : pill({ key: 'none', label: 'Look only' })),
         h('td', { class: 'detail' }, Array.isArray(t.apps) && t.apps.length ? h('span', { class: 'mono', text: t.apps.map(function (x) { return str(x, 63); }).join(', ') }) : h('span', { class: 'muted', text: 'All apps' })),
         h('td', { class: 'nowrap' }, when(t.created_at)),
         h('td', { class: 'nowrap' }, expires),
@@ -1318,7 +1318,8 @@ function viewTokens() {
         h('td', { class: 'nowrap right' }, h('button', { class: 'btn small danger', disabled: !canAct(), title: readOnly() ? 'This token is read-only' : null, onclick: function () { dlgRevokeToken(t); } }, 'Revoke')));
     })))), { flush: true }));
   out.push(h('div', { class: 'hint' }, '“Last used” is written down at most once a minute. Tokens are created on the server, never here: ',
-    h('code', { text: 'limand token create <name>' }), ', with ', h('code', { text: '--read-only' }), ' for one that can only look, ', h('code', { text: '--app <app>' }), ' for one that sees and changes only that app, and ', h('code', { text: '--expires 30d' }), ' for one that stops working by itself.'));
+    h('code', { text: 'limand token create <name>' }), ', with ', h('code', { text: '--read-only' }), ' for one that can only look, ', h('code', { text: '--app <app>' }), ' for one that sees and changes only that app, ',
+    h('code', { text: '--deploy --app <app>' }), ' for a CI pipeline\u2019s deploy key, which can trigger deploys of that app and nothing else, and ', h('code', { text: '--expires 30d' }), ' for one that stops working by itself.'));
   return out;
 }
 function dlgRevokeToken(t) {
