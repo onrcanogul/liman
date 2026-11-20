@@ -174,6 +174,13 @@ func TestLoadRejectsBadConfig(t *testing.T) {
 		{"relative conf dir", "nginx:\n  conf_dir: nginx\n", "nginx.conf_dir: must be an absolute path"},
 		{"relative cert dir", "nginx:\n  conf_dir: /x\n  cert_dir: certs\n", "nginx.cert_dir: must be an absolute path"},
 		{"not yaml", "nginx: [", "parse yaml"},
+		{"acme over plain http", acmeConfig("directory: http://ca.example/dir"), "acme.directory: must be an https:// URL"},
+		{"acme not a url", acmeConfig("directory: ca.example"), "acme.directory: must be an https:// URL"},
+		{"acme bad email", acmeConfig("directory: https://ca.example/dir\n  email: someone"), "acme.email"},
+		{"acme email with a newline", acmeConfig("directory: https://ca.example/dir\n  email: \"a@b\\nc\""), "acme.email"},
+		{"acme relative ca file", acmeConfig("directory: https://ca.example/dir\n  ca_file: ca.pem"), "acme.ca_file: must be an absolute path"},
+		{"acme without nginx", "acme:\n  directory: https://ca.example/dir\n", "acme: needs nginx.conf_dir"},
+		{"acme without acme root", "nginx:\n  conf_dir: /x\n  cert_dir: /c\nacme:\n  directory: https://ca.example/dir\n", "acme: needs nginx.cert_dir"},
 	}
 
 	for _, tt := range tests {
@@ -339,5 +346,27 @@ func TestLoadDeployDrain(t *testing.T) {
 
 	if _, err := Load(write(t, "deploy:\n  drain: 1h\n")); err == nil || !strings.Contains(err.Error(), "deploy.drain") {
 		t.Errorf("Drain 1h error = %v, want it rejected", err)
+	}
+}
+
+// acmeConfig returns a config with Nginx set up for ACME and the given
+// lines (indented by two spaces) under acme:.
+func acmeConfig(lines string) string {
+	return "nginx:\n  conf_dir: /x\n  cert_dir: /c\n  acme_root: /a\nacme:\n  " + lines + "\n"
+}
+
+func TestLoadACME(t *testing.T) {
+	cfg, err := Load(write(t, acmeConfig("directory: https://ca.example/dir\n  email: ops@example.com\n  ca_file: /etc/liman/ca.pem")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ACME{Directory: "https://ca.example/dir", Email: "ops@example.com", CAFile: "/etc/liman/ca.pem"}
+	if cfg.ACME != want || !cfg.ACME.Enabled() {
+		t.Errorf("ACME = %+v, want %+v (enabled)", cfg.ACME, want)
+	}
+
+	cfg, err = Load(write(t, "nginx:\n  conf_dir: /x\n"))
+	if err != nil || cfg.ACME.Enabled() {
+		t.Errorf("without an acme section: %+v, %v; want ACME off", cfg.ACME, err)
 	}
 }

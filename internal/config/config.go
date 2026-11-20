@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"go.yaml.in/yaml/v3"
@@ -24,6 +26,33 @@ type Config struct {
 	Panel   Panel   `yaml:"panel"`
 	Backup  Backup  `yaml:"backup"`
 	Secrets Secrets `yaml:"secrets"`
+	ACME    ACME    `yaml:"acme"`
+}
+
+// ACME configures obtaining and renewing certificates automatically, from
+// Let's Encrypt or any other CA that speaks ACME. Setting Directory turns
+// it on; it needs nginx.cert_dir, where the certificates go, and
+// nginx.acme_root, from which Nginx serves the CA's challenges.
+type ACME struct {
+	// Directory is the CA's ACME directory URL, for example
+	// https://acme-v02.api.letsencrypt.org/directory, or the staging one
+	// while trying things out.
+	Directory string `yaml:"directory"`
+	// Email is given to the CA as a contact, for expiry warnings and
+	// problems with the account. Optional.
+	Email string `yaml:"email"`
+	// CAFile is a PEM file of further certificate authorities to trust
+	// when talking to Directory. Let's Encrypt does not need it; a test CA
+	// such as Pebble, whose own HTTPS certificate nobody trusts, does.
+	CAFile string `yaml:"ca_file"`
+	// AccountKey is where the key of the ACME account is kept. It defaults
+	// to acme-account.key in liman's home directory.
+	AccountKey string `yaml:"account_key"`
+}
+
+// Enabled reports whether liman obtains certificates itself.
+func (a ACME) Enabled() bool {
+	return a.Directory != ""
 }
 
 // Backup configures the backups the daemon makes when asked to over the
@@ -226,6 +255,8 @@ func (c *Config) validate() error {
 		errs = append(errs, fmt.Errorf("monitor.failure_threshold: must not be negative, got %d", c.Monitor.FailureThreshold))
 	}
 
+	errs = append(errs, c.validateACME()...)
+
 	n := c.Nginx
 	if !n.Enabled() {
 		return errors.Join(errs...)
@@ -246,6 +277,36 @@ func (c *Config) validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func (c *Config) validateACME() []error {
+	a := c.ACME
+	if !a.Enabled() {
+		return nil
+	}
+	var errs []error
+	// The account key and every request are sent to this address; over
+	// plain HTTP anyone in between could answer as the CA.
+	if u, err := url.Parse(a.Directory); err != nil || u.Scheme != "https" || u.Host == "" {
+		errs = append(errs, fmt.Errorf("acme.directory: must be an https:// URL, got %q", a.Directory))
+	}
+	if a.Email != "" && (!strings.Contains(a.Email, "@") || strings.ContainsAny(a.Email, " \t\r\n,;<>")) {
+		errs = append(errs, fmt.Errorf("acme.email: %q is not an email address", a.Email))
+	}
+	for _, p := range []struct{ name, value string }{{"ca_file", a.CAFile}, {"account_key", a.AccountKey}} {
+		if p.value != "" && !filepath.IsAbs(p.value) {
+			errs = append(errs, fmt.Errorf("acme.%s: must be an absolute path, got %q", p.name, p.value))
+		}
+	}
+	// Without these there is nowhere to put the challenge for the CA to
+	// fetch, or the certificate it sends back.
+	switch {
+	case !c.Nginx.Enabled():
+		errs = append(errs, errors.New("acme: needs nginx.conf_dir; certificates are only used through Nginx"))
+	case c.Nginx.CertDir == "" || c.Nginx.ACMERoot == "":
+		errs = append(errs, errors.New("acme: needs nginx.cert_dir (where certificates are written) and nginx.acme_root (where Nginx serves the CA's challenges)"))
+	}
+	return errs
 }
 
 // Home returns the directory liman keeps its files in: $LIMAN_HOME if set,
