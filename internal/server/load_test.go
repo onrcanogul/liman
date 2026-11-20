@@ -221,7 +221,8 @@ func TestLoadDeploys(t *testing.T) {
 		}
 		recorded := 0
 		for w := range workers {
-			releases, err := lt.harness.Store.Releases(context.Background(), fmt.Sprintf("load-%d", w))
+			// A limit far above what a run can produce: every release counts.
+			releases, err := lt.harness.Store.Releases(context.Background(), fmt.Sprintf("load-%d", w), 1<<30)
 			if err != nil {
 				t.Fatal(err)
 			}

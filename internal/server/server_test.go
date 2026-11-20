@@ -151,7 +151,7 @@ func TestDeployStreamsOutputAndRecordsEverything(t *testing.T) {
 		t.Errorf("first event = %+v", events[0])
 	}
 
-	releases, err := h.Store.Releases(ctx(), "orders-api")
+	releases, err := h.Store.Releases(ctx(), "orders-api", 10)
 	if err != nil || len(releases) != 1 {
 		t.Fatalf("Releases() = %v, %v; want one", releases, err)
 	}
@@ -185,7 +185,7 @@ func TestDeployFailureIsReportedAndRolledBack(t *testing.T) {
 		t.Errorf("containers = %v, want only the previous one", h.Engine.Containers)
 	}
 
-	releases, _ := h.Store.Releases(ctx(), "orders-api")
+	releases, _ := h.Store.Releases(ctx(), "orders-api", 10)
 	if len(releases) != 1 || releases[0].Status != store.StatusFailed || releases[0].Error == "" {
 		t.Errorf("releases = %+v, want one failed release with its error", releases)
 	}
@@ -260,7 +260,7 @@ func TestDryRunNeedsNoDockerAndChangesNothing(t *testing.T) {
 	}
 
 	events, _ := h.Client.History(ctx(), "", 50)
-	releases, _ := h.Store.Releases(ctx(), "orders-api")
+	releases, _ := h.Store.Releases(ctx(), "orders-api", 10)
 	if len(events) != 0 || len(releases) != 0 {
 		t.Errorf("dry run recorded %d events and %d releases, want none", len(events), len(releases))
 	}
@@ -1342,7 +1342,7 @@ func TestDeployInjectsSecretsIntoTheEnvironment(t *testing.T) {
 	// The values reach the container and nothing else: not the progress
 	// output, not the history, not the release record.
 	events, _ := h.Client.History(ctx(), "", 50)
-	releases, _ := h.Store.Releases(ctx(), "orders-api")
+	releases, _ := h.Store.Releases(ctx(), "orders-api", 10)
 	recorded := fmt.Sprint(out.String(), events, releases)
 	for _, value := range []string{"hunter2", "k-123"} {
 		if strings.Contains(recorded, value) {

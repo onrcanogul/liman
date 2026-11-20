@@ -172,12 +172,21 @@ func TestReleases(t *testing.T) {
 		}
 	}
 
-	got, err := s.Releases(ctx, "web")
+	got, err := s.Releases(ctx, "web", 10)
 	if err != nil {
 		t.Fatalf("Releases() error = %v", err)
 	}
 	if len(got) != 2 || got[0].Release != "r2" || got[1].Release != "r1" {
 		t.Fatalf("Releases() = %+v, want r2 then r1", got)
+	}
+
+	// Without a filter every app is included, and the limit keeps the newest.
+	all, err := s.Releases(ctx, "", 2)
+	if err != nil {
+		t.Fatalf("Releases() error = %v", err)
+	}
+	if len(all) != 2 || all[0].App != "api" || all[1].Release != "r2" {
+		t.Errorf("Releases(all, 2) = %+v, want api/r1 then web/r2", all)
 	}
 	if got[0].Status != StatusFailed || got[0].Error != second.Error || !got[0].FinishedAt.Equal(second.FinishedAt) {
 		t.Errorf("newest release = %+v, want %+v", got[0], second)
@@ -413,6 +422,9 @@ func TestExistingDatabaseIsMigratedForward(t *testing.T) {
 	if err := s.PutSecret(ctx, "web", "KEY", []byte("sealed")); err != nil {
 		t.Errorf("the secrets table is missing after migration: %v", err)
 	}
+	if err := s.AppendHealthSample(ctx, HealthSample{Time: time.Now(), App: "web", OK: true}); err != nil {
+		t.Errorf("the health_samples table is missing after migration: %v", err)
+	}
 	if tokens, err := s.Tokens(ctx); err != nil || len(tokens) != 1 || tokens[0].Name != "old" {
 		t.Errorf("existing data after migration = %+v, %v", tokens, err)
 	}
@@ -420,5 +432,68 @@ func TestExistingDatabaseIsMigratedForward(t *testing.T) {
 	var version int
 	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version != len(migrations) {
 		t.Errorf("schema version = %d, %v; want %d", version, err, len(migrations))
+	}
+}
+
+func TestHealthSamples(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	start := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+
+	samples := []HealthSample{
+		// First minute: two good checks with a response time.
+		{Time: start, App: "web", OK: true, Probed: true, Duration: 10 * time.Millisecond},
+		{Time: start.Add(30 * time.Second), App: "web", OK: true, Probed: true, Duration: 30 * time.Millisecond},
+		// Second minute: nothing at all.
+		// Third minute: one good, one failed, and a check without a probe.
+		{Time: start.Add(2 * time.Minute), App: "web", OK: true, Probed: true, Duration: 50 * time.Millisecond},
+		{Time: start.Add(2*time.Minute + 10*time.Second), App: "web", OK: false, Probed: true, Duration: 2 * time.Second},
+		{Time: start.Add(2*time.Minute + 20*time.Second), App: "web", OK: false},
+		// Outside the requested range, and another app.
+		{Time: start.Add(-time.Second), App: "web", OK: false},
+		{Time: start.Add(3 * time.Minute), App: "web", OK: false},
+		{Time: start, App: "api", OK: false},
+	}
+	for _, h := range samples {
+		if err := s.AppendHealthSample(ctx, h); err != nil {
+			t.Fatalf("AppendHealthSample() error = %v", err)
+		}
+	}
+
+	got, err := s.HealthBuckets(ctx, "web", start, start.Add(3*time.Minute), time.Minute)
+	if err != nil {
+		t.Fatalf("HealthBuckets() error = %v", err)
+	}
+	want := []HealthBucket{
+		{Start: start, OK: 2, Probed: 2, AvgMS: 20, MaxMS: 30},
+		{Start: start.Add(2 * time.Minute), OK: 1, Failed: 2, Probed: 2, AvgMS: 1025, MaxMS: 2000},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("HealthBuckets() = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		// Start is compared with Equal: two time.Time values for the same
+		// instant are not necessarily == (they can differ in location).
+		if !got[i].Start.Equal(want[i].Start) {
+			t.Errorf("bucket %d starts at %s, want %s", i, got[i].Start, want[i].Start)
+		}
+		got[i].Start = want[i].Start
+		if got[i] != want[i] {
+			t.Errorf("bucket %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+
+	if _, err := s.HealthBuckets(ctx, "web", start, start.Add(time.Minute), time.Millisecond); err == nil {
+		t.Error("HealthBuckets() with a width below a second succeeded, want an error")
+	}
+
+	// Pruning removes what is older than the cut-off and nothing else.
+	removed, err := s.PruneHealthSamples(ctx, start.Add(2*time.Minute))
+	if err != nil || removed != 4 {
+		t.Errorf("PruneHealthSamples() = %d, %v; want 4 removed", removed, err)
+	}
+	got, err = s.HealthBuckets(ctx, "web", start, start.Add(3*time.Minute), time.Minute)
+	if err != nil || len(got) != 1 || got[0].Failed != 2 {
+		t.Errorf("after pruning HealthBuckets() = %+v, %v; want only the third minute", got, err)
 	}
 }

@@ -73,6 +73,23 @@ var migrations = []string{
 		PRIMARY KEY (app, name)
 	);
 	`,
+
+	// 3: health samples, one row per health check of an app. Unlike the
+	// other tables the time is a Unix timestamp: this table is only ever
+	// read as "everything since T, grouped into buckets", and that is
+	// integer arithmetic instead of string parsing. duration_ms is NULL for
+	// a check that made no HTTP request.
+	`
+	CREATE TABLE health_samples (
+		id          INTEGER PRIMARY KEY,
+		at          INTEGER NOT NULL,
+		app         TEXT    NOT NULL,
+		ok          INTEGER NOT NULL,
+		duration_ms INTEGER
+	);
+	CREATE INDEX health_samples_app ON health_samples (app, at);
+	CREATE INDEX health_samples_at ON health_samples (at);
+	`,
 }
 
 // Open opens the database at path, creating it and its directory if
@@ -267,11 +284,13 @@ func (s *Store) RecordRelease(ctx context.Context, r Release) error {
 	return nil
 }
 
-// Releases returns the releases of app, newest first.
-func (s *Store) Releases(ctx context.Context, app string) ([]Release, error) {
+// Releases returns the newest limit releases, newest first. An empty app
+// returns releases of all apps.
+func (s *Store) Releases(ctx context.Context, app string, limit int) ([]Release, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT app, release, image, status, error, started_at, finished_at
-		 FROM releases WHERE app = ? ORDER BY id DESC`, app)
+		 FROM releases WHERE (? = '' OR app = ?) ORDER BY id DESC LIMIT ?`,
+		app, app, limit)
 	if err != nil {
 		return nil, fmt.Errorf("read releases: %w", err)
 	}
