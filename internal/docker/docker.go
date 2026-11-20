@@ -21,6 +21,7 @@ import (
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 
+	"github.com/onrcanogul/liman/internal/app"
 	"github.com/onrcanogul/liman/internal/engine"
 )
 
@@ -214,9 +215,9 @@ func (c *Client) Inspect(ctx context.Context, ref string) (engine.Container, err
 		App:   info.Config.Labels[engine.LabelApp],
 		Image: info.Config.Image,
 
-		Release:    info.Config.Labels[engine.LabelRelease],
-		HealthPath: info.Config.Labels[engine.LabelHealthPath],
-		Domain:     info.Config.Labels[engine.LabelDomain],
+		Release:    trusted(info.Config.Labels[engine.LabelRelease], app.ValidRelease),
+		HealthPath: trusted(info.Config.Labels[engine.LabelHealthPath], app.ValidHealthPath),
+		Domain:     trusted(info.Config.Labels[engine.LabelDomain], app.ValidDomain),
 	}
 	if info.State != nil {
 		out.State = string(info.State.Status)
@@ -302,9 +303,9 @@ func (c *Client) List(ctx context.Context) ([]engine.Container, error) {
 			Status:  item.Status,
 			Created: time.Unix(item.Created, 0),
 
-			Release:    item.Labels[engine.LabelRelease],
-			HealthPath: item.Labels[engine.LabelHealthPath],
-			Domain:     item.Labels[engine.LabelDomain],
+			Release:    trusted(item.Labels[engine.LabelRelease], app.ValidRelease),
+			HealthPath: trusted(item.Labels[engine.LabelHealthPath], app.ValidHealthPath),
+			Domain:     trusted(item.Labels[engine.LabelDomain], app.ValidDomain),
 		}
 		if len(item.Names) > 0 {
 			ctr.Name = strings.TrimPrefix(item.Names[0], "/")
@@ -366,17 +367,31 @@ func (c *Client) Logs(ctx context.Context, ref string, follow bool, stdout, stde
 
 // labels returns the labels a container of spec carries.
 func labels(spec engine.Spec) map[string]string {
-	out := map[string]string{engine.LabelApp: spec.App}
-	if spec.Release != "" {
-		out[engine.LabelRelease] = spec.Release
+	// All four are always set, empty if need be. A label the image itself
+	// declares is merged into the container unless the container sets the
+	// same key; leaving one out would let an image supply it, and these
+	// labels are read back later and acted on (the health path is requested
+	// every few seconds, the domain is written into the proxy config).
+	return map[string]string{
+		engine.LabelApp:        spec.App,
+		engine.LabelRelease:    spec.Release,
+		engine.LabelHealthPath: spec.HealthPath,
+		engine.LabelDomain:     spec.Domain,
 	}
-	if spec.HealthPath != "" {
-		out[engine.LabelHealthPath] = spec.HealthPath
+}
+
+// trusted returns a label's value if it has the shape liman itself would
+// have written, and "" otherwise.
+//
+// Labels come back from Docker, which is outside this program: anyone with
+// access to Docker can start a container with any labels. What is read is
+// therefore checked again with the rules that apply to an app definition,
+// exactly as if it had arrived over the network.
+func trusted(value string, valid func(string) bool) string {
+	if valid(value) {
+		return value
 	}
-	if spec.Domain != "" {
-		out[engine.LabelDomain] = spec.Domain
-	}
-	return out
+	return ""
 }
 
 // envList converts a map to the KEY=value list the API expects, sorted so

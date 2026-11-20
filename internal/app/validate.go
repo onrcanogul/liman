@@ -51,6 +51,31 @@ func ValidName(name string) bool {
 	return nameRe.MatchString(name)
 }
 
+// The three functions below check values that liman wrote itself and reads
+// back later from somewhere it does not control (container labels). They
+// apply the same rules as Validate does to a definition.
+
+// ValidDomain reports whether domain is a valid domain for an app.
+func ValidDomain(domain string) bool {
+	return len(domain) <= maxDomainLength && domainRe.MatchString(domain)
+}
+
+// ValidHealthPath reports whether path is a valid health check path. It
+// must start with a slash: the path is appended to "http://127.0.0.1:port",
+// and anything else (an "@host", say) would change where the request goes.
+func ValidHealthPath(path string) bool {
+	return len(path) <= maxHealthPathLength && healthPathRe.MatchString(path)
+}
+
+// releaseRe is the shape of a release name: a timestamp, or whatever a test
+// uses in its place.
+var releaseRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+// ValidRelease reports whether release is a valid release name.
+func ValidRelease(release string) bool {
+	return releaseRe.MatchString(release)
+}
+
 // Validate checks that the definition describes a deployable app.
 //
 // It collects every problem instead of stopping at the first one, so the
