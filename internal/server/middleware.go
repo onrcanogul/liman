@@ -1,16 +1,43 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/onrcanogul/liman/internal/store"
 )
 
 // A middleware is a function that takes a handler and returns a handler. The
 // returned one does something before and/or after calling the original.
 // Because the input and output have the same type, middlewares stack.
+
+// requestMeta is what later middleware learns about a request and earlier
+// middleware wants to log. logRequests creates it and puts a pointer into
+// the request's context; authenticate fills it in. A pointer, because a
+// context is immutable: values can be added on the way in, but nothing can
+// be passed back out except through something both sides can reach.
+type requestMeta struct {
+	// token is the name of the token the request was made with.
+	token string
+	scope string
+}
+
+// metaKey is the context key for *requestMeta. An unexported type of its
+// own means no other package can produce the same key by accident.
+type metaKey struct{}
+
+func metaOf(ctx context.Context) *requestMeta {
+	if m, ok := ctx.Value(metaKey{}).(*requestMeta); ok {
+		return m
+	}
+	// Without logRequests in front (it always is) there is still something
+	// to write into.
+	return &requestMeta{}
+}
 
 // authenticate rejects requests that do not carry a valid token.
 func (s *Server) authenticate(next http.Handler) http.Handler {
@@ -25,35 +52,57 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		client := clientAddress(r)
 		limiter := s.authFailures()
 
-		// Checked before the token is even looked at: during a lockout the
-		// client learns nothing, not even whether a guess was right.
-		if wait, locked := limiter.blocked(client); locked {
-			s.noteRejection(false)
-			w.Header().Set("Retry-After", retryAfter(wait))
-			writeError(w, http.StatusTooManyRequests, tooManyAttempts(wait))
-			return
+		// The token is looked at first, and a valid one always gets
+		// through. The limiter used to come first, which let anybody who
+		// could send ten requests without a token (a web page with ten
+		// <img> tags pointing here is enough) lock the real operator out
+		// for as long as they kept it up: a limit meant to slow an
+		// attacker down had become a switch for turning the owner off.
+		//
+		// Only something shaped like a token is looked up at all, so a
+		// flood of junk costs no database query.
+		token, hasToken := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		var info store.TokenInfo
+		valid := false
+		if hasToken && strings.HasPrefix(token, store.TokenPrefix) {
+			var err error
+			if info, valid, err = s.Store.LookupToken(r.Context(), token); err != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("verify token: %w", err))
+				return
+			}
 		}
 
-		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !ok {
+		if !valid {
+			// During a lockout the client learns nothing more, and its
+			// attempts are no longer counted or logged one by one.
+			if wait, locked := limiter.blocked(client); locked {
+				s.noteRejection(false)
+				w.Header().Set("Retry-After", retryAfter(wait))
+				writeError(w, http.StatusTooManyRequests, tooManyAttempts(wait))
+				return
+			}
 			limiter.recordFailure(client)
 			// WWW-Authenticate tells the client which scheme is expected.
-			w.Header().Set("WWW-Authenticate", "Bearer")
-			writeError(w, http.StatusUnauthorized, errors.New("missing bearer token"))
-			return
-		}
-
-		valid, err := s.Store.VerifyToken(r.Context(), token)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("verify token: %w", err))
-			return
-		}
-		if !valid {
-			limiter.recordFailure(client)
 			// The answer is the same whether the token is malformed,
 			// unknown or revoked: an attacker learns nothing from it.
 			w.Header().Set("WWW-Authenticate", "Bearer")
-			writeError(w, http.StatusUnauthorized, errors.New("invalid token"))
+			if !hasToken {
+				writeError(w, http.StatusUnauthorized, errors.New("missing bearer token"))
+			} else {
+				writeError(w, http.StatusUnauthorized, errors.New("invalid token"))
+			}
+			return
+		}
+
+		meta := metaOf(r.Context())
+		meta.token, meta.scope = info.Name, info.Scope
+
+		// A read-only token may look and nothing else. The rule is about
+		// the method, not a list of paths: an endpoint added later is
+		// covered without anybody remembering to add it here, as long as
+		// it follows HTTP (GET never changes anything, and it does not).
+		if info.Scope != store.ScopeAdmin && r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeError(w, http.StatusForbidden, errors.New("this token is read-only; the request needs a token created without --read-only"))
 			return
 		}
 
@@ -66,13 +115,21 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		meta := &requestMeta{}
 
-		next.ServeHTTP(rec, r)
+		next.ServeHTTP(rec, r.WithContext(context.WithValue(r.Context(), metaKey{}, meta)))
 
 		// Requests from a locked-out address are summarised elsewhere
 		// (see rejections): a client hammering the API while locked out
 		// must not be able to fill the disk with log lines.
 		if rec.status == http.StatusTooManyRequests {
+			return
+		}
+		// The same goes for requests refused because they came from a web
+		// page: they are turned away before authentication, so anybody can
+		// send as many as they like.
+		if rec.status == http.StatusForbidden && meta.token == "" {
+			s.noteRejection(false)
 			return
 		}
 		// Successful health checks are not logged either. They carry no
@@ -87,10 +144,15 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 		// Authorization header is a secret and must never reach a log.
 		s.logger().Info("request",
 			"method", r.Method,
-			"path", r.URL.Path,
+			// Cut off: the path is chosen by the client and may be as long
+			// as the header limit allows.
+			"path", truncate(r.URL.Path, 200),
 			"status", rec.status,
 			"duration", time.Since(started).Round(time.Millisecond).String(),
 			"remote", r.RemoteAddr,
+			// Which token did it: the name, never the token. Empty for a
+			// request that was turned away before it was authenticated.
+			"token", meta.token,
 		)
 	})
 }
@@ -132,4 +194,12 @@ func (r *statusRecorder) WriteHeader(status int) {
 // streaming would silently turn into buffering.
 func (r *statusRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
+}
+
+// truncate shortens s to at most n bytes for a log line.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

@@ -145,3 +145,37 @@ func TestRejectionsAreSummarisedNotLoggedIndividually(t *testing.T) {
 		t.Errorf("after a summary the counts are %d and %d, want 0 and 1", shed, lockedOut)
 	}
 }
+
+func TestClientAddressCountsAnIPv6NetworkAsOneClient(t *testing.T) {
+	tests := map[string]string{
+		"127.0.0.1:5000":                      "127.0.0.1",
+		"10.8.0.2:41000":                      "10.8.0.2",
+		"[2001:db8:1:2:aaaa:bbbb:cccc:1]:443": "2001:db8:1:2::/64",
+		"[2001:db8:1:2:ffff:0:0:9]:443":       "2001:db8:1:2::/64",
+		"[2001:db8:1:3::1]:443":               "2001:db8:1:3::/64",
+		"[::ffff:192.0.2.7]:80":               "::ffff:192.0.2.7",
+		"[::1]:7070":                          "::/64",
+	}
+	for remote, want := range tests {
+		if got := clientAddress(&http.Request{RemoteAddr: remote}); got != want {
+			t.Errorf("clientAddress(%s) = %q, want %q", remote, got, want)
+		}
+	}
+}
+
+func TestLimiterStopsGrowingWhenFull(t *testing.T) {
+	l := newAuthLimiter()
+	for i := range maxTrackedClients + 500 {
+		l.recordFailure(fmt.Sprintf("client-%d", i))
+	}
+	if len(l.failures) > maxTrackedClients {
+		t.Errorf("the limiter tracks %d clients, want at most %d", len(l.failures), maxTrackedClients)
+	}
+	// Clients that are tracked are still counted.
+	for range maxAuthFailures {
+		l.recordFailure("client-0")
+	}
+	if _, locked := l.blocked("client-0"); !locked {
+		t.Error("a tracked client is no longer locked out once the limiter is full")
+	}
+}

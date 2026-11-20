@@ -618,3 +618,39 @@ func TestDaemonServesThePanelUnlessDisabled(t *testing.T) {
 		t.Errorf("GET /ui/ with the panel disabled = %d, want 401", got)
 	}
 }
+
+func TestTokenCreateReadOnly(t *testing.T) {
+	td := newTestDaemon(t)
+	ctx := context.Background()
+
+	if code := td.Run(ctx, []string{"token", "create", "wallboard", "--read-only"}); code != exitOK {
+		t.Fatalf("token create --read-only: code %d, stderr %q", code, td.stderr.String())
+	}
+	token := tokenRe.FindString(td.stdout.String())
+
+	st, err := store.Open(ctx, filepath.Join(td.Home, "liman.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, ok, err := st.LookupToken(ctx, token)
+	_ = st.Close()
+	if err != nil || !ok || info.Scope != store.ScopeRead {
+		t.Errorf("the created token = %+v, %v, %v; want scope read", info, ok, err)
+	}
+
+	if code := td.Run(ctx, []string{"token", "create", "laptop"}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	if code := td.Run(ctx, []string{"token", "list"}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	out := td.stdout.String()
+	if !regexp.MustCompile(`wallboard\s+read`).MatchString(out) || !regexp.MustCompile(`laptop\s+admin`).MatchString(out) {
+		t.Errorf("token list does not show the scopes:\n%s", out)
+	}
+
+	// A name that could forge a log field or move the terminal's cursor.
+	if code := td.Run(ctx, []string{"token", "create", "a b"}); code != exitError {
+		t.Errorf("token create with a space in the name: code %d, want %d", code, exitError)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"sync"
 	"time"
@@ -25,6 +26,9 @@ const (
 	// is locked out for the rest of the window.
 	maxAuthFailures   = 10
 	authFailureWindow = time.Minute
+
+	// maxTrackedClients bounds the limiter's own memory.
+	maxTrackedClients = 10_000
 )
 
 // --- failed authentication limiter ----------------------------------------
@@ -87,7 +91,7 @@ func (l *authLimiter) recordFailure(client string) {
 	// them, and each one costs an entry. Dropping expired entries whenever
 	// the map has grown keeps the limiter itself from becoming the way to
 	// exhaust the daemon's memory.
-	if len(l.failures) >= 10_000 {
+	if len(l.failures) >= maxTrackedClients {
 		for addr, w := range l.failures {
 			if !now.Before(w.resets) {
 				delete(l.failures, addr)
@@ -96,6 +100,14 @@ func (l *authLimiter) recordFailure(client string) {
 	}
 
 	w, ok := l.failures[client]
+	// Still full after the clean-up above: every entry is live. A new
+	// address is then not tracked at all. That lets it guess without being
+	// slowed down, which costs nothing (the tokens cannot be guessed); the
+	// alternative, growing without bound, would let an attacker with many
+	// addresses take the daemon's memory.
+	if !ok && len(l.failures) >= maxTrackedClients {
+		return
+	}
 	if !ok || !now.Before(w.resets) {
 		l.failures[client] = &failureWindow{count: 1, resets: now.Add(authFailureWindow)}
 		return
@@ -112,6 +124,14 @@ func clientAddress(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
+	}
+	// One IPv6 customer is normally handed a whole /64: 2^64 addresses to
+	// pick a fresh one from for every attempt. They are counted as the one
+	// client they are.
+	if addr, err := netip.ParseAddr(host); err == nil && addr.Is6() && !addr.Is4In6() {
+		if prefix, err := addr.Prefix(64); err == nil {
+			return prefix.String()
+		}
 	}
 	return host
 }
@@ -204,27 +224,71 @@ func (s *Server) secureHeaders(next http.Handler) http.Handler {
 		// Stops a browser from guessing a content type and, say, rendering
 		// log output as HTML.
 		h.Set("X-Content-Type-Options", "nosniff")
+		// Other sites may not load anything from here, not even as an
+		// image or a script whose content they cannot read: the mere fact
+		// that a request succeeded, or how long it took, tells them things.
+		h.Set("Cross-Origin-Resource-Policy", "same-origin")
 		next.ServeHTTP(w, r)
 	})
 }
 
-// rejectBrowsers refuses requests made by web pages.
+// rejectBrowsers refuses requests made by web pages other than the daemon's
+// own panel.
 //
 // The daemon usually listens on 127.0.0.1, and any web page open in a
 // browser on that machine can send requests there. Such a page cannot add
 // the Authorization header to a simple request, so the token already
 // protects the API; this check removes the remaining surface (for example
-// probing unauthenticated endpoints) for free: browsers attach an Origin
-// header to cross-origin requests, and no legitimate client of this API is a
-// browser.
+// probing unauthenticated endpoints) for free. Browsers attach an Origin
+// header to every cross-origin request, and to same-origin ones that are
+// not a plain GET.
+//
+// The one browser client that is welcome is the panel, and its requests
+// are recognisable: their Origin is the daemon's own address.
 func (s *Server) rejectBrowsers(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Origin") != "" {
+		// Not every request a page can cause carries an Origin header: an
+		// <img> or <script> tag pointing here sends a plain GET without
+		// one. Browsers label those too, with Sec-Fetch-Site. "same-origin"
+		// is the panel, "none" is an address typed by the user, and no
+		// header at all is a client that is not a browser.
+		if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" && site != "none" {
 			writeError(w, http.StatusForbidden, errors.New("requests from web pages are not accepted"))
 			return
 		}
-		next.ServeHTTP(w, r)
+
+		origin := r.Header.Get("Origin")
+		if origin == "" || (s.Panel != nil && sameOrigin(origin, r.Host)) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		writeError(w, http.StatusForbidden, errors.New("requests from web pages are not accepted"))
 	})
+}
+
+// sameOrigin reports whether a request with this Origin header, sent to
+// this Host, comes from a page the daemon itself served.
+//
+// Comparing the two is not enough on its own. Both are chosen by the
+// browser from the address the user's page was loaded from, and a hostile
+// site can make its own name resolve to 127.0.0.1 ("DNS rebinding"): its
+// page then really is same-origin with the daemon, under the attacker's
+// name. The daemon is only ever addressed by IP address or as localhost,
+// so any other host name is refused. (Such a page would still have no
+// token; this closes the door before that matters.)
+func sameOrigin(origin, host string) bool {
+	if origin != "http://"+host {
+		return false
+	}
+	name := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		name = h
+	}
+	if name == "localhost" {
+		return true
+	}
+	_, err := netip.ParseAddr(name)
+	return err == nil
 }
 
 // --- request bodies -------------------------------------------------------

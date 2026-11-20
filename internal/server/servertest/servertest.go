@@ -5,7 +5,6 @@ package servertest
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/onrcanogul/liman/internal/api"
+	"github.com/onrcanogul/liman/internal/backup"
 	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/deploy"
 	"github.com/onrcanogul/liman/internal/engine"
@@ -39,6 +39,10 @@ type Harness struct {
 
 	Engine *enginetest.Fake
 	Store  *store.Store
+
+	// KeyPath is the master key file; BackupDir is where backups go.
+	KeyPath   string
+	BackupDir string
 
 	// ConnectErr, when set, makes the engine unavailable, as when Docker is
 	// not running.
@@ -68,9 +72,11 @@ func New(t *testing.T, options ...func(*server.Server)) *Harness {
 		t.Fatalf("create token: %v", err)
 	}
 
-	// A fresh random key per test server.
-	key := make([]byte, secrets.KeySize)
-	if _, err := rand.Read(key); err != nil {
+	// A fresh random key per test server, in a file like the real one, so
+	// that backups can be checked against it.
+	keyPath := filepath.Join(t.TempDir(), "master.key")
+	key, err := secrets.CreateKey(keyPath)
+	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
 	vault, err := secrets.NewVault(key, st)
@@ -78,11 +84,12 @@ func New(t *testing.T, options ...func(*server.Server)) *Harness {
 		t.Fatalf("create vault: %v", err)
 	}
 
-	h := &Harness{Engine: enginetest.New(), Store: st}
+	h := &Harness{Engine: enginetest.New(), Store: st, KeyPath: keyPath, BackupDir: filepath.Join(t.TempDir(), "backups")}
 
 	h.Server = &server.Server{
 		Store:   st,
 		Secrets: vault,
+		Backups: &backup.Service{Store: st, Dir: h.BackupDir, KeyPath: keyPath},
 		Connect: func(context.Context) (engine.Engine, error) {
 			if h.ConnectErr != nil {
 				return nil, h.ConnectErr

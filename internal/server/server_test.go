@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,6 +23,7 @@ import (
 	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/engine"
 	"github.com/onrcanogul/liman/internal/panel"
+	"github.com/onrcanogul/liman/internal/secrets"
 	"github.com/onrcanogul/liman/internal/server"
 	"github.com/onrcanogul/liman/internal/server/servertest"
 	"github.com/onrcanogul/liman/internal/store"
@@ -846,11 +848,14 @@ func TestRepeatedBadTokensLockTheClientOut(t *testing.T) {
 		t.Error("a 429 response must say when to retry")
 	}
 
-	// During the lockout even the correct token is refused. Otherwise the
-	// difference between 429 and 200 would tell an attacker that a guess
-	// was right.
-	if resp := guess(h.Client.Token); resp.StatusCode != http.StatusTooManyRequests {
-		t.Errorf("the valid token during a lockout = %d, want 429", resp.StatusCode)
+	// The lockout is for those who fail. Whoever holds a valid token is
+	// not affected by it: otherwise anybody able to send ten bad requests
+	// from the operator's address (a web page in the operator's browser
+	// can) could keep the operator out for as long as they liked. That a
+	// right guess is answered differently gives nothing away: a right
+	// guess is a valid token.
+	if resp := guess(h.Client.Token); resp.StatusCode != http.StatusOK {
+		t.Errorf("the valid token during a lockout = %d, want 200", resp.StatusCode)
 	}
 
 	// The health check stays reachable: monitoring must not be collateral.
@@ -1634,5 +1639,375 @@ func TestHealthHistory(t *testing.T) {
 		if resp.StatusCode != want {
 			t.Errorf("GET %s = %d, want %d", path, resp.StatusCode, want)
 		}
+	}
+}
+
+// --- backups and the panel's write access ---------------------------------------
+
+func TestBackupsOverTheAPI(t *testing.T) {
+	h := servertest.New(t)
+
+	list, err := h.Client.Backups(ctx())
+	if err != nil || list.Backups == nil || len(list.Backups) != 0 || list.Dir != h.BackupDir {
+		t.Fatalf("Backups() before any = %+v, %v; want an empty, non-nil list in %s", list, err, h.BackupDir)
+	}
+
+	if err := h.Client.SetSecret(ctx(), "web", "API_KEY", []byte("s3cr3t-value")); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := h.Client.CreateBackup(ctx())
+	if err != nil {
+		t.Fatalf("CreateBackup() error = %v", err)
+	}
+	if !res.Report.OK || res.Report.Signature != "valid" || res.Report.Secrets != 1 || !res.Report.KeyChecked || res.Report.Rows["tokens"] != 1 {
+		t.Errorf("CreateBackup() report = %+v, want ok with one secret and one token", res.Report)
+	}
+	if res.Backup.SizeBytes == 0 || time.Since(res.Backup.CreatedAt) > time.Minute {
+		t.Errorf("CreateBackup() backup = %+v, want a size and a recent time", res.Backup)
+	}
+	// The file is where the listing says, private, and holds no plain text.
+	data, err := os.ReadFile(filepath.Join(h.BackupDir, res.Backup.Name))
+	if err != nil || bytes.Contains(data, []byte("s3cr3t-value")) {
+		t.Errorf("backup file: %v; it must exist and not contain the secret's value", err)
+	}
+
+	list, err = h.Client.Backups(ctx())
+	if err != nil || len(list.Backups) != 1 || list.Backups[0].Name != res.Backup.Name {
+		t.Errorf("Backups() = %+v, %v; want the new backup", list, err)
+	}
+
+	rep, err := h.Client.VerifyBackup(ctx(), res.Backup.Name)
+	if err != nil || !rep.OK {
+		t.Errorf("VerifyBackup() = %+v, %v; want ok", rep, err)
+	}
+
+	// With another master key the backup is intact but not usable.
+	if err := os.Remove(h.KeyPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secrets.CreateKey(h.KeyPath); err != nil {
+		t.Fatal(err)
+	}
+	rep, err = h.Client.VerifyBackup(ctx(), res.Backup.Name)
+	if err != nil || rep.OK || rep.Signature != "invalid" {
+		t.Errorf("VerifyBackup() with another key = %+v, %v; want not ok with an invalid signature", rep, err)
+	}
+}
+
+func TestBackupNamesFromRequestsCannotLeaveTheDirectory(t *testing.T) {
+	h := servertest.New(t)
+
+	// A real database next to the backup directory, which a traversal
+	// would reach.
+	if err := h.Store.Snapshot(ctx(), filepath.Join(filepath.Dir(h.BackupDir), "outside.db")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(h.BackupDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{"..%2Foutside.db", "outside.db", "liman-20260101-000000.db", "liman-20260101-000000.db%00", "%2e%2e%2f%2e%2e%2fetc%2fpasswd"} {
+		resp := request(t, h, http.MethodPost, "/v1/backups/"+name+"/verify", nil)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("verify of %q = %d, want 404 or 400", name, resp.StatusCode)
+		}
+	}
+}
+
+func TestBackupEndpointsNeedATokenAndTheRightMethod(t *testing.T) {
+	h := servertest.New(t)
+
+	if resp := plain(t, h, "/v1/backups"); resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("GET /v1/backups without a token = %d, want 401", resp.StatusCode)
+	}
+	resp, err := http.Post(h.URL+"/v1/backups", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("POST /v1/backups without a token = %d, want 401", resp.StatusCode)
+	}
+	if entries, _ := os.ReadDir(h.BackupDir); len(entries) != 0 {
+		t.Errorf("a backup was made without a token: %v", entries)
+	}
+
+	// There is no way to remove or fetch a backup through the API.
+	for _, method := range []string{http.MethodDelete, http.MethodPut} {
+		resp := request(t, h, method, "/v1/backups", nil)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Errorf("%s /v1/backups = %d, want 405", method, resp.StatusCode)
+		}
+	}
+}
+
+func TestOnlyThePanelsOwnPagesMaySendRequestsFromABrowser(t *testing.T) {
+	h := servertest.New(t, func(s *server.Server) { s.Panel = panel.Handler() })
+	host := strings.TrimPrefix(h.URL, "http://")
+
+	post := func(origin, hostHeader string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, h.URL+"/v1/backups", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+h.Client.Token)
+		req.Header.Set("Origin", origin)
+		if hostHeader != "" {
+			// What the server sees as the request's Host header.
+			req.Host = hostHeader
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// The panel: its Origin is the daemon's own address.
+	if got := post("http://"+host, ""); got != http.StatusCreated {
+		t.Errorf("POST from the panel's own origin = %d, want 201", got)
+	}
+	// Another site, and the same address with another scheme or port.
+	_, port, _ := net.SplitHostPort(host)
+	for _, origin := range []string{"https://evil.example", "https://" + host, "http://127.0.0.1:1", "null"} {
+		if got := post(origin, ""); got != http.StatusForbidden {
+			t.Errorf("POST with Origin %q = %d, want 403", origin, got)
+		}
+	}
+	// DNS rebinding: a hostile name that resolves to the daemon. Origin and
+	// Host agree, but the daemon is never addressed by such a name.
+	if got := post("http://evil.example:"+port, "evil.example:"+port); got != http.StatusForbidden {
+		t.Errorf("POST from a rebound host name = %d, want 403", got)
+	}
+	// localhost is a name the daemon is addressed by.
+	if got := post("http://localhost:"+port, "localhost:"+port); got != http.StatusCreated && got != http.StatusConflict {
+		t.Errorf("POST addressed as localhost = %d, want it accepted", got)
+	}
+
+	// A daemon without a panel has no browser client at all.
+	bare := servertest.New(t)
+	req, _ := http.NewRequest(http.MethodPost, bare.URL+"/v1/backups", nil)
+	req.Header.Set("Authorization", "Bearer "+bare.Client.Token)
+	req.Header.Set("Origin", bare.URL)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("same-origin POST to a daemon without a panel = %d, want 403", resp.StatusCode)
+	}
+}
+
+// --- token scopes and the audit trail ---------------------------------------------
+
+func TestReadOnlyTokenCanLookAndChangeNothing(t *testing.T) {
+	h := servertest.New(t)
+	h.Engine.Add(engine.Container{Name: "web-r1", App: "web", Image: "web:1.0"})
+	if err := h.Client.SetSecret(ctx(), "web", "KEY", []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+
+	token, err := h.Store.CreateScopedToken(ctx(), "wallboard", store.ScopeRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	do := func(method, path string) int {
+		t.Helper()
+		req, err := http.NewRequest(method, h.URL+path, strings.NewReader("x"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	for _, path := range []string{"/v1/apps", "/v1/history", "/v1/releases", "/v1/info", "/v1/backups", "/v1/apps/web/secrets", "/v1/apps/web/health", "/v1/apps/web/logs"} {
+		if got := do(http.MethodGet, path); got != http.StatusOK {
+			t.Errorf("GET %s with a read-only token = %d, want 200", path, got)
+		}
+	}
+
+	// Everything that changes something, including a path that does not
+	// exist: the rule is about the method.
+	changes := []struct{ method, path string }{
+		{http.MethodPost, "/v1/deploys"},
+		{http.MethodPost, "/v1/deploys?dry_run=true"},
+		{http.MethodPost, "/v1/apps/web/rollback"},
+		{http.MethodDelete, "/v1/apps/web"},
+		{http.MethodPut, "/v1/apps/web/secrets/KEY"},
+		{http.MethodDelete, "/v1/apps/web/secrets/KEY"},
+		{http.MethodPost, "/v1/backups"},
+		{http.MethodPost, "/v1/confirmations/abc"},
+		{http.MethodPost, "/v1/something-added-later"},
+	}
+	for _, c := range changes {
+		if got := do(c.method, c.path); got != http.StatusForbidden {
+			t.Errorf("%s %s with a read-only token = %d, want 403", c.method, c.path, got)
+		}
+	}
+
+	// And nothing did change.
+	if h.Engine.State("web-r1") != "running" {
+		t.Error("the app was touched by a read-only token")
+	}
+	if list, err := h.Client.Secrets(ctx(), "web"); err != nil || len(list) != 1 {
+		t.Errorf("secrets after the attempts = %+v, %v; want the one that was there", list, err)
+	}
+	if entries, _ := os.ReadDir(h.BackupDir); len(entries) != 0 {
+		t.Errorf("a backup was made by a read-only token: %v", entries)
+	}
+
+	// The token is told what it is.
+	info, err := (&api.Client{BaseURL: h.URL, Token: token}).Info(ctx())
+	if err != nil || info.Scope != store.ScopeRead || info.Token != "wallboard" {
+		t.Errorf("Info() with the read-only token = %+v, %v", info, err)
+	}
+	if info, err := h.Client.Info(ctx()); err != nil || info.Scope != store.ScopeAdmin {
+		t.Errorf("Info() with the admin token = %+v, %v", info, err)
+	}
+}
+
+func TestRequestLogNamesTheTokenAndNeverContainsIt(t *testing.T) {
+	var log lockedBuffer
+	h := servertest.New(t, func(s *server.Server) {
+		s.Log = slog.New(slog.NewTextHandler(&log, nil))
+	})
+
+	if _, err := h.Client.Apps(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Client.SetSecret(ctx(), "web", "KEY", []byte("s3cr3t-value")); err != nil {
+		t.Fatal(err)
+	}
+	if resp := plain(t, h, "/v1/apps"); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatal("expected a 401")
+	}
+
+	out := log.String()
+	if !strings.Contains(out, "path=/v1/apps status=200") || !strings.Contains(out, "token=test") {
+		t.Errorf("the log does not say which token made the request:\n%s", out)
+	}
+	if !strings.Contains(out, `status=401`) || !strings.Contains(out, `token=""`) {
+		t.Errorf("the rejected request is not logged with an empty token name:\n%s", out)
+	}
+	if strings.Contains(out, h.Client.Token) || strings.Contains(out, "s3cr3t-value") {
+		t.Error("the log contains a token or a secret's value")
+	}
+}
+
+// lockedBuffer is a buffer that handlers of concurrent requests can write
+// log lines to while the test reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// --- findings of the security review ----------------------------------------------
+
+func TestRequestsWithoutATokenCannotLockTheOperatorOut(t *testing.T) {
+	h := servertest.New(t, func(s *server.Server) { s.Panel = panel.Handler() })
+
+	// What ten <img> tags on a hostile page would send, and then some.
+	for range 40 {
+		_ = plain(t, h, "/v1/apps")
+	}
+	if resp := plain(t, h, "/v1/apps"); resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("after the flood a request without a token = %d, want 429", resp.StatusCode)
+	}
+
+	// The operator's CLI and panel, from the same address, carry on.
+	if _, err := h.Client.Apps(ctx()); err != nil {
+		t.Errorf("Apps() with a valid token during the lockout error = %v", err)
+	}
+	if _, err := h.Client.CreateBackup(ctx()); err != nil {
+		t.Errorf("CreateBackup() with a valid token during the lockout error = %v", err)
+	}
+	if resp := plain(t, h, "/ui/"); resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /ui/ during the lockout = %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestRequestsCausedByOtherSitesAreRefusedEvenWithoutAnOriginHeader(t *testing.T) {
+	h := servertest.New(t, func(s *server.Server) { s.Panel = panel.Handler() })
+
+	// An <img>, <script> or <link> tag on another site: a GET without an
+	// Origin header, which the browser labels with Sec-Fetch-Site.
+	for site, want := range map[string]int{
+		"cross-site":  http.StatusForbidden,
+		"same-site":   http.StatusForbidden, // another port on the same machine
+		"same-origin": http.StatusOK,        // the panel
+		"none":        http.StatusOK,        // typed into the address bar
+	} {
+		resp := request(t, h, http.MethodGet, "/v1/apps", map[string]string{"Sec-Fetch-Site": site})
+		_ = resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("GET with Sec-Fetch-Site: %s = %d, want %d", site, resp.StatusCode, want)
+		}
+	}
+
+	// Refused before authentication: such requests do not count as failed
+	// attempts, so they cannot be used to lock anybody out either.
+	for range 30 {
+		req, _ := http.NewRequest(http.MethodGet, h.URL+"/v1/apps", nil)
+		req.Header.Set("Sec-Fetch-Site", "cross-site")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+	}
+	if resp := plain(t, h, "/v1/apps"); resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("after 30 refused cross-site requests, a plain one = %d, want 401 (not locked out)", resp.StatusCode)
+	}
+}
+
+func TestRefusedBrowserRequestsAreNotLoggedOneByOne(t *testing.T) {
+	var log lockedBuffer
+	h := servertest.New(t, func(s *server.Server) {
+		s.Log = slog.New(slog.NewTextHandler(&log, nil))
+	})
+
+	long := "/v1/" + strings.Repeat("a", 3000)
+	for range 50 {
+		req, _ := http.NewRequest(http.MethodGet, h.URL+long, nil)
+		req.Header.Set("Origin", "https://evil.example")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+	}
+
+	out := log.String()
+	// A summary line now and then, never a line per request, and never the
+	// path in full.
+	if n := strings.Count(out, "\n"); n > 3 {
+		t.Errorf("50 refused requests wrote %d log lines, want a summary", n)
+	}
+	if strings.Contains(out, strings.Repeat("a", 300)) {
+		t.Error("the log contains a path of thousands of characters")
 	}
 }

@@ -21,6 +21,7 @@ import (
 
 	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/applock"
+	"github.com/onrcanogul/liman/internal/backup"
 	"github.com/onrcanogul/liman/internal/buildinfo"
 	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/engine"
@@ -43,12 +44,26 @@ liman CLI asks for.
 
 Usage:
   limand                          Serve the API (same as "limand serve")
-  limand token create <name> [--write-client <file>] [--url <url>]
+  limand token create <name> [--read-only] [--write-client <file>] [--url <url>]
                                   Create an API token. It is printed once, or
                                   with --write-client written to a client.yaml
-                                  instead of being printed
+                                  instead of being printed. A --read-only
+                                  token can look at everything and change
+                                  nothing
   limand token list               List token names
   limand token revoke <name>      Revoke a token
+  limand backup create <dir> [--keep <n>]
+                                  Write a copy of the database into <dir> and
+                                  check it; with --keep, remove all but the
+                                  newest <n> backups there. Safe while the
+                                  daemon is running
+  limand backup verify <file>     Check a backup: is it intact, and can its
+                                  secrets be decrypted with this master key
+  limand backup restore <file> [--allow-unsigned]
+                                  Replace the database with a backup. The
+                                  daemon must be stopped. A backup whose
+                                  signature cannot be checked is refused
+                                  unless --allow-unsigned is given
   limand version                  Print version information
   limand help                     Show this help
 
@@ -90,6 +105,8 @@ func (d *Daemon) Run(ctx context.Context, args []string) int {
 		return d.serve(ctx)
 	case "token":
 		return d.runToken(ctx, args[1:])
+	case "backup":
+		return d.runBackup(ctx, args[1:])
 	case "version":
 		fmt.Fprintln(d.Stdout, buildinfo.String())
 		return exitOK
@@ -133,6 +150,13 @@ func (d *Daemon) serve(ctx context.Context) int {
 	srv := &server.Server{Store: st, Connect: connect, Log: log, Locks: locks, Secrets: vault, Started: time.Now()}
 	if !cfg.Panel.Disabled {
 		srv.Panel = panel.Handler()
+	}
+	srv.Backups = &backup.Service{Store: st, Dir: cfg.Backup.Dir, KeyPath: d.keyPath(cfg), Keep: 14}
+	if srv.Backups.Dir == "" {
+		srv.Backups.Dir = filepath.Join(d.Home, "backups")
+	}
+	if cfg.Backup.Keep != nil {
+		srv.Backups.Keep = *cfg.Backup.Keep
 	}
 	if cfg.Deploy.Drain != nil {
 		drain := time.Duration(*cfg.Deploy.Drain)
@@ -269,10 +293,7 @@ func (d *Daemon) serve(ctx context.Context) int {
 // openVault loads the master key, creating it on the very first start, and
 // returns the vault that encrypts app secrets with it.
 func (d *Daemon) openVault(ctx context.Context, cfg config.Config, st *store.Store, log *slog.Logger) (*secrets.Vault, error) {
-	path := cfg.Secrets.KeyFile
-	if path == "" {
-		path = filepath.Join(d.Home, "master.key")
-	}
+	path := d.keyPath(cfg)
 
 	exists, err := secrets.KeyExists(path)
 	if err != nil {
@@ -304,6 +325,14 @@ func (d *Daemon) openVault(ctx context.Context, cfg config.Config, st *store.Sto
 	}
 
 	return secrets.NewVault(key, st)
+}
+
+// keyPath returns where the master key is kept.
+func (d *Daemon) keyPath(cfg config.Config) string {
+	if cfg.Secrets.KeyFile != "" {
+		return cfg.Secrets.KeyFile
+	}
+	return filepath.Join(d.Home, "master.key")
 }
 
 // recordRestart returns the callback that writes the monitor's restarts
@@ -448,12 +477,13 @@ func (d *Daemon) runToken(ctx context.Context, args []string) int {
 }
 
 func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
-	const synopsis = "limand token create <name> [--write-client <file>] [--url <url>]"
+	const synopsis = "limand token create <name> [--read-only] [--write-client <file>] [--url <url>]"
 
 	fs := flag.NewFlagSet("token create", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	writeClient := fs.String("write-client", "", "write the token to this client.yaml instead of printing it")
 	url := fs.String("url", "", "daemon URL to put into the client.yaml")
+	readOnly := fs.Bool("read-only", false, "the token can look at everything and change nothing")
 
 	// The flag package stops at the first non-flag argument, so the name is
 	// taken first and the flags are parsed from what follows it.
@@ -475,7 +505,11 @@ func (d *Daemon) tokenCreate(ctx context.Context, args []string) int {
 	}
 	defer func() { _ = st.Close() }()
 
-	token, err := st.CreateToken(ctx, name)
+	scope := store.ScopeAdmin
+	if *readOnly {
+		scope = store.ScopeRead
+	}
+	token, err := st.CreateScopedToken(ctx, name, scope)
 	if err != nil {
 		return d.fail(err)
 	}
@@ -526,9 +560,9 @@ func (d *Daemon) tokenList(ctx context.Context, args []string) int {
 	}
 
 	w := tabwriter.NewWriter(d.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "NAME\tCREATED")
+	fmt.Fprintln(w, "NAME\tSCOPE\tCREATED")
 	for _, t := range tokens {
-		fmt.Fprintf(w, "%s\t%s\n", t.Name, t.CreatedAt.Local().Format("2006-01-02 15:04:05"))
+		fmt.Fprintf(w, "%s\t%s\t%s\n", t.Name, t.Scope, t.CreatedAt.Local().Format("2006-01-02 15:04:05"))
 	}
 	if err := w.Flush(); err != nil {
 		return d.fail(err)

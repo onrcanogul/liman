@@ -227,6 +227,47 @@ func (c *Client) Info(ctx context.Context) (*Info, error) {
 	return &out, nil
 }
 
+// Backups lists the backups on the server, newest first.
+func (c *Client) Backups(ctx context.Context) (*BackupList, error) {
+	var out BackupList
+	if err := c.getJSON(ctx, "/v1/backups", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// CreateBackup makes a backup now.
+func (c *Client) CreateBackup(ctx context.Context) (*BackupResult, error) {
+	var out BackupResult
+	if err := c.postJSON(ctx, "/v1/backups", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// VerifyBackup checks the backup called name.
+func (c *Client) VerifyBackup(ctx context.Context, name string) (*BackupReport, error) {
+	var out BackupReport
+	if err := c.postJSON(ctx, "/v1/backups/"+url.PathEscape(name)+"/verify", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// postJSON sends a POST without a body and decodes the JSON answer.
+func (c *Client) postJSON(ctx context.Context, path string, into any) error {
+	resp, err := c.do(ctx, http.MethodPost, path, nil, "", nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if err := json.NewDecoder(resp.Body).Decode(into); err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+	return nil
+}
+
 // SetSecret stores value as the secret name of app.
 func (c *Client) SetSecret(ctx context.Context, app, name string, value []byte) error {
 	// The value travels in the request body, never in the URL: URLs end up

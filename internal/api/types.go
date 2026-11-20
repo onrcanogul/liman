@@ -179,10 +179,17 @@ type Info struct {
 	StartedAt time.Time `json:"started_at"`
 	Now       time.Time `json:"now"`
 
+	// Token and Scope describe the token the question was asked with: its
+	// name and whether it is "admin" or "read". A client uses them to
+	// offer only what will be allowed.
+	Token string `json:"token"`
+	Scope string `json:"scope"`
+
 	// Proxy says whether the daemon manages a reverse proxy, Secrets whether
-	// it has secret storage.
+	// it has secret storage, Backups whether it can make backups.
 	Proxy   bool `json:"proxy"`
 	Secrets bool `json:"secrets"`
+	Backups bool `json:"backups"`
 
 	// Monitor describes the health monitor; it is absent when the monitor
 	// is turned off.
@@ -195,4 +202,51 @@ type MonitorInfo struct {
 	FailureThreshold int `json:"failure_threshold"`
 	// RetentionSeconds is how long health checks are kept.
 	RetentionSeconds int `json:"retention_seconds"`
+}
+
+// Backup describes one backup file of the daemon's database.
+type Backup struct {
+	Name      string    `json:"name"`
+	SizeBytes int64     `json:"size_bytes"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// BackupList is the answer to GET /v1/backups.
+type BackupList struct {
+	// Dir is the directory on the server the backups are in.
+	Dir string `json:"dir"`
+	// Keep is how many backups stay after a new one is made; zero means
+	// all of them.
+	Keep int `json:"keep"`
+	// Backups is ordered newest first.
+	Backups []Backup `json:"backups"`
+}
+
+// BackupReport is what checking a backup found. A report exists only for a
+// file that could be opened and is not damaged; OK additionally says that
+// every secret in it can be decrypted with the daemon's master key.
+type BackupReport struct {
+	OK            bool           `json:"ok"`
+	SchemaVersion int            `json:"schema_version"`
+	Rows          map[string]int `json:"rows"`
+	Secrets       int            `json:"secrets"`
+	// KeyChecked is false when the secrets could not be tested because the
+	// daemon has no master key.
+	KeyChecked bool `json:"key_checked"`
+	// Signature says whether the file is what the daemon's master key
+	// signed: "valid", "missing" (made before backups were signed),
+	// "invalid" (changed since, or from another key) or "unchecked" (the
+	// daemon has no master key).
+	Signature string `json:"signature"`
+	// Undecryptable names the secrets the master key does not open, as
+	// app/name. Names only: no value ever leaves the daemon.
+	Undecryptable []string `json:"undecryptable,omitempty"`
+}
+
+// BackupResult is the answer to POST /v1/backups.
+type BackupResult struct {
+	Backup Backup       `json:"backup"`
+	Report BackupReport `json:"report"`
+	// Removed is how many older backups were removed afterwards.
+	Removed int `json:"removed"`
 }

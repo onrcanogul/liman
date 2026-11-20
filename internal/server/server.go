@@ -21,6 +21,7 @@ import (
 	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/app"
 	"github.com/onrcanogul/liman/internal/applock"
+	"github.com/onrcanogul/liman/internal/backup"
 	"github.com/onrcanogul/liman/internal/buildinfo"
 	"github.com/onrcanogul/liman/internal/deploy"
 	"github.com/onrcanogul/liman/internal/engine"
@@ -63,6 +64,10 @@ type Server struct {
 	// public: they contain no data, and the page they make up has to ask
 	// the API for everything, with a token, like any other client.
 	Panel http.Handler
+
+	// Backups makes and checks backups of the database. Nil means this
+	// daemon offers none over the API.
+	Backups *backup.Service
 
 	// Secrets holds the apps' secret values, encrypted. Nil means the
 	// daemon has no secret storage; apps that refer to secrets cannot be
@@ -143,6 +148,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/info", s.handleInfo)
 	mux.HandleFunc("GET /v1/releases", s.handleReleases)
 	mux.HandleFunc("GET /v1/apps/{name}/health", s.handleHealthHistory)
+	mux.HandleFunc("GET /v1/backups", s.handleBackupList)
+	mux.HandleFunc("POST /v1/backups", s.handleBackupCreate)
+	mux.HandleFunc("POST /v1/backups/{name}/verify", s.handleBackupVerify)
 
 	// Middleware wraps the handler from the inside out; a request passes
 	// through the list below from top to bottom. The order is deliberate:
@@ -184,7 +192,16 @@ func (s *Server) Handler() http.Handler {
 // the daemon can request them, and a log line per request would let that
 // anybody fill the disk.
 func (s *Server) panelHandler() http.Handler {
-	h := http.StripPrefix("/ui", s.Panel)
+	files := http.StripPrefix("/ui", s.Panel)
+	// The panel's files are small and need no token. A client that asks
+	// for one and then never reads the answer would hold its place among
+	// the concurrent requests forever; with a deadline on the write, the
+	// connection is cut instead. (The API cannot have a blanket deadline
+	// like this: a deploy or a followed log legitimately takes long.)
+	h := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(30 * time.Second))
+		files.ServeHTTP(w, r)
+	}))
 	h = s.limitConcurrency(h)
 	h = s.secureHeaders(h)
 	h = s.recoverPanics(h)
@@ -570,8 +587,11 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 
 // --- read-only views for the panel --------------------------------------------
 
-func (s *Server) handleInfo(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
+	meta := metaOf(r.Context())
 	writeJSON(w, http.StatusOK, api.Info{
+		Token:     meta.token,
+		Scope:     meta.scope,
 		Version:   buildinfo.Version,
 		Commit:    buildinfo.Commit,
 		Built:     buildinfo.Date,
@@ -579,6 +599,7 @@ func (s *Server) handleInfo(w http.ResponseWriter, _ *http.Request) {
 		Now:       time.Now(),
 		Proxy:     s.Proxy != nil,
 		Secrets:   s.Secrets != nil,
+		Backups:   s.Backups != nil,
 		Monitor:   s.Monitoring,
 	})
 }
@@ -680,6 +701,94 @@ func listQuery(w http.ResponseWriter, r *http.Request) (limit int, filter string
 		return 0, "", false
 	}
 	return limit, filter, true
+}
+
+// --- backups -------------------------------------------------------------------
+//
+// Making and checking backups is offered over the API. Restoring is not:
+// it replaces the database the daemon has open, so it needs the daemon
+// stopped and is done with "limand backup restore" on the server.
+
+func (s *Server) handleBackupList(w http.ResponseWriter, _ *http.Request) {
+	if !s.haveBackups(w) {
+		return
+	}
+	entries, err := s.Backups.List()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	out := api.BackupList{Dir: s.Backups.Dir, Keep: s.Backups.Keep, Backups: make([]api.Backup, 0, len(entries))}
+	for _, e := range entries {
+		out.Backups = append(out.Backups, api.Backup{Name: e.Name, SizeBytes: e.Size, CreatedAt: e.Created})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleBackupCreate(w http.ResponseWriter, r *http.Request) {
+	if !s.haveBackups(w) {
+		return
+	}
+
+	entry, rep, removed, err := s.Backups.Create(r.Context())
+	switch {
+	case errors.Is(err, backup.ErrBusy):
+		writeError(w, http.StatusConflict, err)
+		return
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	s.logger().Info("backup created", "name", entry.Name, "bytes", entry.Size, "removed_older", removed)
+	writeJSON(w, http.StatusCreated, api.BackupResult{
+		Backup:  api.Backup{Name: entry.Name, SizeBytes: entry.Size, CreatedAt: entry.Created},
+		Report:  backupReport(rep),
+		Removed: removed,
+	})
+}
+
+func (s *Server) handleBackupVerify(w http.ResponseWriter, r *http.Request) {
+	if !s.haveBackups(w) {
+		return
+	}
+
+	rep, err := s.Backups.Verify(r.Context(), r.PathValue("name"))
+	switch {
+	case errors.Is(err, backup.ErrNotFound):
+		writeError(w, http.StatusNotFound, err)
+		return
+	case err != nil:
+		// The file exists but is damaged or not a database: that is the
+		// answer to the question, not a failure of the daemon.
+		writeError(w, http.StatusUnprocessableEntity, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, backupReport(rep))
+}
+
+// haveBackups answers 503 and returns false if the daemon offers no backups.
+func (s *Server) haveBackups(w http.ResponseWriter) bool {
+	if s.Backups == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("this daemon does not offer backups"))
+		return false
+	}
+	return true
+}
+
+func backupReport(rep backup.Report) api.BackupReport {
+	return api.BackupReport{
+		// A wrong signature, or secrets that could not be tested, do not
+		// count as fine.
+		OK:            rep.Usable(),
+		Signature:     rep.Signature,
+		SchemaVersion: rep.Summary.SchemaVersion,
+		Rows:          rep.Summary.Rows,
+		Secrets:       rep.Secrets,
+		KeyChecked:    rep.KeyChecked,
+		Undecryptable: rep.Undecryptable,
+	}
 }
 
 // --- secrets -----------------------------------------------------------------
