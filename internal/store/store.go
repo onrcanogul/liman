@@ -123,6 +123,26 @@ var migrations = []string{
 		PRIMARY KEY (token, app)
 	);
 	`,
+
+	// 8: the audit trail: who changed what, when, and how it ended. Rows
+	// are only ever added. Each one's mac covers the previous one's (see
+	// package audit), so a row changed or removed later shows. app is ""
+	// for what concerns the daemon as a whole (tokens, backups, keys).
+	`
+	CREATE TABLE audit (
+		seq    INTEGER PRIMARY KEY,
+		at     TEXT    NOT NULL,
+		actor  TEXT    NOT NULL,
+		action TEXT    NOT NULL,
+		app    TEXT    NOT NULL DEFAULT '',
+		target TEXT    NOT NULL DEFAULT '',
+		ok     INTEGER NOT NULL,
+		error  TEXT    NOT NULL DEFAULT '',
+		key_id TEXT    NOT NULL DEFAULT '',
+		mac    TEXT    NOT NULL
+	);
+	CREATE INDEX audit_app ON audit (app, seq);
+	`,
 }
 
 // SchemaVersion is the schema version this build reads and writes.

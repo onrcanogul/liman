@@ -149,7 +149,7 @@ func (s *Store) Inspect(ctx context.Context) (Summary, error) {
 	// A file written by an older version has fewer tables. Only the ones
 	// it has are counted; the list is ours, so the name can go into the
 	// query text (a table name cannot be a "?" parameter).
-	for _, table := range []string{"events", "releases", "tokens", "secrets", "health_samples"} {
+	for _, table := range []string{"events", "releases", "tokens", "secrets", "health_samples", "audit"} {
 		var exists int
 		err := s.db.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&exists)

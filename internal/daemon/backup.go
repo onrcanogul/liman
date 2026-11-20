@@ -85,7 +85,7 @@ func (d *Daemon) printReport(rep backupReport, cfg config.Config) {
 	// A fixed order; ranging over the map would shuffle the lines.
 	var parts []string
 	for _, table := range []struct{ name, noun string }{
-		{"events", "event"}, {"releases", "release"}, {"tokens", "token"}, {"secrets", "secret"}, {"health_samples", "health sample"},
+		{"events", "event"}, {"releases", "release"}, {"tokens", "token"}, {"secrets", "secret"}, {"health_samples", "health sample"}, {"audit", "audit record"},
 	} {
 		if n, ok := sum.Rows[table.name]; ok {
 			parts = append(parts, count(int(n), table.noun))
