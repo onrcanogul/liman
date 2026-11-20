@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -17,6 +19,7 @@ import (
 	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/engine"
 	"github.com/onrcanogul/liman/internal/engine/enginetest"
+	"github.com/onrcanogul/liman/internal/monitor"
 	"github.com/onrcanogul/liman/internal/store"
 )
 
@@ -542,5 +545,76 @@ func TestDaemonRefusesAKeyReadableByOthers(t *testing.T) {
 
 	if code != exitError || !strings.Contains(td.stderr.String(), "readable by others") {
 		t.Errorf("code %d, stderr %q; want a refusal over the key's permissions", code, td.stderr.String())
+	}
+}
+
+func TestHealthChecksAreRecordedAndOldOnesRemoved(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "liman.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+
+	const retention = 24 * time.Hour
+	record := recordChecks(st, slog.New(slog.DiscardHandler), retention)
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
+	count := func() int {
+		t.Helper()
+		buckets, err := st.HealthBuckets(ctx, "web", now.Add(-10*24*time.Hour), now.Add(time.Hour), time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		total := 0
+		for _, b := range buckets {
+			total += b.OK + b.Failed
+		}
+		return total
+	}
+
+	// A check from two days ago, as left behind by an earlier run.
+	record(monitor.Check{App: "web", Time: now.Add(-48 * time.Hour), OK: true})
+	if got := count(); got != 1 {
+		t.Fatalf("samples after the first check = %d, want 1", got)
+	}
+
+	// The next check is outside the pruning interval, so the old one goes.
+	record(monitor.Check{App: "web", Time: now, OK: false, Probed: true, Duration: 20 * time.Millisecond})
+	if got := count(); got != 1 {
+		t.Errorf("samples after pruning = %d, want only the new one", got)
+	}
+
+	// Checks that follow closely do not prune again, and are all kept.
+	for i := 1; i <= 3; i++ {
+		record(monitor.Check{App: "web", Time: now.Add(time.Duration(i) * time.Second), OK: true})
+	}
+	if got := count(); got != 4 {
+		t.Errorf("samples after three more checks = %d, want 4", got)
+	}
+}
+
+func TestDaemonServesThePanelUnlessDisabled(t *testing.T) {
+	status := func(t *testing.T, config string) int {
+		t.Helper()
+		td := newTestDaemon(t)
+		writeConfig(t, td.Home, config)
+		addr, stop, exit := startServing(t, td)
+		defer func() { stop(); <-exit }()
+
+		resp, err := http.Get("http://" + addr + "/ui/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := status(t, "daemon:\n  listen: 127.0.0.1:0\n"); got != http.StatusOK {
+		t.Errorf("GET /ui/ = %d, want 200", got)
+	}
+	// Disabled, the path is like any other unknown one: it needs a token.
+	if got := status(t, "daemon:\n  listen: 127.0.0.1:0\npanel:\n  disabled: true\n"); got != http.StatusUnauthorized {
+		t.Errorf("GET /ui/ with the panel disabled = %d, want 401", got)
 	}
 }

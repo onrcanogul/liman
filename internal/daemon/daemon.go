@@ -19,12 +19,14 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/applock"
 	"github.com/onrcanogul/liman/internal/buildinfo"
 	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/engine"
 	"github.com/onrcanogul/liman/internal/monitor"
 	"github.com/onrcanogul/liman/internal/nginx"
+	"github.com/onrcanogul/liman/internal/panel"
 	"github.com/onrcanogul/liman/internal/secrets"
 	"github.com/onrcanogul/liman/internal/server"
 	"github.com/onrcanogul/liman/internal/store"
@@ -51,6 +53,7 @@ Usage:
   limand help                     Show this help
 
 Files are kept in $LIMAN_HOME (default ~/.liman): config.yaml and liman.db.
+While it runs, limand also serves a read-only web panel under /ui/.
 `
 
 // Daemon holds what the limand command needs from the outside world.
@@ -127,7 +130,10 @@ func (d *Daemon) serve(ctx context.Context) int {
 		return d.fail(err)
 	}
 
-	srv := &server.Server{Store: st, Connect: connect, Log: log, Locks: locks, Secrets: vault}
+	srv := &server.Server{Store: st, Connect: connect, Log: log, Locks: locks, Secrets: vault, Started: time.Now()}
+	if !cfg.Panel.Disabled {
+		srv.Panel = panel.Handler()
+	}
 	if cfg.Deploy.Drain != nil {
 		drain := time.Duration(*cfg.Deploy.Drain)
 		srv.Drain = &drain
@@ -155,6 +161,12 @@ func (d *Daemon) serve(ctx context.Context) int {
 			FailureThreshold: cfg.Monitor.FailureThreshold,
 			Log:              log,
 			OnRestart:        recordRestart(st, log),
+			OnCheck:          recordChecks(st, log, healthRetention),
+		}
+		srv.Monitoring = &api.MonitorInfo{
+			IntervalSeconds:  int(orDefault(mon.Interval, monitor.DefaultInterval) / time.Second),
+			FailureThreshold: orDefault(mon.FailureThreshold, monitor.DefaultFailureThreshold),
+			RetentionSeconds: int(healthRetention / time.Second),
 		}
 		srv.HealthOf = func(app string) (string, string, int, bool) {
 			status, ok := mon.Status(app)
@@ -202,6 +214,7 @@ func (d *Daemon) serve(ctx context.Context) int {
 		"version", buildinfo.Version,
 		"nginx", cfg.Nginx.Enabled(),
 		"monitor", !cfg.Monitor.Disabled,
+		"panel", !cfg.Panel.Disabled,
 	)
 	if d.Ready != nil {
 		d.Ready(listener.Addr().String())
@@ -316,6 +329,69 @@ func recordRestart(st *store.Store, log *slog.Logger) func(monitor.Event) {
 			log.Error("restart not recorded", "app", ev.App, "error", err)
 		}
 	}
+}
+
+// healthRetention is how long health checks are kept. It matches the
+// longest range the API offers; keeping more would only grow the database.
+const healthRetention = 7 * 24 * time.Hour
+
+// pruneInterval is how often old health checks are deleted.
+const pruneInterval = time.Hour
+
+// recordChecks returns the callback that stores the monitor's health checks
+// and, now and then, deletes the ones older than retention.
+//
+// Pruning rides along with recording instead of having a timer of its own:
+// the table only grows when checks are recorded, so that is exactly when
+// there can be something to delete, and there is no extra goroutine to
+// start and stop.
+func recordChecks(st *store.Store, log *slog.Logger, retention time.Duration) func(monitor.Check) {
+	// The monitor checks several apps at once, so this callback runs on
+	// several goroutines; mu guards the one variable they share.
+	var (
+		mu        sync.Mutex
+		lastPrune time.Time
+	)
+
+	return func(c monitor.Check) {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		err := st.AppendHealthSample(ctx, store.HealthSample{
+			Time: c.Time, App: c.App, OK: c.OK, Probed: c.Probed, Duration: c.Duration,
+		})
+		if err != nil {
+			// The history is a convenience; losing a sample must not stop
+			// the monitor from doing its real job.
+			log.Error("health check not recorded", "app", c.App, "error", err)
+		}
+
+		mu.Lock()
+		due := c.Time.Sub(lastPrune) >= pruneInterval
+		if due {
+			lastPrune = c.Time
+		}
+		mu.Unlock()
+		if !due {
+			return
+		}
+
+		removed, err := st.PruneHealthSamples(ctx, c.Time.Add(-retention))
+		if err != nil {
+			log.Error("old health checks not removed", "error", err)
+		} else if removed > 0 {
+			log.Info("removed old health checks", "count", removed)
+		}
+	}
+}
+
+// orDefault returns v, or def if v is the zero value of its type.
+func orDefault[T comparable](v, def T) T {
+	var zero T
+	if v == zero {
+		return def
+	}
+	return v
 }
 
 // connectOnce wraps connect so that the engine is connected to once and the

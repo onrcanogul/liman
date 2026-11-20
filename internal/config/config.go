@@ -21,7 +21,14 @@ type Config struct {
 	Deploy  Deploy  `yaml:"deploy"`
 	Monitor Monitor `yaml:"monitor"`
 	Nginx   Nginx   `yaml:"nginx"`
+	Panel   Panel   `yaml:"panel"`
 	Secrets Secrets `yaml:"secrets"`
+}
+
+// Panel configures the web panel the daemon serves under /ui/.
+type Panel struct {
+	// Disabled turns the panel off. The API is not affected.
+	Disabled bool `yaml:"disabled"`
 }
 
 // Secrets configures where the key that encrypts app secrets is kept.
