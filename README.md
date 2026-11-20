@@ -236,7 +236,8 @@ While it runs, the daemon serves a web panel at `/ui/` on its listen address (`h
   timeline per app, deploys per day and the latest activity.
 - **Apps**: every app with its status, release, address and restarts; per
   app the health history, the response time of its health check, its
-  deploys, the names of its secrets, its activity and its logs.
+  deploys, the names of its secrets, its activity and its logs, which
+  can be followed as they are written.
 - **Activity**, **Secrets** (names only) and **Daemon** (version, which
   parts are switched on).
 - **Backups**: the backups on the server, a button to make one now and a

@@ -152,7 +152,7 @@ var S = {
   engineError: '', offlineError: '', updated: 0,
   health: new Map(),     // "app|range" -> { at, hist }
   secrets: new Map(),    // app -> { at, list, error }
-  logs: { app: '', text: '', error: '', loading: false, cut: false },
+  logs: { app: '', text: '', error: '', loading: false, cut: false, following: false, ended: false },
   backups: null,         // { at, list, error }
   backupBusy: false, backupNote: null,   // note: { kind, text }
   note: null,            // { kind, text }: the outcome of the last action
@@ -431,36 +431,84 @@ function checkBackup(name) {
   }).then(function () { if (S.token) render(); });
 }
 
-// Logs are read on demand. The daemon sends the whole output of the
-// container; only its end is kept, so a chatty app cannot fill the tab's
-// memory, and the read is given up after a while.
-var LOG_KEEP = 200000, LOG_LINES = 400, logRun = 0;
-function loadLogs(name) {
-  var my = ++logRun;
-  S.logs = { app: name, text: '', error: '', loading: true, cut: false };
+// Logs are read on demand, or followed: then the connection stays open
+// and what the container writes is appended as it comes. The daemon starts
+// with the last 200 lines either way. Only the end is kept, so a chatty app
+// cannot fill the tab's memory.
+var LOG_KEEP = 200000, LOG_LINES = 400, logRun = 0, logStop = null;
+// FOLLOW_LIMIT ends a followed stream after a while; Follow starts it
+// again. A tab left open overnight should not hold a connection forever.
+var FOLLOW_LIMIT = 6 * 3600000;
+function emptyLogs(name) { return { app: name || '', text: '', error: '', loading: false, cut: false, following: false, ended: false }; }
+// lastLines keeps the last LOG_LINES lines of text.
+function lastLines(text) {
+  var lines = text.replace(/\r\n?/g, '\n').split('\n');
+  return lines.length > LOG_LINES ? { text: lines.slice(-LOG_LINES).join('\n'), cut: true } : { text: lines.join('\n'), cut: false };
+}
+// stopFollowing closes a followed stream, if there is one. Whatever it had
+// shown stays on screen.
+function stopFollowing() {
+  logRun++;
+  if (logStop) { logStop(); logStop = null; }
+  if (S.logs.following) { S.logs.following = false; S.logs.loading = false; }
+}
+function loadLogs(name, follow) {
+  stopFollowing();
+  var my = logRun;
+  S.logs = emptyLogs(name); S.logs.loading = true; S.logs.following = !!follow;
   render();
-  request(appPath(name, '/logs'), 20000).then(function (r) {
+  request(appPath(name, '/logs') + (follow ? '?follow=true' : ''), follow ? FOLLOW_LIMIT : 20000).then(function (r) {
+    if (my !== logRun) { r.abort(); r.done(); return null; }
     if (!r.res.ok) return errorOf(r.res).then(function (e) { r.done(); throw e; });
-    if (!r.res.body || !r.res.body.getReader) return r.res.text().then(function (t) { r.done(); return { text: t.slice(-LOG_KEEP), cut: t.length > LOG_KEEP }; });
-    var reader = r.res.body.getReader(), dec = new TextDecoder(), text = '', cut = false;
+    if (!r.res.body || !r.res.body.getReader) {
+      if (follow) { r.abort(); r.done(); throw fail(0, 'This browser cannot follow a stream. The command line can: liman logs -f ' + name); }
+      return r.res.text().then(function (t) { r.done(); return { text: t.slice(-LOG_KEEP), cut: t.length > LOG_KEEP }; });
+    }
+    var reader = r.res.body.getReader(), dec = new TextDecoder(), text = '', cut = false, paintTimer = null;
+    if (follow) {
+      logStop = function () { clearTimeout(paintTimer); r.abort(); r.done(); };
+      // The stream is open: what there is to show is shown, even before
+      // the container writes anything.
+      S.logs.loading = false; render();
+    }
+    // paint puts the latest text on screen at most a few times a second;
+    // a busy app would otherwise redraw for every chunk.
+    function paint() {
+      paintTimer = null;
+      if (my !== logRun) return;
+      var kept = lastLines(text);
+      S.logs.text = kept.text; S.logs.cut = cut || kept.cut;
+      var el = $('logs');
+      if (!el) { render(); scrollLogsToEnd(); return; }
+      // Only keep up with the end when the reader is there; someone who
+      // scrolled up to read is left where they are.
+      var atEnd = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+      el.textContent = S.logs.text;
+      if (atEnd) scrollLogsToEnd();
+    }
     function pump() {
       return reader.read().then(function (chunk) {
-        if (chunk.done) { r.done(); return { text: text, cut: cut }; }
+        if (chunk.done) { r.done(); return { text: text, cut: cut, ended: follow }; }
         text += dec.decode(chunk.value, { stream: true });
         if (text.length > LOG_KEEP * 2) { text = text.slice(-LOG_KEEP); cut = true; }
+        if (follow && !paintTimer) paintTimer = setTimeout(paint, 200);
         return pump();
       }, function () { r.done(); return { text: text, cut: true, stopped: true }; });
     }
     return pump();
   }).then(function (out) {
-    if (my !== logRun) return;
-    var lines = out.text.replace(/\r\n?/g, '\n').split('\n');
-    if (lines.length > LOG_LINES) { lines = lines.slice(-LOG_LINES); out.cut = true; }
-    S.logs = { app: name, text: lines.join('\n'), error: out.stopped ? 'Reading stopped before the end; the log is very large. The command line shows all of it.' : '', loading: false, cut: out.cut };
+    if (!out || my !== logRun) return;
+    logStop = null;
+    var kept = lastLines(out.text);
+    S.logs = emptyLogs(name);
+    S.logs.text = kept.text; S.logs.cut = out.cut || kept.cut; S.logs.ended = !!out.ended;
+    if (out.stopped) S.logs.error = follow ? 'Following stopped: the connection to the daemon ended. Follow again to go on.' : 'Reading stopped before the end; the log is very large. The command line shows all of it.';
     render(); scrollLogsToEnd();
   }, function (e) {
     if (my !== logRun) return;
-    S.logs = { app: name, text: '', error: e && e.apiError ? e.message : 'The logs could not be read.', loading: false, cut: false };
+    logStop = null;
+    if (e && e.status === 401) { signOut(rejected(e)); return; }
+    S.logs = emptyLogs(name); S.logs.error = e && e.apiError ? e.message : 'The logs could not be read.';
     render();
   });
 }
@@ -483,12 +531,12 @@ function signIn(token) {
   });
 }
 function signOut(message, keepToken) {
-  seq++; logRun++;
+  seq++; stopFollowing();
   var token = keepToken ? S.token : '';
   if (!keepToken) saveToken('');
   S.token = ''; S.mode = 'signin'; S.gateError = str(message, 300); S.gateBusy = false;
   S.info = null; S.apps = []; S.events = []; S.releases = []; S.engineError = ''; S.offlineError = ''; S.updated = 0;
-  S.health = new Map(); S.secrets = new Map(); S.logs = { app: '', text: '', error: '', loading: false, cut: false };
+  S.health = new Map(); S.secrets = new Map(); S.logs = emptyLogs();
   S.backups = null; S.backupBusy = false; S.backupNote = null; S.checks = new Map(); S.note = null;
   closeDialog();
   S.pending = token;
@@ -833,6 +881,7 @@ function viewApps() {
 // ---------- view: one app, in tabs ----------
 var TABS = [['overview', 'Overview'], ['releases', 'Releases'], ['secrets', 'Secrets'], ['activity', 'Activity'], ['logs', 'Logs']];
 function setTab(tab) {
+  if (tab !== 'logs') stopFollowing();
   S.tab = tab; render();
   var r = route();
   if (tab === 'logs' && r.view === 'app' && findApp(r.name) && S.logs.app !== r.name) loadLogs(r.name);
@@ -890,16 +939,22 @@ function viewApp(name) {
     var ev = sortedEvents().filter(function (e) { return str(e.app) === a.name; });
     out.push(h('div', { class: 'grid' }, panel('Activity', ev.length ? eventTable(ev, false) : stateBlock('Nothing recorded for this app in the latest ' + S.events.length + ' steps', null, null, true), { flush: true })));
   } else {
-    var lg = S.logs.app === a.name ? S.logs : { loading: true, text: '', error: '', cut: false };
+    var lg = S.logs.app === a.name ? S.logs : { loading: true, text: '', error: '', cut: false, following: false, ended: false };
     var logBody = lg.loading ? stateBlock('Reading the logs…', null, null, true)
       : lg.text === '' && lg.error ? stateBlock('The logs could not be read', h('p', { text: str(lg.error, 300) }), null, true)
+      : lg.text === '' && lg.following ? stateBlock('Waiting for the container to write something', null, null, true)
       : lg.text === '' ? stateBlock('The container has not written anything', null, null, true)
-      : h('pre', { class: 'logs', id: 'logs', tabindex: '0', 'aria-label': 'Log output', text: lg.text });
+      : h('pre', { class: 'logs', id: 'logs', tabindex: '0', 'aria-label': 'Log output', 'aria-live': lg.following ? 'off' : null, text: lg.text });
+    var what = lg.following ? 'following: new lines appear as they are written' : lg.cut ? 'the last ' + LOG_LINES + ' lines at most' : 'output of the current container';
     out.push(h('div', { class: 'grid' }, panel('Logs', logBody, { flush: true, side: h('div', { class: 'hstack' },
-      h('span', { class: 'hint', text: lg.cut ? 'the last ' + LOG_LINES + ' lines at most' : 'output of the current container' }),
-      h('button', { class: 'btn small', disabled: lg.loading, onclick: function () { loadLogs(a.name); } }, 'Reload')) })));
+      h('span', { class: 'hint', text: what }),
+      lg.following
+        ? h('button', { class: 'btn small', id: 'logs-follow', onclick: function () { stopFollowing(); render(); } }, 'Stop following')
+        : [h('button', { class: 'btn small', disabled: lg.loading, onclick: function () { loadLogs(a.name); } }, 'Reload'),
+           h('button', { class: 'btn small', id: 'logs-follow', disabled: lg.loading, onclick: function () { loadLogs(a.name, true); } }, 'Follow')]) })));
     if (lg.text !== '' && lg.error) out.push(h('div', { class: 'hint', text: str(lg.error, 300) }));
-    out.push(h('div', { class: 'hint' }, 'Logs are not followed here. To watch them live: ', h('code', { text: 'liman logs -f ' + a.name })));
+    if (lg.ended) out.push(h('div', { class: 'hint', text: 'The stream ended: the container stopped, or was replaced by a new release. Follow again to watch the current one.' }));
+    out.push(h('div', { class: 'hint' }, 'In a terminal: ', h('code', { text: 'liman logs -f ' + a.name })));
   }
   return out;
 }
@@ -1191,6 +1246,7 @@ window.addEventListener('error', function (e) { crash(e.error || e); });
 window.addEventListener('hashchange', function () {
   // A dialog belongs to the page it was opened on, unless it is busy.
   if ($dlg.open && $dlg.querySelector('#dlg-go')) closeDialog();
+  stopFollowing();
   S.drawer = false; S.tab = 'overview'; render(); $main.scrollTop = 0; ensureExtras();
 });
 document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && S.drawer) setDrawer(false); });
