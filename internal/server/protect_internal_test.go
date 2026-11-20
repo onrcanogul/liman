@@ -179,3 +179,42 @@ func TestLimiterStopsGrowingWhenFull(t *testing.T) {
 		t.Error("a tracked client is no longer locked out once the limiter is full")
 	}
 }
+
+func TestReadLogLogsOncePerWindow(t *testing.T) {
+	var l readLog
+	t0 := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	const w = 10 * time.Minute
+
+	steps := []struct {
+		key  string
+		at   time.Duration
+		want bool
+	}{
+		{"panel GET /v1/apps", 0, true},
+		{"panel GET /v1/apps", 10 * time.Second, false},
+		{"panel GET /v1/history", 10 * time.Second, true},
+		{"cli GET /v1/apps", 20 * time.Second, true},
+		{"panel GET /v1/apps", 9*time.Minute + 59*time.Second, false},
+		// Measured from the line that was written, not from the last read.
+		{"panel GET /v1/apps", 10 * time.Minute, true},
+		{"panel GET /v1/apps", 15 * time.Minute, false},
+	}
+	for _, s := range steps {
+		if got := l.firstIn(s.key, w, t0.Add(s.at)); got != s.want {
+			t.Errorf("firstIn(%q) at +%v = %v, want %v", s.key, s.at, got, s.want)
+		}
+	}
+}
+
+func TestReadLogStaysBounded(t *testing.T) {
+	var l readLog
+	t0 := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < 3*maxReadLogKeys; i++ {
+		if !l.firstIn(fmt.Sprintf("t GET /v1/apps/a%d", i), time.Minute, t0) {
+			t.Fatalf("a new key %d was treated as a repeat", i)
+		}
+	}
+	if n := len(l.last); n > maxReadLogKeys {
+		t.Errorf("readLog holds %d keys, more than %d", n, maxReadLogKeys)
+	}
+}

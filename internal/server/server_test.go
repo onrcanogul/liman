@@ -2074,3 +2074,41 @@ func TestInfoSaysWhenTheTokenExpires(t *testing.T) {
 		t.Errorf("/v1/info for a token that never expires mentions an expiry: %s", body)
 	}
 }
+
+func TestRepeatedReadsAreLoggedOnce(t *testing.T) {
+	var log lockedBuffer
+	h := servertest.New(t, func(s *server.Server) {
+		s.Log = slog.New(slog.NewTextHandler(&log, nil))
+	})
+
+	for i := 0; i < 3; i++ {
+		if _, err := h.Client.Apps(ctx()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := h.Client.History(ctx(), "", 10); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.Client.SetSecret(ctx(), "web", "KEY", []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A failed read is always logged.
+	if _, err := h.Client.HealthHistory(ctx(), "web", "1s"); err == nil {
+		t.Fatal("expected an error for range=1s")
+	}
+	if _, err := h.Client.HealthHistory(ctx(), "web", "1s"); err == nil {
+		t.Fatal("expected an error for range=1s")
+	}
+
+	out := log.String()
+	for line, want := range map[string]int{
+		"method=GET path=/v1/apps status=200":              1,
+		"method=GET path=/v1/history status=200":           1,
+		"method=PUT path=/v1/apps/web/secrets/KEY status=": 3,
+		"method=GET path=/v1/apps/web/health status=400":   2,
+	} {
+		if got := strings.Count(out, line); got != want {
+			t.Errorf("%q appears %d times in the log, want %d:\n%s", line, got, want, out)
+		}
+	}
+}

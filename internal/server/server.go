@@ -117,6 +117,10 @@ type Server struct {
 	// rejected summarises requests that were turned away wholesale. Its
 	// zero value is ready to use.
 	rejected rejections
+
+	// reads keeps repeated successful reads out of the log. Its zero value
+	// is ready to use.
+	reads readLog
 }
 
 // authFailures returns the failed-authentication limiter.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/onrcanogul/liman/internal/store"
@@ -154,6 +155,16 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 		if r.URL.Path == "/v1/health" && rec.status == http.StatusOK {
 			return
 		}
+		// A successful read that the same token made of the same path a
+		// little while ago is not logged again. The panel refreshes every
+		// few seconds, and line after identical line would bury what the
+		// log is for. Changes, failures and the first read of anything
+		// still get their line, so "who looked at what, when" survives.
+		path := truncate(r.URL.Path, 200)
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && rec.status < 300 && meta.token != "" &&
+			!s.reads.firstIn(meta.token+" "+r.Method+" "+path, readLogWindow, started) {
+			return
+		}
 
 		// The path is logged, the query string and headers are not: the
 		// Authorization header is a secret and must never reach a log.
@@ -161,7 +172,7 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 			"method", r.Method,
 			// Cut off: the path is chosen by the client and may be as long
 			// as the header limit allows.
-			"path", truncate(r.URL.Path, 200),
+			"path", path,
 			"status", rec.status,
 			"duration", time.Since(started).Round(time.Millisecond).String(),
 			"remote", r.RemoteAddr,
@@ -170,6 +181,50 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 			"token", meta.token,
 		)
 	})
+}
+
+// readLogWindow is how long a successful read is not logged again.
+const readLogWindow = 10 * time.Minute
+
+// maxReadLogKeys bounds readLog. Only successful reads are recorded, and
+// those can only name what exists, so the table stays small; the bound is
+// there all the same, because the paths come from the client.
+const maxReadLogKeys = 4096
+
+// readLog remembers when a read was last logged.
+type readLog struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+// firstIn reports whether key was not logged within window before now,
+// and if so records now as the time it was. A key logged at 10:00 is
+// therefore logged again at the first read from 10:10 on, however often
+// it is read in between.
+func (l *readLog) firstIn(key string, window time.Duration, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if at, ok := l.last[key]; ok && now.Sub(at) < window {
+		return false
+	}
+	if l.last == nil {
+		l.last = make(map[string]time.Time)
+	}
+	if len(l.last) >= maxReadLogKeys {
+		for k, at := range l.last {
+			if now.Sub(at) >= window {
+				delete(l.last, k)
+			}
+		}
+		// Still full: forget everything. The cost is some lines logged
+		// again, never a line that is missing.
+		if len(l.last) >= maxReadLogKeys {
+			clear(l.last)
+		}
+	}
+	l.last[key] = now
+	return true
 }
 
 // recoverPanics turns a panic in a handler into a 500 response. A bug in

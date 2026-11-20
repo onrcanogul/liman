@@ -370,6 +370,9 @@ is equivalent to root. The API is built around keeping everyone else out:
   not a `GET`. Give the panel a read-only token wherever it only needs to
   show things. Every request is logged with the name of the token that made
   it (never the token), so `journalctl -u limand` answers "who did that".
+  A successful read that the same token repeats within ten minutes is not
+  logged again, so that the panel's refreshing does not fill the log;
+  changes and failures are always logged.
   Ten failed attempts from one address (one /64 for IPv6) within a minute
   lock that address out (429) until the minute is over. A request with a
   valid token is never locked out: failures by someone else at the same
