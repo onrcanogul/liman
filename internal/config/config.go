@@ -22,7 +22,20 @@ type Config struct {
 	Monitor Monitor `yaml:"monitor"`
 	Nginx   Nginx   `yaml:"nginx"`
 	Panel   Panel   `yaml:"panel"`
+	Backup  Backup  `yaml:"backup"`
 	Secrets Secrets `yaml:"secrets"`
+}
+
+// Backup configures the backups the daemon makes when asked to over the
+// API (the panel's "Back up now"). "limand backup create" takes its
+// directory as an argument and does not read this.
+type Backup struct {
+	// Dir is where backups are written and listed from. It defaults to the
+	// directory "backups" in liman's home.
+	Dir string `yaml:"dir"`
+	// Keep is how many backups stay after a new one is made. It defaults
+	// to 14; a pointer so that 0 ("keep them all") can be written.
+	Keep *int `yaml:"keep"`
 }
 
 // Panel configures the web panel the daemon serves under /ui/.
@@ -190,6 +203,12 @@ func (c *Config) validate() error {
 		errs = append(errs, fmt.Errorf("daemon.listen: %w", err))
 	}
 
+	if c.Backup.Dir != "" && !filepath.IsAbs(c.Backup.Dir) {
+		errs = append(errs, fmt.Errorf("backup.dir: must be an absolute path, got %q", c.Backup.Dir))
+	}
+	if k := c.Backup.Keep; k != nil && *k < 0 {
+		errs = append(errs, fmt.Errorf("backup.keep: must not be negative, got %d", *k))
+	}
 	if c.Secrets.KeyFile != "" && !filepath.IsAbs(c.Secrets.KeyFile) {
 		errs = append(errs, fmt.Errorf("secrets.key_file: must be an absolute path, got %q", c.Secrets.KeyFile))
 	}
@@ -299,13 +318,24 @@ func SaveClient(path string, c Client) error {
 	if err != nil {
 		return fmt.Errorf("encode client config: %w", err)
 	}
-	// WriteFile only applies the mode when it creates the file. Chmod
-	// covers the case where a more permissive file was already there.
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	// The token is written to a new file that is then renamed into place.
+	// Writing into a file that is already there would be writing through
+	// whatever someone put there: in a shared directory another user could
+	// create the file first and stay its owner, and the token would land
+	// in a file they can read. CreateTemp makes a file that did not exist,
+	// with mode 0600; Rename replaces the name, not the content.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".client-*.yaml")
+	if err != nil {
 		return fmt.Errorf("write client config: %w", err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		return fmt.Errorf("protect client config: %w", err)
+	_, writeErr := tmp.Write(data)
+	if err := errors.Join(writeErr, tmp.Close()); err != nil {
+		_ = os.Remove(tmp.Name())
+		return fmt.Errorf("write client config: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		_ = os.Remove(tmp.Name())
+		return fmt.Errorf("write client config: %w", err)
 	}
 	return nil
 }
