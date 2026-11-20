@@ -29,6 +29,7 @@ type fixture struct {
 	probeErr map[int]error
 	probes   int
 	events   []Event
+	checks   []Check
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -65,6 +66,11 @@ func newFixture(t *testing.T) *fixture {
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			f.events = append(f.events, ev)
+		},
+		OnCheck: func(c Check) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.checks = append(f.checks, c)
 		},
 	}
 	return f
@@ -585,5 +591,63 @@ func TestNewReleaseStartsWithACleanRecord(t *testing.T) {
 	st := f.health(t, "web")
 	if st.Health != Healthy || st.Restarts != 0 || !st.LastRestart.IsZero() {
 		t.Errorf("status of the new release = %+v, want a clean healthy record", st)
+	}
+}
+
+func TestEveryCheckIsReported(t *testing.T) {
+	f := newFixture(t)
+	f.addApp("web", 40001)
+	// An app without a health check: running is all there is to see.
+	f.engine.Add(engine.Container{Name: "plain-r1", App: "plain", HostPort: 40002, Release: "r1"})
+
+	f.advance(interval)
+	f.setProbe(40001, errors.New("503"))
+	f.advance(interval)
+
+	// The two apps are checked concurrently, so the order between them is
+	// not fixed; look at each app's checks on their own.
+	f.mu.Lock()
+	byApp := map[string][]Check{}
+	for _, c := range f.checks {
+		byApp[c.App] = append(byApp[c.App], c)
+	}
+	f.mu.Unlock()
+
+	web := byApp["web"]
+	if len(web) != 2 || !web[0].OK || web[1].OK || !web[0].Probed || !web[1].Probed {
+		t.Errorf("checks of web = %+v, want a probed success and then a probed failure", web)
+	}
+	if len(web) == 2 && !web[1].Time.Equal(web[0].Time.Add(interval)) {
+		t.Errorf("check times = %s and %s, want them one interval apart", web[0].Time, web[1].Time)
+	}
+	plain := byApp["plain"]
+	if len(plain) != 2 || !plain[0].OK || plain[0].Probed {
+		t.Errorf("checks of plain = %+v, want two successes without a probe", plain)
+	}
+}
+
+func TestNoCheckIsReportedWhileAnAppIsLeftAlone(t *testing.T) {
+	f := newFixture(t)
+	name := f.addApp("web", 40001)
+
+	f.engine.SetState(name, "exited")
+	f.advance(interval) // restarted; the grace period starts
+
+	f.mu.Lock()
+	before := len(f.checks)
+	f.mu.Unlock()
+
+	// Half an interval later the app is still inside its grace period: it
+	// is not looked at, so there is nothing to report. A gap in the history
+	// is the honest record of that.
+	f.advance(interval / 2)
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if before != 1 || len(f.checks) != before {
+		t.Errorf("checks reported = %d, then %d; want 1 and no more during the grace period", before, len(f.checks))
+	}
+	if f.checks[0].OK || f.checks[0].Probed {
+		t.Errorf("check of a stopped container = %+v, want a failure without a probe", f.checks[0])
 	}
 }

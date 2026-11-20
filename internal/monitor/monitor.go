@@ -77,6 +77,18 @@ type Event struct {
 	Duration time.Duration
 }
 
+// Check is the outcome of one look at an app, for the health history.
+type Check struct {
+	App  string
+	Time time.Time
+	// OK is false when something was wrong with the app.
+	OK bool
+	// Probed says whether an HTTP health request was made; Duration is how
+	// long it took and means nothing without one.
+	Probed   bool
+	Duration time.Duration
+}
+
 // Monitor checks apps periodically. Set the exported fields before calling
 // Run; they must not be changed afterwards.
 type Monitor struct {
@@ -97,6 +109,10 @@ type Monitor struct {
 
 	// OnRestart, when set, is called after every restart attempt.
 	OnRestart func(Event)
+	// OnCheck, when set, is called after every check of an app. Checks of
+	// different apps run concurrently, so it must be safe to call from
+	// several goroutines at once.
+	OnCheck func(Check)
 	// Log receives what the monitor does. Nil discards it.
 	Log *slog.Logger
 
@@ -210,7 +226,13 @@ func (m *Monitor) checkApp(ctx context.Context, eng engine.Engine, c engine.Cont
 		return
 	}
 
-	problem := m.diagnose(ctx, eng, c)
+	problem, probed, took := m.diagnose(ctx, eng, c)
+	if m.OnCheck != nil {
+		// Called before the lock below is taken: the callback writes to the
+		// database, and a slow disk must not hold up everyone who wants to
+		// read a status.
+		m.OnCheck(Check{App: c.App, Time: now, OK: problem == "", Probed: probed, Duration: took})
+	}
 
 	m.mu.Lock()
 	st.status.CheckedAt = now
@@ -245,24 +267,28 @@ func (m *Monitor) checkApp(ctx context.Context, eng engine.Engine, c engine.Cont
 }
 
 // diagnose returns a description of what is wrong with the app, or "" if
-// it is fine.
-func (m *Monitor) diagnose(ctx context.Context, eng engine.Engine, c engine.Container) string {
+// it is fine. It also reports whether it made a health request and, if so,
+// how long the answer took.
+func (m *Monitor) diagnose(ctx context.Context, eng engine.Engine, c engine.Container) (problem string, probed bool, took time.Duration) {
 	if !c.Running() {
-		return stoppedReason(ctx, eng, c)
+		return stoppedReason(ctx, eng, c), false, 0
 	}
 	// Without a health check, running is all that can be verified.
 	if c.HealthPath == "" || c.HostPort == 0 {
-		return ""
+		return "", false, 0
 	}
 
 	probe := m.Probe
 	if probe == nil {
 		probe = health.Probe
 	}
-	if err := probe(ctx, health.URL(c.HostPort, c.HealthPath)); err != nil {
-		return "health check failed: " + err.Error()
+	started := m.now()
+	err := probe(ctx, health.URL(c.HostPort, c.HealthPath))
+	took = m.now().Sub(started)
+	if err != nil {
+		return "health check failed: " + err.Error(), true, took
 	}
-	return ""
+	return "", true, took
 }
 
 // stoppedReason describes why a container is not running. The listing only
