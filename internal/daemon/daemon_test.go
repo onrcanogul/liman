@@ -756,6 +756,11 @@ func TestRegisteredAppIsDeployedFromItsPipelineOnly(t *testing.T) {
 		t.Error("an admin token triggered a deploy")
 	}
 
+	// The clients share http.DefaultTransport, which may have dialled a
+	// connection it never sent a request on. The server counts such a
+	// connection as idle only once it is five seconds old, as long as
+	// this test lets the shutdown take: close them first.
+	http.DefaultClient.CloseIdleConnections()
 	stop()
 	if code := <-exit; code != exitOK {
 		t.Errorf("exit code = %d: %s", code, td.stderr.String())
