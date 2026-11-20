@@ -319,7 +319,11 @@ func (d *Daemon) openVault(ctx context.Context, cfg config.Config, st *store.Sto
 			return nil, err
 		}
 		if count > 0 {
-			return nil, fmt.Errorf("the master key %s is missing, but %d secrets are stored that were encrypted with it; restore the key file from your backup (without it those secrets cannot be recovered)", path, count)
+			stored := fmt.Sprintf("%d secrets are stored that were", count)
+			if count == 1 {
+				stored = "1 secret is stored that was"
+			}
+			return nil, fmt.Errorf("the master key %s is missing, but %s encrypted with it; restore the key file from your backup (without it the stored secrets cannot be recovered)", path, stored)
 		}
 		if key, err = secrets.CreateKey(path); err != nil {
 			return nil, err

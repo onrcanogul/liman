@@ -102,7 +102,7 @@ func TestBackupCreateWritesACheckedPrivateCopy(t *testing.T) {
 	}
 
 	out := td.stdout.String()
-	for _, want := range []string{names[0], "signature valid", "1 events", "1 tokens", "1 secrets", "all 1 secrets can be decrypted", "master key is not part of the backup"} {
+	for _, want := range []string{names[0], "signature valid", "1 event,", "1 token,", "1 secret,", "the one secret can be decrypted", "master key is not part of the backup"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output does not mention %q:\n%s", want, out)
 		}

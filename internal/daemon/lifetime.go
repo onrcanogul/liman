@@ -63,19 +63,13 @@ func describeExpiry(t store.TokenInfo, now time.Time) string {
 // a unit is only used from two of it upwards, so that the rounding never
 // turns 47 hours into "2 days" or "1 day".
 func roughly(d time.Duration) string {
-	plural := func(n int64, unit string) string {
-		if n == 1 {
-			return "1 " + unit
-		}
-		return strconv.FormatInt(n, 10) + " " + unit + "s"
-	}
 	switch {
 	case d >= 48*time.Hour:
-		return plural(int64((d+12*time.Hour)/(24*time.Hour)), "day")
+		return count(int((d+12*time.Hour)/(24*time.Hour)), "day")
 	case d >= 2*time.Hour:
-		return plural(int64((d+30*time.Minute)/time.Hour), "hour")
+		return count(int((d+30*time.Minute)/time.Hour), "hour")
 	case d >= time.Minute:
-		return plural(int64(d/time.Minute), "minute")
+		return count(int(d/time.Minute), "minute")
 	default:
 		return "less than a minute"
 	}

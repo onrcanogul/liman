@@ -400,8 +400,8 @@ function reportText(rep) {
 }
 function contentText(rep) {
   var n = num(rep && rep.secrets) || 0, bad = Array.isArray(rep && rep.undecryptable) ? rep.undecryptable : [];
-  if (bad.length) return bad.length + ' of ' + n + ' secrets cannot be decrypted with the server\u2019s master key: ' + bad.map(function (x) { return str(x, 80); }).slice(0, 5).join(', ');
-  if (n > 0 && !(rep && rep.key_checked)) return 'intact, but its ' + n + ' secrets were not tested: the server has no master key';
+  if (bad.length) return bad.length + ' of ' + n + (n === 1 ? ' secret' : ' secrets') + ' cannot be decrypted with the server\u2019s master key: ' + bad.map(function (x) { return str(x, 80); }).slice(0, 5).join(', ');
+  if (n > 0 && !(rep && rep.key_checked)) return 'intact, but ' + (n === 1 ? 'its secret was' : 'its ' + n + ' secrets were') + ' not tested: the server has no master key';
   return 'intact' + (n === 1 ? '; its secret can be decrypted' : n > 1 ? '; all ' + n + ' secrets can be decrypted' : '');
 }
 function backUpNow() {

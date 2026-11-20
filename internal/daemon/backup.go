@@ -76,9 +76,11 @@ func (d *Daemon) printReport(rep backupReport, cfg config.Config) {
 
 	// A fixed order; ranging over the map would shuffle the lines.
 	var parts []string
-	for _, table := range []string{"events", "releases", "tokens", "secrets", "health_samples"} {
-		if n, ok := sum.Rows[table]; ok {
-			parts = append(parts, fmt.Sprintf("%d %s", n, strings.ReplaceAll(table, "_", " ")))
+	for _, table := range []struct{ name, noun string }{
+		{"events", "event"}, {"releases", "release"}, {"tokens", "token"}, {"secrets", "secret"}, {"health_samples", "health sample"},
+	} {
+		if n, ok := sum.Rows[table.name]; ok {
+			parts = append(parts, count(int(n), table.noun))
 		}
 	}
 	fmt.Fprintf(d.Stdout, "  %s\n", strings.Join(parts, ", "))
@@ -89,8 +91,10 @@ func (d *Daemon) printReport(rep backupReport, cfg config.Config) {
 	case !rep.KeyChecked:
 		fmt.Fprintf(d.Stdout, "  secrets NOT checked: there is no master key at %s\n", d.keyPath(cfg))
 	case len(rep.Undecryptable) > 0:
-		fmt.Fprintf(d.Stdout, "  %d of %d secrets can NOT be decrypted with %s: %s\n",
-			len(rep.Undecryptable), rep.Secrets, d.keyPath(cfg), strings.Join(rep.Undecryptable, ", "))
+		fmt.Fprintf(d.Stdout, "  %d of %s can NOT be decrypted with %s: %s\n",
+			len(rep.Undecryptable), count(rep.Secrets, "secret"), d.keyPath(cfg), strings.Join(rep.Undecryptable, ", "))
+	case rep.Secrets == 1:
+		fmt.Fprintf(d.Stdout, "  the one secret can be decrypted with %s\n", d.keyPath(cfg))
 	default:
 		fmt.Fprintf(d.Stdout, "  all %d secrets can be decrypted with %s\n", rep.Secrets, d.keyPath(cfg))
 	}
@@ -244,10 +248,10 @@ func (d *Daemon) backupRestore(ctx context.Context, args []string) int {
 		}
 	}
 	if rep.Secrets > 0 && !rep.KeyChecked {
-		return d.fail(fmt.Errorf("the backup holds %d secrets, but there is no master key at %s; put the key that belongs to this backup there first", rep.Secrets, d.keyPath(cfg)))
+		return d.fail(fmt.Errorf("the backup holds %s, but there is no master key at %s; put the key that belongs to this backup there first", count(rep.Secrets, "secret"), d.keyPath(cfg)))
 	}
 	if len(rep.Undecryptable) > 0 {
-		return d.fail(fmt.Errorf("%d of the %d secrets in the backup cannot be decrypted with %s; put the key that belongs to this backup there first", len(rep.Undecryptable), rep.Secrets, d.keyPath(cfg)))
+		return d.fail(fmt.Errorf("%d of the %s in the backup cannot be decrypted with %s; put the key that belongs to this backup there first", len(rep.Undecryptable), count(rep.Secrets, "secret"), d.keyPath(cfg)))
 	}
 
 	// 2. Nobody may be using the database. A running daemon holds it open

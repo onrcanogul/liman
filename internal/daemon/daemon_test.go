@@ -519,7 +519,7 @@ func TestDaemonRefusesToStartWhenKeyIsLostButSecretsExist(t *testing.T) {
 	if code != exitError {
 		t.Fatalf("exit code = %d, want the daemon to refuse to start", code)
 	}
-	for _, want := range []string{"master key", "is missing", "1 secrets are stored", "restore the key file"} {
+	for _, want := range []string{"master key", "is missing", "1 secret is stored", "restore the key file"} {
 		if !strings.Contains(td.stderr.String(), want) {
 			t.Errorf("stderr does not contain %q:\n%s", want, td.stderr.String())
 		}
