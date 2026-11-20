@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -565,5 +566,114 @@ func TestBackupRestoreDoesNotListExpiredTokensAsValid(t *testing.T) {
 	}
 	if out := td.stdout.String(); !strings.Contains(out, "These tokens are valid now: laptop\n") {
 		t.Errorf("restore lists an expired token as valid, or none at all:\n%s", out)
+	}
+}
+
+func TestPruneAsidesKeepsTheNewestByName(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "liman.db")
+	files := []string{
+		"liman.db",
+		"liman.db.replaced-20261101-090000",
+		"liman.db.replaced-20261101-090000-wal",
+		"liman.db.replaced-20261102-090000",
+		"liman.db.replaced-20261103-090000",
+		"liman.db.replaced-20261103-090000-2",
+		"liman.db.replaced-20261103-090000-10",
+		"liman.db.replaced-20261103-090000-10-shm",
+		"liman.db.replaced-by-hand", // not ours
+		"liman.db.replaced-20261103-090000-x",
+	}
+	for i, f := range files {
+		if err := os.WriteFile(filepath.Join(dir, f), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// Modification times in the opposite order of the names: the
+		// order must come from the names.
+		at := time.Now().Add(-time.Duration(i) * time.Hour)
+		if err := os.Chtimes(filepath.Join(dir, f), at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	removed, err := pruneAsides(target, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRemoved := []string{filepath.Join(dir, "liman.db.replaced-20261102-090000"), filepath.Join(dir, "liman.db.replaced-20261101-090000")}
+	if !slices.Equal(removed, wantRemoved) {
+		t.Errorf("removed = %v, want %v", removed, wantRemoved)
+	}
+
+	left, _ := os.ReadDir(dir)
+	var names []string
+	for _, e := range left {
+		names = append(names, e.Name())
+	}
+	want := []string{
+		"liman.db",
+		"liman.db.replaced-20261103-090000",
+		"liman.db.replaced-20261103-090000-10",
+		"liman.db.replaced-20261103-090000-10-shm",
+		"liman.db.replaced-20261103-090000-2",
+		"liman.db.replaced-20261103-090000-x",
+		"liman.db.replaced-by-hand",
+	}
+	if !slices.Equal(names, want) {
+		t.Errorf("left = %v, want %v", names, want)
+	}
+
+	// With nothing over the limit, nothing goes.
+	if removed, err := pruneAsides(target, 3); err != nil || len(removed) != 0 {
+		t.Errorf("second prune = %v, %v; want nothing removed", removed, err)
+	}
+}
+
+func TestRestoresInTheSameSecondKeepBothOldDatabases(t *testing.T) {
+	td := newTestDaemon(t)
+	seed(t, td)
+	dir := t.TempDir()
+	ctx := context.Background()
+
+	if code := td.Run(ctx, []string{"backup", "create", dir}); code != exitOK {
+		t.Fatalf("backup create: code %d, stderr %q", code, td.stderr.String())
+	}
+	file := filepath.Join(dir, backupsIn(t, dir)[0])
+
+	// Five restores, most of them within one second: each set-aside
+	// database gets a name of its own, and only the newest three stay.
+	for i := 0; i < 5; i++ {
+		if code := td.Run(ctx, []string{"backup", "restore", file}); code != exitOK {
+			t.Fatalf("restore %d: code %d, stderr %q", i+1, code, td.stderr.String())
+		}
+	}
+	kept, _ := filepath.Glob(filepath.Join(td.Home, "liman.db.replaced-*"))
+	var dbs []string
+	for _, k := range kept {
+		if !strings.HasSuffix(k, "-wal") && !strings.HasSuffix(k, "-shm") {
+			dbs = append(dbs, k)
+		}
+	}
+	if len(dbs) != keepAsides {
+		t.Errorf("set-aside databases after 5 restores = %v, want %d", dbs, keepAsides)
+	}
+	if !strings.Contains(td.stdout.String(), "Removed an older one: ") {
+		t.Errorf("restore does not say what it removed:\n%s", td.stdout.String())
+	}
+}
+
+func TestFreeAsideName(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "liman.db.replaced-20261120-120000")
+	if got := freeAsideName(base); got != base {
+		t.Errorf("freeAsideName with nothing there = %q, want %q", got, base)
+	}
+	for _, f := range []string{base, base + "-2"} {
+		if err := os.WriteFile(f, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := freeAsideName(base); got != base+"-3" {
+		t.Errorf("freeAsideName with two taken = %q, want %q", got, base+"-3")
 	}
 }

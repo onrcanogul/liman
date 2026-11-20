@@ -522,7 +522,8 @@ limand backup restore /var/backups/liman/liman-20261120-031500.db
 - **restore** needs the daemon stopped. It refuses a backup whose signature
   is wrong, and one without a checkable signature unless `--allow-unsigned`
   is given. It checks the backup first, keeps
-  the database it replaces as `liman.db.replaced-<date>-<time>`, and lists
+  the database it replaces as `liman.db.replaced-<date>-<time>` (the
+  newest three of those are kept, older ones removed), and lists
   the tokens that are valid afterwards: one that was revoked after the
   backup was made is valid again. (Expiry is not turned back: a token
   that has expired since stays expired.)

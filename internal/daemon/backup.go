@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -211,7 +213,7 @@ func (d *Daemon) backupRestore(ctx context.Context, args []string) int {
 
 	target := filepath.Join(d.Home, "liman.db")
 	staged := target + ".restoring"
-	stamp := time.Now().UTC().Format("20060102-150405")
+	stamp := time.Now().UTC().Format(asideStamp)
 
 	// 1. Copy the backup next to the database, then check the copy. The
 	// file that is checked is the file that is used: checking the original
@@ -264,7 +266,7 @@ func (d *Daemon) backupRestore(ctx context.Context, args []string) int {
 	// turns out to have been a mistake, it can be undone by hand.
 	aside := ""
 	if _, err := os.Stat(target); err == nil {
-		aside = target + ".replaced-" + stamp
+		aside = freeAsideName(target + ".replaced-" + stamp)
 		if err := d.setAside(ctx, target, aside); err != nil {
 			return d.fail(err)
 		}
@@ -290,6 +292,15 @@ func (d *Daemon) backupRestore(ctx context.Context, args []string) int {
 	if aside != "" {
 		fmt.Fprintf(d.Stdout, "The previous database was kept as %s\n", aside)
 	}
+	// Each restore leaves one more; without a limit they would add up to
+	// as many copies of the database as there were restores.
+	removed, err := pruneAsides(target, keepAsides)
+	for _, name := range removed {
+		fmt.Fprintf(d.Stdout, "Removed an older one: %s\n", name)
+	}
+	if err != nil {
+		fmt.Fprintf(d.Stderr, "limand: could not remove older set-aside databases: %v\n", err)
+	}
 
 	// A restore turns the clock back for the tokens too: one that was
 	// revoked after the backup was made is valid again. Expiry does not go
@@ -309,6 +320,96 @@ func (d *Daemon) backupRestore(ctx context.Context, args []string) int {
 	}
 	fmt.Fprintln(d.Stdout, "\nStart the daemon again: systemctl start limand")
 	return exitOK
+}
+
+// keepAsides is how many databases replaced by a restore are kept.
+const keepAsides = 3
+
+// asideStamp is the time in the name of a set-aside database. It sorts as
+// text in the order of time.
+const asideStamp = "20060102-150405"
+
+// freeAsideName returns name, or name with -2, -3, ... appended if a file
+// of that name exists. Two restores in the same second would otherwise
+// get the same name, and the rename would silently replace the first
+// set-aside database with the second.
+func freeAsideName(name string) string {
+	candidate := name
+	for i := 2; ; i++ {
+		if _, err := os.Lstat(candidate); errors.Is(err, fs.ErrNotExist) {
+			return candidate
+		}
+		candidate = fmt.Sprintf("%s-%d", name, i)
+	}
+}
+
+// pruneAsides removes all but the newest keep databases that restores set
+// aside next to target, each with its -wal and -shm, and returns the
+// names it removed.
+//
+// Newest is read from the name (the time of the restore, then the -2, -3
+// of freeAsideName), not from the file: a rename keeps the modification
+// time, which is when the database was last written, not when it was set
+// aside. A file whose name does not have that shape is not ours and is
+// left alone.
+func pruneAsides(target string, keep int) ([]string, error) {
+	matches, err := filepath.Glob(target + ".replaced-*")
+	if err != nil {
+		return nil, err
+	}
+	type aside struct {
+		name  string
+		stamp string
+		n     int
+	}
+	var asides []aside
+	for _, m := range matches {
+		// The name is <stamp> or <stamp>-<n>. Its companions end in -wal
+		// and -shm, which is not a number: they are skipped here and
+		// removed together with their database below.
+		rest := strings.TrimPrefix(m, target+".replaced-")
+		if len(rest) < len(asideStamp) {
+			continue
+		}
+		stamp, tail := rest[:len(asideStamp)], rest[len(asideStamp):]
+		if _, err := time.Parse(asideStamp, stamp); err != nil {
+			continue
+		}
+		n := 1
+		if tail != "" {
+			num, ok := strings.CutPrefix(tail, "-")
+			if n, err = strconv.Atoi(num); !ok || err != nil || n < 2 {
+				continue
+			}
+		}
+		asides = append(asides, aside{m, stamp, n})
+	}
+	if len(asides) <= keep {
+		return nil, nil
+	}
+	sort.Slice(asides, func(i, j int) bool {
+		if asides[i].stamp != asides[j].stamp {
+			return asides[i].stamp > asides[j].stamp
+		}
+		return asides[i].n > asides[j].n
+	})
+
+	var removed []string
+	var errs []error
+	for _, a := range asides[keep:] {
+		err := os.Remove(a.name)
+		for _, suffix := range []string{"-wal", "-shm"} {
+			if e := os.Remove(a.name + suffix); e != nil && !errors.Is(e, fs.ErrNotExist) {
+				err = errors.Join(err, e)
+			}
+		}
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		removed = append(removed, a.name)
+	}
+	return removed, errors.Join(errs...)
 }
 
 // setAside renames the database at path to aside, as one complete file.
