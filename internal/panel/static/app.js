@@ -1182,20 +1182,23 @@ function viewBackups() {
     stat('Size on disk', size(total), 'all backups together', { small: true }),
     stat('Where', orDash(have.list.dir, 60), 'on the server\u2019s own disk', { small: true }),
     panel('Backups', list.length ? h('div', { class: 'tbl-wrap' }, h('table', null,
-      h('thead', null, h('tr', null, h('th', { text: 'File' }), h('th', { text: 'Made' }), h('th', { text: 'Size' }), h('th', { text: 'Check' }))),
+      h('thead', null, h('tr', null, h('th', { text: 'File' }), h('th', { text: 'Made' }), h('th', { text: 'Size' }), h('th', { text: 'Contents' }), h('th', { text: 'Check' }))),
       h('tbody', null, list.map(function (b) {
         var name = str(b.name), c = S.checks.get(name), cell;
         if (c && c.busy) cell = h('span', { class: 'muted', text: 'Checking\u2026' });
         else if (c && c.report) cell = h('div', { class: 'hstack' }, pill(c.report.ok ? { key: 'ok', label: 'Good' } : { key: 'crit', label: 'Not usable' }), h('span', { class: 'muted wrap-any', text: reportText(c.report) }));
         else if (c && c.error) cell = h('div', { class: 'hstack' }, pill({ key: 'crit', label: 'Damaged' }), h('span', { class: 'muted wrap-any', text: c.error }));
         else cell = h('button', { class: 'btn small', disabled: !canAct(), onclick: function () { checkBackup(name); } }, 'Check');
-        return h('tr', null, h('td', { class: 'mono nowrap', text: orDash(name, 60) }), h('td', { class: 'nowrap' }, when(b.created_at)), h('td', { class: 'nowrap mono', text: size(b.size_bytes) }), h('td', { class: 'detail' }, cell));
+        // Unencrypted is not an error: backups from before encryption,
+        // and the one taken before an upgrade, are plain on purpose.
+        var enc = b.encrypted === true ? pill({ key: 'ok', label: 'Encrypted' }) : pill({ key: 'none', label: 'Not encrypted' });
+        return h('tr', null, h('td', { class: 'mono nowrap', text: orDash(name, 60) }), h('td', { class: 'nowrap' }, when(b.created_at)), h('td', { class: 'nowrap mono', text: size(b.size_bytes) }), h('td', { class: 'nowrap' }, enc), h('td', { class: 'detail' }, cell));
       })))) : stateBlock('No backups yet', h('p', null, 'Make the first one with the button above. On a server installed with ', h('code', { text: 'install.sh' }), ' one is also made every night.'), null, true), { flush: true }),
     panel('What a backup is, and is not', h('dl', { class: 'kv' },
       h('dt', { text: 'In it' }), h('dd', null, 'The daemon\u2019s database: tokens, secrets (still encrypted), deploy history. Made while everything keeps running.'),
-      h('dt', { text: 'Not in it' }), h('dd', null, 'The master key. Keep a copy of ', h('code', { text: 'master.key' }), ' somewhere else; without it the secrets in every backup are lost. \u201cCheck\u201d tells you whether the server\u2019s key opens a backup.'),
+      h('dt', { text: 'Not in it' }), h('dd', null, 'The master key. Keep a copy of ', h('code', { text: 'master.key' }), ' somewhere else; without it an encrypted backup cannot be opened at all, and the secrets in an older, unencrypted one are lost. \u201cCheck\u201d tells you whether the server\u2019s key opens a backup.'),
       h('dt', { text: 'Restoring' }), h('dd', null, 'Not from here: it replaces the database the daemon is using, so the daemon has to be stopped. On the server: ', h('code', { text: 'limand backup restore <file>' }), '.'),
-      h('dt', { text: 'Off the server' }), h('dd', null, 'These files are on the same disk as the data they protect. Copy them elsewhere regularly, or they are lost together with the server.')), { span: 'c12' })));
+      h('dt', { text: 'Off the server' }), h('dd', null, 'These files are on the same disk as the data they protect. Copy them elsewhere regularly, or they are lost together with the server. Encrypted ones can go anywhere: they open only with the master key, so keep a copy of that key too, apart from the backups.')), { span: 'c12' })));
   return out;
 }
 // certificatesPanel lists what is in nginx.cert_dir. Nothing here can

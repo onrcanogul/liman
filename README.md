@@ -613,11 +613,11 @@ config are not backed up; deploying again rebuilds them.
 
 ```
 limand backup create /var/backups/liman --keep 14
-limand backup verify /var/backups/liman/liman-20261120-031500.db
-limand backup restore /var/backups/liman/liman-20261120-031500.db
+limand backup verify /var/backups/liman/liman-20261120-031500.db.age
+limand backup restore /var/backups/liman/liman-20261120-031500.db.age
 ```
 
-- **create** writes `liman-<date>-<time>.db` into the directory and can run
+- **create** writes `liman-<date>-<time>.db.age` into the directory and can run
   while the daemon is working: the copy is made by SQLite itself and is the
   state at one moment. (Copying `liman.db` with `cp` while the daemon runs
   can produce a corrupt file.) The new file is then opened and checked, and
@@ -647,7 +647,25 @@ backup:
 Restoring is deliberately not offered there: it replaces the database the
 daemon has open, so the daemon must be stopped.
 
-**Backups are signed.** Next to every `liman-….db` is a `liman-….db.sig`:
+**Backups are encrypted.** A plain copy of the database would show the
+deploy history, the apps, their images and domains to whoever gets hold of
+the file; the secrets in it are sealed either way. With a master key, a
+backup is written in the [age](https://age-encryption.org) format, to an
+age identity derived from the master key: the snapshot is encrypted in
+authenticated 64 KiB chunks and only the encrypted file is kept. A file that
+was changed, reordered or cut short does not open. `verify` and `restore`
+open it into a private temporary file. Backups made before encryption
+(`.db`) are still read, and so is the one taken before an upgrade, which
+stays unencrypted because the previous version restores it.
+
+To open a backup without liman, for instance on another machine:
+
+```
+limand backup identity /root/liman-backup-identity.txt   # opens every backup: guard it
+age -d -i /root/liman-backup-identity.txt liman-20261120-031500.db.age > liman.db
+```
+
+**Backups are signed.** Next to every backup is a `.sig` file:
 an HMAC of the file, keyed from the master key. The tokens in a backup
 become valid tokens when it is restored, and a token row is only a hash that
 anyone can compute for a token of their own; the signature is what shows
@@ -656,9 +674,11 @@ together when copying backups elsewhere.
 
 **The master key is not in the backup**, on purpose: a backup that carries
 its own key protects nothing. Copy `master.key` once, by hand, to a place
-that is not where the backups go. Without it the secrets in every backup are
-lost; `verify` and `restore` say so, and name the key they need, when the
-server does not have it. After `limand key rotate`, back up the new key too.
+that is not where the backups go. **Without it an encrypted backup cannot be
+opened at all**, not only its secrets; `verify` and `restore` say so, and
+name the key they need, when the server does not have it. After `limand key
+rotate`, back up the new key too; backups made with the old one open as long
+as the old key is kept (see Rotating the master key).
 
 On a server installed with `install.sh` a systemd timer takes a backup every
 day into `/var/backups/liman` and keeps the newest 14

@@ -1664,6 +1664,9 @@ func TestBackupsOverTheAPI(t *testing.T) {
 	if !res.Report.OK || res.Report.Signature != "valid" || res.Report.Secrets != 1 || !res.Report.KeyChecked || res.Report.Rows["tokens"] != 1 {
 		t.Errorf("CreateBackup() report = %+v, want ok with one secret and one token", res.Report)
 	}
+	if !res.Backup.Encrypted {
+		t.Errorf("CreateBackup() backup = %+v, want it marked encrypted", res.Backup)
+	}
 	if res.Backup.SizeBytes == 0 || time.Since(res.Backup.CreatedAt) > time.Minute {
 		t.Errorf("CreateBackup() backup = %+v, want a size and a recent time", res.Backup)
 	}
@@ -1674,7 +1677,7 @@ func TestBackupsOverTheAPI(t *testing.T) {
 	}
 
 	list, err = h.Client.Backups(ctx())
-	if err != nil || len(list.Backups) != 1 || list.Backups[0].Name != res.Backup.Name {
+	if err != nil || len(list.Backups) != 1 || list.Backups[0].Name != res.Backup.Name || !list.Backups[0].Encrypted || !strings.HasSuffix(res.Backup.Name, ".db.age") {
 		t.Errorf("Backups() = %+v, %v; want the new backup", list, err)
 	}
 

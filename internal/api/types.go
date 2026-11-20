@@ -270,7 +270,9 @@ type Keys struct {
 
 // Backup describes one backup file of the daemon's database.
 type Backup struct {
-	Name      string    `json:"name"`
+	Name string `json:"name"`
+	// Encrypted is true for a backup in the age format (.db.age).
+	Encrypted bool      `json:"encrypted"`
 	SizeBytes int64     `json:"size_bytes"`
 	CreatedAt time.Time `json:"created_at"`
 }
@@ -306,6 +308,8 @@ type BackupReport struct {
 	// Undecryptable names the secrets the master key does not open, as
 	// app/name. Names only: no value ever leaves the daemon.
 	Undecryptable []string `json:"undecryptable,omitempty"`
+	// Encrypted is true for a backup in the age format.
+	Encrypted bool `json:"encrypted"`
 	// SignedBy is the ID of the master key that signed the file, when
 	// known; with Signature "unknown-key" it is the key the daemon lacks.
 	SignedBy string `json:"signed_by,omitempty"`

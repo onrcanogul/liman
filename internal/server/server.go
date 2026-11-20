@@ -763,7 +763,7 @@ func (s *Server) handleBackupList(w http.ResponseWriter, _ *http.Request) {
 
 	out := api.BackupList{Dir: s.Backups.Dir, Keep: s.Backups.Keep, Backups: make([]api.Backup, 0, len(entries))}
 	for _, e := range entries {
-		out.Backups = append(out.Backups, api.Backup{Name: e.Name, SizeBytes: e.Size, CreatedAt: e.Created})
+		out.Backups = append(out.Backups, api.Backup{Name: e.Name, Encrypted: e.Encrypted, SizeBytes: e.Size, CreatedAt: e.Created})
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -785,7 +785,7 @@ func (s *Server) handleBackupCreate(w http.ResponseWriter, r *http.Request) {
 
 	s.logger().Info("backup created", "name", entry.Name, "bytes", entry.Size, "removed_older", removed)
 	writeJSON(w, http.StatusCreated, api.BackupResult{
-		Backup:  api.Backup{Name: entry.Name, SizeBytes: entry.Size, CreatedAt: entry.Created},
+		Backup:  api.Backup{Name: entry.Name, Encrypted: entry.Encrypted, SizeBytes: entry.Size, CreatedAt: entry.Created},
 		Report:  backupReport(rep),
 		Removed: removed,
 	})
@@ -856,6 +856,7 @@ func backupReport(rep backup.Report) api.BackupReport {
 		Secrets:       rep.Secrets,
 		KeyChecked:    rep.KeyChecked,
 		Undecryptable: rep.Undecryptable,
+		Encrypted:     rep.Encrypted,
 		SignedBy:      rep.SignedBy,
 		MissingKeys:   rep.MissingKeys,
 	}
