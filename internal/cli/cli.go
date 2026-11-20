@@ -24,6 +24,7 @@ import (
 	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/app"
 	"github.com/onrcanogul/liman/internal/buildinfo"
+	"github.com/onrcanogul/liman/internal/engine"
 )
 
 // Exit codes returned by Run. Following the common Unix convention, 2 means
@@ -46,6 +47,11 @@ Commands:
   plan <file>          Same as deploy --dry-run
   rollback [--dry-run] [--step] <app>
                        Put the previous release back into service
+  trigger --app <app> --digest <sha256:...>
+                       From a CI pipeline, after pushing an image: deploy the
+                       app again with the image of its repository that has
+                       this digest. Needs a deploy key (LIMAN_TOKEN) and the
+                       trigger endpoint's address (LIMAN_URL)
   ps                   List containers managed by liman
   logs [-f] <app>      Show the logs of an app (-f keeps following)
   stop <app>           Stop and remove an app
@@ -105,6 +111,8 @@ func (c *CLI) Run(ctx context.Context, args []string) int {
 		return c.runDeploy(ctx, rest, true)
 	case "rollback":
 		return c.runRollback(ctx, rest)
+	case "trigger":
+		return c.runTrigger(ctx, rest)
 	case "ps":
 		return c.runPs(ctx, rest)
 	case "logs":
@@ -203,6 +211,37 @@ func (c *CLI) runDeploy(ctx context.Context, args []string, planOnly bool) int {
 	} else {
 		fmt.Fprintln(c.Stdout, "No Nginx is configured on the server, so it is only reachable on that address")
 	}
+	return exitOK
+}
+
+func (c *CLI) runTrigger(ctx context.Context, args []string) int {
+	const synopsis = "liman trigger --app <app> --digest <sha256:...>"
+
+	fs := flag.NewFlagSet("trigger", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	name := fs.String("app", "", "the app to deploy again")
+	digest := fs.String("digest", "", "the digest of the pushed image")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *name == "" || *digest == "" {
+		return c.usageError(synopsis)
+	}
+	// Checked here so a pipeline with an empty or garbled variable fails
+	// with a clear message; the daemon checks again.
+	if !app.ValidName(*name) {
+		return c.fail(fmt.Errorf("invalid app name %q", *name))
+	}
+	if !engine.ValidDigest(*digest) {
+		return c.fail(fmt.Errorf("invalid digest %q: want sha256: and 64 hexadecimal digits, as docker push prints it", *digest))
+	}
+
+	res, err := c.API.Trigger(ctx, *name, *digest, c.Stdout)
+	if err != nil {
+		if errors.Is(err, api.ErrDeployFailed) && res != nil {
+			fmt.Fprintf(c.Stderr, "liman: %s\n", res.Error)
+			return exitError
+		}
+		return c.fail(err)
+	}
+	fmt.Fprintf(c.Stdout, "\n%s is running release %s, image %s\n", res.App, res.Release, *digest)
 	return exitOK
 }
 

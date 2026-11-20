@@ -706,3 +706,37 @@ func TestStatusNotesAVersionDifference(t *testing.T) {
 		}
 	}
 }
+
+func TestTrigger(t *testing.T) {
+	h := newHarness(t, "")
+	if code := h.run("deploy", writeFile(t, validDefinition)); code != exitOK {
+		t.Fatal(h.stderr.String())
+	}
+	d := "sha256:" + strings.Repeat("0a", 32)
+	h.Engine.Registry = map[string]bool{"ghcr.io/user/orders-api@" + d: true}
+	_, key := h.DeployKey(t, "ci", "orders-api")
+	h.cli.API = key
+	h.stdout.Reset()
+
+	if code := h.run("trigger", "--app", "orders-api", "--digest", d); code != exitOK {
+		t.Fatalf("trigger: code %d, stderr %s", code, h.stderr.String())
+	}
+	if !strings.Contains(h.stdout.String(), "orders-api is running release r2, image "+d) {
+		t.Errorf("stdout = %s", h.stdout.String())
+	}
+
+	for _, tt := range []struct {
+		args []string
+		code int
+		want string
+	}{
+		{[]string{"trigger", "--app", "orders-api"}, exitUsage, "usage: liman trigger"},
+		{[]string{"trigger", "--app", "orders-api", "--digest", "latest"}, exitError, "invalid digest"},
+		{[]string{"trigger", "--app", "orders-api", "--digest", "sha256:" + strings.Repeat("ff", 32)}, exitError, "not in the registry"},
+	} {
+		h.stderr.Reset()
+		if code := h.run(tt.args...); code != tt.code || !strings.Contains(h.stderr.String(), tt.want) {
+			t.Errorf("%v: code %d, stderr %q; want %d and %q", tt.args, code, h.stderr.String(), tt.code, tt.want)
+		}
+	}
+}
