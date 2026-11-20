@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -105,5 +106,74 @@ func TestKeyRotateNeedsAKey(t *testing.T) {
 	}
 	if code := td.Run(context.Background(), []string{"key"}); code != exitUsage {
 		t.Errorf("key without a subcommand: code %d, want %d", code, exitUsage)
+	}
+}
+
+func TestKeyListAndRetire(t *testing.T) {
+	td := newTestDaemon(t)
+	seed(t, td)
+	ctx := context.Background()
+	// Backups go where the daemon would put them, so that list and retire
+	// count them.
+	backups := filepath.Join(td.Home, "backups")
+	if code := td.Run(ctx, []string{"backup", "create", backups}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	oldKey, _ := secrets.LoadKey(filepath.Join(td.Home, "master.key"))
+	oldID := secrets.IDOf(oldKey)
+	if code := td.Run(ctx, []string{"key", "rotate"}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	newKey, _ := secrets.LoadKey(filepath.Join(td.Home, "master.key"))
+	newID := secrets.IDOf(newKey)
+
+	td.stdout.buf.Reset()
+	if code := td.Run(ctx, []string{"key", "list"}); code != exitOK {
+		t.Fatalf("key list: code %d, stderr %q", code, td.stderr.String())
+	}
+	out := td.stdout.String()
+	for _, re := range []string{
+		`(?m)^KEY\s+ROLE\s+SECRETS\s+BACKUPS$`,
+		`(?m)^` + newID.String() + `\s+primary\s+1\s+0$`,
+		`(?m)^` + oldID.String() + `\s+old \(opens only\)\s+0\s+1$`,
+	} {
+		if !regexp.MustCompile(re).MatchString(out) {
+			t.Errorf("key list does not match %s:\n%s", re, out)
+		}
+	}
+
+	// The primary key cannot be retired.
+	if code := td.Run(ctx, []string{"key", "retire", newID.String()}); code != exitError || !strings.Contains(td.stderr.String(), "is the master key") {
+		t.Errorf("retire the primary: code %d, stderr %q", code, td.stderr.String())
+	}
+	// The old one has a backup that needs it: refused, and the backup named.
+	if code := td.Run(ctx, []string{"key", "retire", oldID.String()}); code != exitError || !strings.Contains(td.stderr.String(), backupsIn(t, backups)[0]) {
+		t.Errorf("retire with a dependent backup: code %d, stderr %q", code, td.stderr.String())
+	}
+	if exists, _ := secrets.KeyExists(filepath.Join(td.Home, "master.key.old", oldID.String()+".key")); !exists {
+		t.Fatal("the old key was removed although retiring was refused")
+	}
+	// --force retires it, and the backup can no longer be checked.
+	if code := td.Run(ctx, []string{"key", "retire", oldID.String(), "--force"}); code != exitOK || !strings.Contains(td.stdout.String(), "Retired key "+oldID.String()) {
+		t.Fatalf("retire --force: code %d, stderr %q", code, td.stderr.String())
+	}
+	if code := td.Run(ctx, []string{"backup", "verify", filepath.Join(backups, backupsIn(t, backups)[0])}); code != exitError || !strings.Contains(td.stderr.String(), "cannot be checked without key "+oldID.String()) {
+		t.Errorf("verify after retiring its key: code %d, stderr %q", code, td.stderr.String())
+	}
+	if code := td.Run(ctx, []string{"key", "retire", oldID.String()}); code != exitError || !strings.Contains(td.stderr.String(), "there is no old key") {
+		t.Errorf("retire twice: code %d, stderr %q", code, td.stderr.String())
+	}
+}
+
+func TestKeyRetireRefusesWhileSecretsNeedIt(t *testing.T) {
+	td := newTestDaemon(t)
+	seed(t, td)
+	ctx := context.Background()
+	// The key changes without resealing (as by hand, not by rotate): the
+	// secret stays sealed with the old key.
+	oldID, _ := rotateByHand(t, td.Home)
+
+	if code := td.Run(ctx, []string{"key", "retire", oldID.String(), "--force"}); code != exitError || !strings.Contains(td.stderr.String(), "1 secret in the database is still sealed with") {
+		t.Errorf("retire a key secrets need: code %d, stderr %q", code, td.stderr.String())
 	}
 }

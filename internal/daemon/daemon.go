@@ -73,10 +73,16 @@ Usage:
                                   ACME (acme in config.yaml), and reload Nginx.
                                   The daemon renews by itself; this is for
                                   when that keeps failing or cannot wait
+  limand key list                 List the master key and the old keys, with
+                                  the secrets and backups that depend on each
   limand key rotate               Replace the master key and seal every secret
                                   again with the new one. The old key is kept
                                   for older backups. The daemon must be
                                   stopped
+  limand key retire <id> [--force]
+                                  Delete an old key. Refused while secrets
+                                  depend on it; backups signed with it are
+                                  listed, and only --force retires it anyway
   limand version                  Print version information
   limand help                     Show this help
 
