@@ -8,7 +8,7 @@ LDFLAGS := -X $(MODULE)/internal/buildinfo.Version=$(VERSION) \
            -X $(MODULE)/internal/buildinfo.Commit=$(COMMIT) \
            -X $(MODULE)/internal/buildinfo.Date=$(DATE)
 
-.PHONY: build release test test-integration load-test lint fmt check clean dev-nginx dev-nginx-stop dev-cert
+.PHONY: build release test test-integration load-test lint fmt check clean dev-nginx dev-nginx-stop dev-cert lab-server lab-server-stop
 
 build: ## Build the CLI (bin/liman) and the daemon (bin/limand)
 	go build -ldflags "$(LDFLAGS)" -o bin/liman ./cmd/liman
@@ -50,6 +50,12 @@ dev-nginx-stop: ## Stop the local Nginx
 
 dev-cert: ## Create a self-signed certificate: make dev-cert DOMAIN=whoami.localhost
 	./scripts/dev-cert.sh $(DOMAIN)
+
+lab-server: ## Boot a throwaway Ubuntu "server" in Docker to practise installing on
+	./scripts/lab-server.sh start
+
+lab-server-stop: ## Remove the lab server
+	./scripts/lab-server.sh stop
 
 clean:
 	rm -rf bin dist
