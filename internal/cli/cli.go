@@ -54,6 +54,12 @@ Commands:
                        values is filled from the environment. Needs a deploy
                        key (LIMAN_TOKEN) and the trigger endpoint's address
                        (LIMAN_URL)
+  preview --file <app.yaml> [--digest <sha256:...>] [--markdown]
+                       From a pull request's pipeline: what a deploy of this
+                       definition would change, and what is wrong with it,
+                       without deploying. Needs a preview key; no secrets.
+                       --markdown writes a summary for a comment. Exits 1 when
+                       the deploy would be refused
   ps                   List containers managed by liman
   logs [-f] <app>      Show the logs of an app (-f keeps following)
   stop <app>           Stop and remove an app
@@ -119,6 +125,8 @@ func (c *CLI) Run(ctx context.Context, args []string) int {
 		return c.runRollback(ctx, rest)
 	case "trigger":
 		return c.runTrigger(ctx, rest)
+	case "preview":
+		return c.runPreview(ctx, rest)
 	case "ps":
 		return c.runPs(ctx, rest)
 	case "logs":
@@ -236,19 +244,9 @@ func (c *CLI) runTrigger(ctx context.Context, args []string) int {
 	if !engine.ValidDigest(*digest) {
 		return c.fail(fmt.Errorf("invalid digest %q: want sha256: and 64 hexadecimal digits, as docker push prints it", *digest))
 	}
-	definition, err := os.ReadFile(*file)
+	a, definition, err := readDefinition(*file, *name)
 	if err != nil {
-		return c.fail(fmt.Errorf("read app definition: %w", err))
-	}
-	a, err := app.Decode(definition)
-	if err != nil {
-		return c.fail(fmt.Errorf("%s: %w", *file, err))
-	}
-	if *name != "" && *name != a.Name {
-		return c.fail(fmt.Errorf("%s is the definition of %q, not %q", *file, a.Name, *name))
-	}
-	if !app.ValidName(a.Name) {
-		return c.fail(fmt.Errorf("%s: invalid app name %q", *file, a.Name))
+		return c.fail(err)
 	}
 
 	// The values of the variables the env values refer to, from this

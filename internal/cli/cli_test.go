@@ -10,10 +10,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/onrcanogul/liman/internal/api"
 	"github.com/onrcanogul/liman/internal/engine"
 	"github.com/onrcanogul/liman/internal/server/servertest"
+	"github.com/onrcanogul/liman/internal/store"
 )
 
 const validDefinition = `
@@ -283,6 +285,7 @@ func TestDeployThenHistory(t *testing.T) {
 		t.Fatalf("history exit code = %d, stderr: %s", code, h.stderr.String())
 	}
 	out := h.stdout.String()
+	t.Log(out)
 	if !strings.Contains(out, "Pull image ghcr.io/user/orders-api:1.4") || strings.Count(out, "\n") != 6 {
 		t.Errorf("history output should have a header and 5 rows:\n%s", out)
 	}
@@ -754,6 +757,78 @@ env:
 		h.stderr.Reset()
 		if code := h.run(tt.args...); code != tt.code || !strings.Contains(h.stderr.String(), tt.want) {
 			t.Errorf("%v: code %d, stderr %q; want %d and %q", tt.args, code, h.stderr.String(), tt.code, tt.want)
+		}
+	}
+}
+
+func TestPreview(t *testing.T) {
+	h := newHarness(t, "")
+	h.Register(t, "orders-api", "ghcr.io/user/orders-api", "api.example.com")
+	d := "sha256:" + strings.Repeat("0a", 32)
+	h.Engine.Registry = map[string]bool{"ghcr.io/user/orders-api@" + d: true}
+	_, deployKey := h.DeployKey(t, "ci", "orders-api")
+	definition := `
+name: orders-api
+image: ghcr.io/user/orders-api
+domain: api.example.com
+port: 3000
+env:
+  LOG_LEVEL: info
+  DATABASE_URL: ${DATABASE_URL}
+`
+	file := writeFile(t, definition)
+	h.cli.API = deployKey
+	h.cli.LookupEnv = func(string) (string, bool) { return "x", true }
+	if code := h.run("trigger", "--digest", d, "--file", file); code != exitOK {
+		t.Fatal(h.stderr.String())
+	}
+
+	token, err := h.Store.CreateScopedToken(context.Background(), "pr", store.ScopePreview, time.Time{}, "orders-api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.cli.API = &api.Client{BaseURL: h.HookURL, Token: token}
+
+	h.stdout.Reset()
+	edited := writeFile(t, strings.Replace(definition, "LOG_LEVEL: info", "LOG_LEVEL: debug", 1))
+	if code := h.run("preview", "--file", edited, "--digest", d); code != exitOK {
+		t.Fatalf("preview: code %d, stderr %s", code, h.stderr.String())
+	}
+	for _, want := range []string{"would be accepted", "compared with release r1", "changed: env.LOG_LEVEL", "already running", "must set: DATABASE_URL", "not known to a preview"} {
+		if !strings.Contains(h.stdout.String(), want) {
+			t.Errorf("preview does not say %q:\n%s", want, h.stdout.String())
+		}
+	}
+
+	// Whoever opens the pull request writes app.yaml: nothing of it may
+	// become a link, an image or a mention in the comment.
+	hostile := strings.Replace(definition, "image: ghcr.io/user/orders-api", "image: \"x](https://evil.example/p.png) `@team` | ![i](https://evil.example/i.png)\"", 1)
+	hostile = strings.Replace(hostile, "LOG_LEVEL: info", "LOG_LEVEL: info\n  \"A`B|C\": x", 1)
+	h.stdout.Reset()
+	if code := h.run("preview", "--file", writeFile(t, hostile), "--markdown"); code != exitError {
+		t.Fatalf("preview of a refused definition: code %d, stderr %s", code, h.stderr.String())
+	}
+	out := h.stdout.String()
+	if !strings.Contains(out, "would be refused") || !strings.Contains(out, "**Problems**") || !strings.Contains(out, "see the problems") {
+		t.Errorf("markdown:\n%s", out)
+	}
+	// The right repository, and an env name of the same kind: it is
+	// compared (added) and refused (invalid name).
+	hostile = strings.Replace(definition, "LOG_LEVEL: info", "LOG_LEVEL: info\n  \"A`](https://evil.example)|B\": x", 1)
+	h.stdout.Reset()
+	if code := h.run("preview", "--file", writeFile(t, hostile), "--markdown"); code != exitError {
+		t.Fatalf("preview of an invalid env name: code %d, stderr %s", code, h.stderr.String())
+	}
+	out += h.stdout.String()
+	if !strings.Contains(h.stdout.String(), "| Added | `env.A'](https://evil.example)¦B` |") {
+		t.Errorf("markdown:\n%s", h.stdout.String())
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "- ") && (strings.Count(line, "`") != 2 || strings.Contains(line, "|")) {
+			t.Errorf("a problem escapes its code span: %s", line)
+		}
+		if strings.HasPrefix(line, "| ") && strings.Count(line, "|") != 3 {
+			t.Errorf("a table row has a cell too many: %s", line)
 		}
 	}
 }
