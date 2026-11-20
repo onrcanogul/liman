@@ -223,10 +223,38 @@ the database**: without it the secrets cannot be recovered, and the daemon
 refuses to start rather than create a new key when secrets exist but the key
 is gone. It also refuses a key file that other users can read.
 
-What this protects is the database and its backups. It does not hide a secret
-from someone who can run `docker inspect` on the server, or from the app
-itself: the value is in the container's environment in plain text. There is
-no API to read a secret back.
+What this protects is the database and its backups. A secret under
+`secrets:` is in the container's environment in plain text: `docker
+inspect` shows it, Docker keeps it on disk with the container's
+configuration, every process the app starts inherits it, and error pages
+and crash reports that dump the environment carry it. There is no API to
+read a secret back.
+
+### Secrets as files
+
+A secret listed under `secret_files:` is given as a file instead:
+
+```yaml
+secret_files:
+  - DATABASE_PASSWORD
+```
+
+It is written to `/run/secrets/DATABASE_PASSWORD` inside the new container
+before it starts, and `DATABASE_PASSWORD_FILE=/run/secrets/DATABASE_PASSWORD`
+is set in the environment: the convention of the official Docker images
+(`POSTGRES_PASSWORD_FILE` and the like). For an app of your own, read the
+file at startup; Spring Boot reads a directory of such files with
+`spring.config.import=configtree:/run/secrets/`.
+
+The value is then not in `docker inspect`, not in the configuration Docker
+keeps on disk, and not inherited by child processes. The file is part of the
+container, so restarts and rollbacks keep it; its mode is 0444, since the app
+may not run as root and nothing else runs in its container. Whoever can run
+`docker exec` or `docker cp` on the server can still read it, as can code
+running inside the container: this closes the accidental ways out, not the
+deliberate ones.
+
+A name is either under `secrets:` or under `secret_files:`, not both.
 
 ### Rotating the master key
 
