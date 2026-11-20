@@ -499,8 +499,8 @@ installs the binary and the systemd unit, writes
 `/var/lib/liman/config.yaml`, creates `/etc/nginx/liman.d` with one include
 line in `/etc/nginx/conf.d/liman.conf`, and allows the `liman` user exactly
 two commands through sudo: `nginx -t` and `systemctl reload nginx`. Existing
-Nginx configuration is not touched. Running it again upgrades the binary and
-leaves everything else as it is.
+Nginx configuration is not touched. Running it again with a newer binary
+upgrades (see Upgrading) and leaves everything else as it is.
 
 **4. A token, and the client:**
 
@@ -537,6 +537,45 @@ The installer also schedules a daily backup; see Backups.
 
 For private images, log in as the daemon's user:
 `sudo -u liman -H docker login ghcr.io`.
+
+### Upgrading
+
+Copy the new `limand` (and `deploy/`) to the server and run the installer
+again:
+
+```
+sudo ./install.sh --binary ./limand-linux-amd64 --listen 10.8.0.1:7070
+```
+
+Running apps are not touched; the API is away for the few seconds the
+daemon needs to restart. What happens:
+
+- The running binary is kept as `/usr/local/bin/limand.previous`.
+- If the new version uses a newer database schema, the daemon backs the
+  database up first, into the backup directory, and only then upgrades it
+  (`journalctl -u limand | grep upgrad`). `limand version` shows beforehand
+  whether that will happen. The previous version cannot open an upgraded
+  database, so this backup is the way back; it is signed in the format older
+  versions can check.
+- The installer waits for the new version to say it started. If it does
+  not, and the database was not upgraded, the previous binary is put back
+  and started. If the database was upgraded, nothing is undone
+  automatically; the installer prints the way back:
+
+```
+systemctl stop limand
+install -m 0755 /usr/local/bin/limand.previous /usr/local/bin/limand
+runuser -u liman -- env LIMAN_HOME=/var/lib/liman limand backup restore <the backup from before the upgrade>
+systemctl start limand
+```
+
+That loses what was written after the upgrade (history, secrets, tokens).
+Settings that only the new version knows have to leave `config.yaml` first:
+an older limand refuses a key it does not know.
+
+Other `limand` commands (`token`, `backup`, `cert`, `key`) do not upgrade an
+older database; they ask for the daemon to be started first. Update the CLI
+on your machine too: `liman status` says when it and the daemon differ.
 
 ## Backups
 
