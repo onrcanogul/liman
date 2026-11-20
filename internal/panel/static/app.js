@@ -394,7 +394,7 @@ function ensureExtras() {
       S.allSecrets = { at: Date.now(), list: res.ok ? cleanList(res.value) : null, error: res.ok ? '' : res.error.message };
     }));
   }
-  if (r.view === 'tokens' && !(S.tokens && now - S.tokens.at < EXTRA_TTL)) {
+  if (r.view === 'tokens' && !tokenApps() && !(S.tokens && now - S.tokens.at < EXTRA_TTL)) {
     jobs.push(settle(get('/v1/tokens')).then(function (res) {
       if (!S.token) return;
       S.tokens = { at: Date.now(), list: res.ok ? cleanList(res.value) : null, error: res.ok ? '' : res.error.message };
@@ -403,19 +403,19 @@ function ensureExtras() {
   // Certificates are wanted everywhere: an expired one is a banner on
   // every page. Reading them is cheap. The keys are not (the daemon checks
   // every backup's signature), so only the Daemon page asks for them.
-  if (S.info && S.info.certificates && !(S.certs && now - S.certs.at < EXTRA_TTL)) {
+  if (S.info && S.info.certificates && !tokenApps() && !(S.certs && now - S.certs.at < EXTRA_TTL)) {
     jobs.push(settle(get('/v1/certs')).then(function (res) {
       if (!S.token) return;
       S.certs = { at: Date.now(), data: res.ok && res.value && typeof res.value === 'object' ? res.value : null, error: res.ok ? '' : res.error.message };
     }));
   }
-  if (r.view === 'daemon' && S.info && S.info.secrets && !(S.keys && now - S.keys.at < EXTRA_TTL)) {
+  if (r.view === 'daemon' && S.info && S.info.secrets && !tokenApps() && !(S.keys && now - S.keys.at < EXTRA_TTL)) {
     jobs.push(settle(get('/v1/keys')).then(function (res) {
       if (!S.token) return;
       S.keys = { at: Date.now(), data: res.ok && res.value && typeof res.value === 'object' ? res.value : null, error: res.ok ? '' : res.error.message };
     }));
   }
-  if (r.view === 'backups' && S.info && S.info.backups && !(S.backups && now - S.backups.at < EXTRA_TTL)) {
+  if (r.view === 'backups' && S.info && S.info.backups && !tokenApps() && !(S.backups && now - S.backups.at < EXTRA_TTL)) {
     jobs.push(settle(get('/v1/backups')).then(function (res) {
       if (!S.token) return;
       S.backups = { at: Date.now(), list: res.ok && res.value && typeof res.value === 'object' ? res.value : null, error: res.ok ? '' : res.error.message };
@@ -629,7 +629,7 @@ function renderSide(r) {
     }), list.length > shown.length ? h('a', { class: 'nav muted', href: '#apps' }, h('span', { class: 'lbl', text: 'All ' + list.length + ' apps' })) : null));
   }
   add($nav, [navItem('activity', 'Activity', 'activity', r.view === 'activity'), navItem('secrets', 'Secrets', 'secrets', r.view === 'secrets'),
-    h('div', { class: 'side-label', text: 'System' }), navItem('tokens', 'Tokens', 'tokens', r.view === 'tokens'), navItem('backups', 'Backups', 'backups', r.view === 'backups'), navItem('daemon', 'Daemon', 'daemon', r.view === 'daemon')]);
+    h('div', { class: 'side-label', text: 'System' }), tokenApps() ? null : navItem('tokens', 'Tokens', 'tokens', r.view === 'tokens'), tokenApps() ? null : navItem('backups', 'Backups', 'backups', r.view === 'backups'), navItem('daemon', 'Daemon', 'daemon', r.view === 'daemon')]);
   renderFoot();
   $app.className = 'app' + (S.collapsed ? ' collapsed' : '') + (S.drawer ? ' drawer' : '');
 }
@@ -1055,6 +1055,17 @@ function secretRows(rows, withApp) {
 // courtesy to the user, not the protection: the daemon refuses a read-only
 // token whatever this page shows.
 function readOnly() { return !(S.info && S.info.scope === 'admin'); }
+// tokenApps are the apps the panel's token is limited to, or null when it
+// may use every app. A limited token sees only those apps, and none of the
+// pages about the daemon as a whole: the daemon refuses them anyway, and a
+// page full of refusals helps nobody.
+function tokenApps() {
+  var a = S.info && Array.isArray(S.info.token_apps) ? S.info.token_apps.map(function (x) { return str(x, 63); }).filter(Boolean) : [];
+  return a.length ? a : null;
+}
+function limitedPage(title) {
+  return [h('h1', { text: title }), fullState('Not for this token', h('p', null, 'This token is limited to ', h('code', { text: tokenApps().join(', ') }), '. This page is about the daemon as a whole; a token for every app sees it.'))];
+}
 function canAct() { return S.mode === 'ready' && !readOnly(); }
 function openDialog(title, body, actions) {
   clear($dlg);
@@ -1210,13 +1221,14 @@ function viewSecrets() {
 // is not, on purpose: a stolen admin token must not be able to make itself
 // spares that outlive its revocation.
 function viewTokens() {
+  if (tokenApps()) return limitedPage('Tokens');
   var have = S.tokens, out = [h('h1', { text: 'Tokens' })];
   if (!have) { out.push(h('div', { class: 'panel' }, stateBlock('Reading the tokens…', null, null, true))); return out; }
   if (have.list === null) { out.push(fullState('The tokens could not be listed', h('p', { text: str(have.error, 300) }), h('button', { class: 'btn', onclick: function () { S.tokens = null; render(); ensureExtras(); } }, 'Try again'))); return out; }
   var list = have.list.filter(function (t) { return str(t.name); });
   var now = S.info ? time(S.info.now) : null;
   out.push(panel('Tokens', h('div', { class: 'tbl-wrap' }, h('table', null,
-    h('thead', null, h('tr', null, h('th', { text: 'Name' }), h('th', { text: 'Can' }), h('th', { text: 'Created' }), h('th', { text: 'Expires' }), h('th', { text: 'Last used' }), h('th', null, h('span', { class: 'sr', text: 'Actions' })))),
+    h('thead', null, h('tr', null, h('th', { text: 'Name' }), h('th', { text: 'Can' }), h('th', { text: 'Apps' }), h('th', { text: 'Created' }), h('th', { text: 'Expires' }), h('th', { text: 'Last used' }), h('th', null, h('span', { class: 'sr', text: 'Actions' })))),
     h('tbody', null, list.map(function (t) {
       var end = time(t.expires_at), expires;
       if (t.expired === true) expires = h('span', { title: abs(t.expires_at) }, pill({ key: 'crit', label: 'Expired' }));
@@ -1225,13 +1237,14 @@ function viewTokens() {
       return h('tr', null,
         h('td', { class: 'name' }, h('span', { class: 'hstack' }, h('span', { class: 'mono trunc', text: str(t.name, 64) }), t.current === true ? pill({ key: 'info', label: 'This panel' }) : null)),
         h('td', { class: 'nowrap' }, t.scope === 'admin' ? pill({ key: 'warn', label: 'Change things' }) : pill({ key: 'none', label: 'Look only' })),
+        h('td', { class: 'detail' }, Array.isArray(t.apps) && t.apps.length ? h('span', { class: 'mono', text: t.apps.map(function (x) { return str(x, 63); }).join(', ') }) : h('span', { class: 'muted', text: 'All apps' })),
         h('td', { class: 'nowrap' }, when(t.created_at)),
         h('td', { class: 'nowrap' }, expires),
         h('td', { class: 'nowrap' }, time(t.last_used_at) === null ? h('span', { class: 'muted', title: 'Not used since the daemon started keeping track', text: DASH }) : when(t.last_used_at)),
         h('td', { class: 'nowrap right' }, h('button', { class: 'btn small danger', disabled: !canAct(), title: readOnly() ? 'This token is read-only' : null, onclick: function () { dlgRevokeToken(t); } }, 'Revoke')));
     })))), { flush: true }));
   out.push(h('div', { class: 'hint' }, '“Last used” is written down at most once a minute. Tokens are created on the server, never here: ',
-    h('code', { text: 'limand token create <name>' }), ', with ', h('code', { text: '--read-only' }), ' for one that can only look and ', h('code', { text: '--expires 30d' }), ' for one that stops working by itself.'));
+    h('code', { text: 'limand token create <name>' }), ', with ', h('code', { text: '--read-only' }), ' for one that can only look, ', h('code', { text: '--app <app>' }), ' for one that sees and changes only that app, and ', h('code', { text: '--expires 30d' }), ' for one that stops working by itself.'));
   return out;
 }
 function dlgRevokeToken(t) {
@@ -1251,6 +1264,7 @@ function dlgRevokeToken(t) {
     } }, own ? 'Revoke and sign out' : 'Revoke')]);
 }
 function viewBackups() {
+  if (tokenApps()) return limitedPage('Backups');
   var out = [h('div', { class: 'head' }, h('div', { class: 'grow' }, h('h1', { text: 'Backups' })),
     S.info && S.info.backups ? h('button', { class: 'btn primary', id: 'backup-now', disabled: S.backupBusy || !canAct(), title: readOnly() ? 'This token is read-only' : null, onclick: backUpNow }, S.backupBusy ? 'Backing up\u2026' : 'Back up now') : null)];
   if (!(S.info && S.info.backups)) { out.push(fullState('This daemon does not offer backups', h('p', null, 'On the server, ', h('code', { text: 'limand backup create <dir>' }), ' still works.'))); return out; }
@@ -1347,15 +1361,17 @@ function viewDaemon() {
       h('dt', { text: 'Built' }), h('dd', { class: 'mono', text: orDash(d.built, 80) }),
       h('dt', { text: 'Running since' }), h('dd', null, when(d.started_at), h('span', { class: 'muted', text: time(d.started_at) === null ? '' : ' · ' + abs(d.started_at) })),
       h('dt', { text: 'Panel address' }), h('dd', { class: 'mono', text: str(window.location.host, 120) })), { span: 'c6' }),
-    certificatesPanel(), keysPanel(),
+    tokenApps() ? null : certificatesPanel(), tokenApps() ? null : keysPanel(),
     panel('Access', h('dl', { class: 'kv' },
       h('dt', { text: 'This panel' }), h('dd', null, 'Signed in as ', h('code', { text: orDash(d.token, 64) }), readOnly()
         ? ', a read-only token: this panel can look at everything and change nothing. The token is kept in this browser tab only.'
+        : tokenApps() ? ', a token that can change its apps: this panel offers rollback, stop and secrets for them, and asks before anything that removes something. The token is kept in this browser tab only.'
         : ', a token that can change things: this panel offers rollback, stop, secrets, revoking tokens and backups, and asks before anything that removes something. The token is kept in this browser tab only.'),
+      h('dt', { text: 'Apps' }), h('dd', null, tokenApps() ? h('span', null, 'Only ', h('code', { text: tokenApps().join(', ') }), '. Other apps, and the pages about the daemon as a whole, are not shown.') : 'Every app.'),
       h('dt', { text: 'Expires' }), h('dd', null, tokenLeft() === null ? 'Never: this token works until it is revoked.'
         : h('span', null, abs(d.token_expires_at), h('span', { class: 'muted', text: ' · in ' + roughly(Math.max(tokenLeft(), 0)) }))),
       h('dt', { text: 'Signing out' }), h('dd', null, 'By hand, by closing the tab, or by itself after ' + Math.round(IDLE_LIMIT / 60000) + ' minutes without a click or a key press.'),
-      h('dt', { text: 'Tokens' }), h('dd', null, 'Listed and revoked on the ', h('a', { href: '#tokens', text: 'Tokens' }), ' page; created on the server only. For a panel that should only look: ', h('code', { text: 'limand token create panel --read-only' }), '; for one that stops working by itself, add ', h('code', { text: '--expires 30d' }), '. Revoking a token signs its panel out at the next refresh.')),
+      tokenApps() ? null : h('dt', { text: 'Tokens' }), tokenApps() ? null : h('dd', null, 'Listed and revoked on the ', h('a', { href: '#tokens', text: 'Tokens' }), ' page; created on the server only. For a panel that should only look: ', h('code', { text: 'limand token create panel --read-only' }), '; for one that stops working by itself, add ', h('code', { text: '--expires 30d' }), '. Revoking a token signs its panel out at the next refresh.')),
       { span: 'c12', side: h('button', { class: 'btn small', onclick: function () { signOut(''); } }, 'Sign out') }))];
 }
 
