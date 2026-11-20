@@ -267,7 +267,10 @@ While it runs, the daemon serves a web panel at `/ui/` on its listen address (`h
   deploys, the names of its secrets, its activity and its logs, which
   can be followed as they are written.
 - **Activity**, **Secrets** (names only) and **Daemon** (version, which
-  parts are switched on).
+  parts are switched on, the certificates with their expiry, and the
+  master keys by ID with the secrets and backups that depend on each).
+- A banner on every page when a certificate an app uses has expired or
+  keeps failing to renew, and when a key rotation did not finish.
 - **Backups**: the backups on the server, a button to make one now and a
   check for each (is it intact, does the server's master key open it).
 

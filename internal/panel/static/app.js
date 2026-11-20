@@ -154,6 +154,8 @@ var S = {
   secrets: new Map(),    // app -> { at, list, error }
   logs: { app: '', text: '', error: '', loading: false, cut: false, following: false, ended: false },
   backups: null,         // { at, list, error }
+  certs: null,           // { at, data, error }: GET /v1/certs
+  keys: null,            // { at, data, error }: GET /v1/keys
   backupBusy: false, backupNote: null,   // note: { kind, text }
   note: null,            // { kind, text }: the outcome of the last action
   checks: new Map(),     // backup name -> { busy, report, error }
@@ -381,6 +383,21 @@ function ensureExtras() {
     if (S.tab === 'secrets' && vault) wantSecrets(r.name);
   }
   if (r.view === 'secrets' && vault) names.forEach(wantSecrets);
+  // Certificates are wanted everywhere: an expired one is a banner on
+  // every page. Reading them is cheap. The keys are not (the daemon checks
+  // every backup's signature), so only the Daemon page asks for them.
+  if (S.info && S.info.certificates && !(S.certs && now - S.certs.at < EXTRA_TTL)) {
+    jobs.push(settle(get('/v1/certs')).then(function (res) {
+      if (!S.token) return;
+      S.certs = { at: Date.now(), data: res.ok && res.value && typeof res.value === 'object' ? res.value : null, error: res.ok ? '' : res.error.message };
+    }));
+  }
+  if (r.view === 'daemon' && S.info && S.info.secrets && !(S.keys && now - S.keys.at < EXTRA_TTL)) {
+    jobs.push(settle(get('/v1/keys')).then(function (res) {
+      if (!S.token) return;
+      S.keys = { at: Date.now(), data: res.ok && res.value && typeof res.value === 'object' ? res.value : null, error: res.ok ? '' : res.error.message };
+    }));
+  }
   if (r.view === 'backups' && S.info && S.info.backups && !(S.backups && now - S.backups.at < EXTRA_TTL)) {
     jobs.push(settle(get('/v1/backups')).then(function (res) {
       if (!S.token) return;
@@ -539,6 +556,7 @@ function signOut(message, keepToken) {
   S.info = null; S.apps = []; S.events = []; S.releases = []; S.engineError = ''; S.offlineError = ''; S.updated = 0;
   S.health = new Map(); S.secrets = new Map(); S.logs = emptyLogs();
   S.backups = null; S.backupBusy = false; S.backupNote = null; S.checks = new Map(); S.note = null;
+  S.certs = null; S.keys = null;
   closeDialog();
   S.pending = token;
   render();
@@ -637,6 +655,21 @@ function banners() {
   if (S.mode === 'ready' && left !== null && left < EXPIRY_WARNING) out.push(h('div', { class: 'banner warn', role: 'status' }, h('div', { class: 'grow' },
     h('b', { text: 'This token expires in ' + roughly(Math.max(left, 0)) + '. ' }),
     'The panel signs out when it does. Create a new one on the server with ', h('code', { text: 'limand token create' }), ' and revoke this one.')));
+  // A certificate is renewed when a third of its life is left (30 days of
+  // Let's Encrypt's 90), twice a day. One still due with two weeks left
+  // means renewing keeps failing; one that expired is broken HTTPS. Only
+  // certificates an app uses count: the rest are not renewed, on purpose.
+  var certList = S.certs && S.certs.data && Array.isArray(S.certs.data.certificates) ? S.certs.data.certificates.filter(function (c) { return c && c.in_use; }) : [];
+  var expired = certList.filter(function (c) { return c && c.status === 'expired'; });
+  var failing = certList.filter(function (c) { var end = c && time(c.not_after); return c && c.status === 'renewal due' && end !== null && end - Date.now() < 14 * DAY; });
+  if (S.mode === 'ready' && expired.length) out.push(h('div', { class: 'banner crit', role: 'alert' }, h('div', { class: 'grow wrap-any' },
+    h('b', { text: (expired.length === 1 ? 'The certificate for ' : expired.length + ' certificates have expired: ') + expired.slice(0, 3).map(function (c) { return str(c.domain, 80); }).join(', ') + (expired.length === 1 ? ' has expired. ' : '. ') }),
+    'Browsers refuse HTTPS for it. ', S.certs.data.acme ? 'liman keeps trying to renew; the reason is in the daemon log (journalctl -u limand | grep certificate), and limand cert renew <domain> tries at once.' : 'acme is not set up, so liman does not renew certificates; replace the files in cert_dir.')));
+  if (S.mode === 'ready' && failing.length) out.push(h('div', { class: 'banner warn', role: 'status' }, h('div', { class: 'grow wrap-any' },
+    h('b', { text: 'Renewing ' + failing.slice(0, 3).map(function (c) { return str(c.domain, 80); }).join(', ') + ' keeps failing. ' }),
+    'It expires in ' + roughly(Math.max(time(failing[0].not_after) - Date.now(), 0)) + '. ', S.certs.data.acme ? 'The reason is in the daemon log (journalctl -u limand | grep certificate); limand cert renew <domain> tries at once.' : 'acme is not set up, so liman does not renew certificates.')));
+  if (S.mode === 'ready' && S.info && S.info.key_rotation_unfinished) out.push(h('div', { class: 'banner warn', role: 'status' }, h('div', { class: 'grow' },
+    h('b', { text: 'A master key rotation did not finish. ' }), 'Every secret still opens. Finish it on the server with ', h('code', { text: 'limand key rotate' }), ' while the daemon is stopped.')));
   var skew = S.info ? time(S.info.now) : null;
   if (S.mode === 'ready' && skew !== null && Math.abs(skew - S.updated) > 120000) out.push(h('div', { class: 'banner warn' }, h('div', { class: 'grow' },
     'The clock of the server and the clock of this computer are ' + Math.round(Math.abs(skew - S.updated) / 60000) + ' minutes apart. Times such as “5m ago” are off by that much.')));
@@ -1165,6 +1198,49 @@ function viewBackups() {
       h('dt', { text: 'Off the server' }), h('dd', null, 'These files are on the same disk as the data they protect. Copy them elsewhere regularly, or they are lost together with the server.')), { span: 'c12' })));
   return out;
 }
+// certificatesPanel lists what is in nginx.cert_dir. Nothing here can
+// change a certificate: that is the daemon's job, or the command line's.
+function certificatesPanel() {
+  if (!(S.info && S.info.certificates)) return null;
+  var have = S.certs, data = have && have.data, list = data && Array.isArray(data.certificates) ? data.certificates : [];
+  var side = h('span', { class: 'hint', text: data ? (data.acme ? 'obtained and renewed by liman' : 'acme is off: renewing is up to you') : '' });
+  var body;
+  if (!have) body = stateBlock('Reading the certificates…', null, null, true);
+  else if (!data) body = stateBlock('The certificates could not be read', h('p', { text: str(have.error, 300) }), null, true);
+  else if (!list.length) body = stateBlock('No certificates yet', h('p', null, data.acme ? 'An app with a domain gets one after its next deploy.' : 'Put fullchain.pem and privkey.pem into cert_dir/<domain>/, or set up acme in config.yaml.'), null, true);
+  else body = h('div', { class: 'tbl-wrap' }, h('table', null,
+    h('thead', null, h('tr', null, h('th', { text: 'Domain' }), h('th', { text: 'Status' }), h('th', { text: 'Expires' }), h('th', { text: 'Issuer' }))),
+    h('tbody', null, list.map(function (c) {
+      var st = !c.in_use ? { key: 'none', label: c.status === 'expired' ? 'Expired, not in use' : 'Not in use' }
+        : c.status === 'expired' ? { key: 'crit', label: 'Expired' } : c.status === 'renewal due' ? { key: 'warn', label: 'Renewal due' } : { key: 'ok', label: 'Valid' };
+      var end = time(c.not_after), left = end === null ? '' : end > Date.now() ? 'in ' + roughly(end - Date.now()) : 'expired';
+      return h('tr', null, h('td', { class: 'mono wrap-word', text: str(c.domain, 120) }), h('td', null, pill(st)),
+        h('td', { class: 'nowrap' }, h('span', { text: abs(c.not_after) }), h('span', { class: 'muted', text: left ? ' · ' + left : '' })),
+        h('td', { class: 'muted wrap-any', text: orDash(c.issuer, 80) }));
+    }))));
+  var extra = data && Array.isArray(data.errors) && data.errors.length ? h('div', { class: 'hint wrap-any', text: str(data.errors.join('; '), 300) }) : null;
+  var unused = list.some(function (c) { return c && !c.in_use; }) ? h('div', { class: 'hint', text: 'Not in use: no app has this domain any more. liman keeps the files for a later deploy but does not renew them.' }) : null;
+  return panel('Certificates', [body, unused, extra], { span: 'c12', side: side, flush: !!(data && list.length) });
+}
+// keysPanel lists the master keys by ID. An ID says nothing about the key;
+// the panel never sees a key, only which one sealed what.
+function keysPanel() {
+  if (!(S.info && S.info.secrets)) return null;
+  var have = S.keys, data = have && have.data, list = data && Array.isArray(data.keys) ? data.keys : [];
+  var roles = { primary: { key: 'ok', label: 'Primary' }, old: { key: 'none', label: 'Old, opens only' }, 'unfinished rotation': { key: 'warn', label: 'Unfinished rotation' }, missing: { key: 'crit', label: 'Missing' } };
+  var body;
+  if (!have) body = stateBlock('Reading the keys…', null, null, true);
+  else if (!data) body = stateBlock('The keys could not be read', h('p', { text: str(have.error, 300) }), null, true);
+  else body = h('div', { class: 'tbl-wrap' }, h('table', null,
+    h('thead', null, h('tr', null, h('th', { text: 'Key' }), h('th', { text: 'Role' }), h('th', { class: 'right', text: 'Secrets' }), h('th', { class: 'right', text: 'Backups' }))),
+    h('tbody', null, list.map(function (k) {
+      return h('tr', null, h('td', { class: 'mono', text: str(k.id, 32) }), h('td', null, pill(roles[k.role] || { key: 'none', label: str(k.role, 40) })),
+        h('td', { class: 'right', text: fmtNum(k.secrets) }), h('td', { class: 'right', text: fmtNum(k.backups) }));
+    }))));
+  var hint = h('div', { class: 'hint' }, 'Secrets: sealed with the key, in the database. Backups: signed with it, in the backup directory. Rotating and retiring keys is done on the server: ', h('code', { text: 'limand key rotate' }), ', ', h('code', { text: 'limand key retire <id>' }), '.');
+  return panel('Master keys', [body, hint], { span: 'c12', flush: !!data });
+}
+
 function viewDaemon() {
   var d = S.info || {}, m = d.monitor && typeof d.monitor === 'object' ? d.monitor : null;
   function part(label, key, word, text) { return [h('dt', { text: label }), h('dd', { class: 'hstack' }, pill({ key: key, label: word }), h('span', { class: 'muted wrap-any', text: text }))]; }
@@ -1181,6 +1257,7 @@ function viewDaemon() {
       h('dt', { text: 'Built' }), h('dd', { class: 'mono', text: orDash(d.built, 80) }),
       h('dt', { text: 'Running since' }), h('dd', null, when(d.started_at), h('span', { class: 'muted', text: time(d.started_at) === null ? '' : ' · ' + abs(d.started_at) })),
       h('dt', { text: 'Panel address' }), h('dd', { class: 'mono', text: str(window.location.host, 120) })), { span: 'c6' }),
+    certificatesPanel(), keysPanel(),
     panel('Access', h('dl', { class: 'kv' },
       h('dt', { text: 'This panel' }), h('dd', null, 'Signed in as ', h('code', { text: orDash(d.token, 64) }), readOnly()
         ? ', a read-only token: this panel can look at everything and change nothing. The token is kept in this browser tab only.'

@@ -39,6 +39,9 @@ a { color: inherit }
 .muted { color: var(--fg-3) }
 .trunc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0 }
 .wrap-any { overflow-wrap: anywhere; min-width: 0 }
+/* break-word, unlike anywhere, does not lower a table column's minimum
+   width: a domain stays whole unless it is longer than the screen. */
+.wrap-word { overflow-wrap: break-word; min-width: 0 }
 .sr { position: absolute; left: -9999px }
 .hstack { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; min-width: 0 }
 .right { text-align: right }
@@ -132,6 +135,7 @@ h2 { font-size: 13px; font-weight: 600; margin: 0; color: var(--fg) }
 .panel-h .hint { font-size: 12px }
 .panel-b { padding: 0 12px 12px; min-width: 0 }
 .panel-b.flush { padding: 0 }
+.panel-b.flush > .hint { padding: 8px 12px; border-top: 1px solid var(--line) }
 .stat { padding: 2px 12px 14px; display: flex; flex-direction: column; gap: 2px; min-width: 0 }
 .stat b { font: 500 30px/1.15 var(--sans); font-variant-numeric: tabular-nums; overflow-wrap: anywhere }
 .stat b.small { font: 500 15px/1.5 var(--mono) }
