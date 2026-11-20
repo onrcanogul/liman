@@ -118,7 +118,7 @@ type Server struct {
 	// the same time.
 	mu sync.Mutex
 	// confirms holds the questions that are waiting for an answer.
-	confirms map[string]chan bool
+	confirms map[string]confirmation
 	// domains holds the domains of deploys in progress, by app; see
 	// claimDomain.
 	domains map[string]string
@@ -545,10 +545,12 @@ func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	answer, ok := s.confirms[r.PathValue("id")]
+	c, ok := s.confirms[r.PathValue("id")]
 	s.mu.Unlock()
 
-	if !ok {
+	// A question is answered by the token that started the deploy. Any
+	// other gets the same answer as for a question that does not exist.
+	if !ok || c.token != metaOf(r.Context()).token {
 		writeError(w, http.StatusNotFound, errors.New("no such confirmation; it may have been answered or timed out"))
 		return
 	}
@@ -557,7 +559,7 @@ func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request) {
 	// never blocks. A second answer for the same question finds the buffer
 	// full; the default branch drops it instead of hanging this request.
 	select {
-	case answer <- req.Approve:
+	case c.answer <- req.Approve:
 	default:
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -1337,9 +1339,17 @@ func (s *Server) lock(app string) (unlock func(), ok bool) {
 	return s.ownLocks.TryLock(app)
 }
 
+// confirmation is a question of a step-by-step deploy or rollback, waiting
+// for an answer from the token that started it.
+type confirmation struct {
+	answer chan bool
+	token  string
+}
+
 // confirmer returns the pipeline callback that asks the client before each
 // step. The question goes out on the deploy's own response stream; the
-// answer comes back on a separate request, handled by handleConfirm.
+// answer comes back on a separate request, handled by handleConfirm, from
+// the same token.
 func (s *Server) confirmer(ctx context.Context, stream *eventStream) func(pipeline.Step) (bool, error) {
 	timeout := s.ConfirmTimeout
 	if timeout == 0 {
@@ -1355,9 +1365,9 @@ func (s *Server) confirmer(ctx context.Context, stream *eventStream) func(pipeli
 
 		s.mu.Lock()
 		if s.confirms == nil {
-			s.confirms = map[string]chan bool{}
+			s.confirms = map[string]confirmation{}
 		}
-		s.confirms[id] = answer
+		s.confirms[id] = confirmation{answer: answer, token: metaOf(ctx).token}
 		s.mu.Unlock()
 
 		// Whatever happens below, the question must not stay registered.

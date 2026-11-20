@@ -6,6 +6,7 @@ package server_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -2409,6 +2410,72 @@ func TestADomainBelongsToOneApp(t *testing.T) {
 	}
 	if _, err := h.Client.Deploy(ctx(), []byte(sameDomain), api.DeployOptions{}, io.Discard); err != nil {
 		t.Errorf("Deploy(shop) after orders-api was stopped = %v", err)
+	}
+}
+
+func TestOnlyTheTokenThatAskedCanAnswer(t *testing.T) {
+	h := servertest.New(t)
+	other, err := h.Store.CreateToken(ctx(), "other")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, h.URL+"/v1/deploys?step=true", strings.NewReader(definition))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+h.Client.Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	dec := json.NewDecoder(resp.Body)
+	var id string
+	for id == "" {
+		var ev api.DeployEvent
+		if err := dec.Decode(&ev); err != nil {
+			t.Fatalf("reading the stream: %v", err)
+		}
+		if ev.Type == api.EventConfirm {
+			id = ev.ConfirmID
+		}
+	}
+
+	answer := func(token string) int {
+		status, _ := func() (int, string) {
+			r, err := http.NewRequest(http.MethodPost, h.URL+"/v1/confirmations/"+id, strings.NewReader(`{"approve":false}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.Header.Set("Authorization", "Bearer "+token)
+			res, err := http.DefaultClient.Do(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = res.Body.Close()
+			return res.StatusCode, ""
+		}()
+		return status
+	}
+	// Another token, even an admin one, is told there is no such question.
+	if got := answer(other); got != http.StatusNotFound {
+		t.Errorf("answer from another token = %d, want 404", got)
+	}
+	if got := answer(h.Client.Token); got != http.StatusNoContent {
+		t.Errorf("answer from the token that asked = %d, want 204", got)
+	}
+	for {
+		var ev api.DeployEvent
+		if err := dec.Decode(&ev); err != nil {
+			t.Fatalf("reading the stream: %v", err)
+		}
+		if ev.Type == api.EventResult {
+			if ev.Result.OK || !strings.Contains(ev.Result.Error, "aborted") {
+				t.Errorf("result = %+v, want aborted by its own token's answer", ev.Result)
+			}
+			break
+		}
 	}
 }
 
