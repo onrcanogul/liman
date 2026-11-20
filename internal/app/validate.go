@@ -67,6 +67,17 @@ func ValidHealthPath(path string) bool {
 	return len(path) <= maxHealthPathLength && healthPathRe.MatchString(path)
 }
 
+// ValidRepository reports whether repo is an image repository without a
+// tag or a digest (ghcr.io/user/api, localhost:5000/api), as an app is
+// registered with.
+func ValidRepository(repo string) bool {
+	if repo == "" || len(repo) > maxImageLength-72 || !imageRe.MatchString(repo) || strings.Contains(repo, "@") {
+		return false
+	}
+	// A ":" after the last "/" is a tag; one before it is a registry's port.
+	return !strings.Contains(repo[strings.LastIndex(repo, "/")+1:], ":")
+}
+
 // releaseRe is the shape of a release name: a timestamp, or whatever a test
 // uses in its place.
 var releaseRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
