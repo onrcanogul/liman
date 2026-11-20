@@ -305,12 +305,22 @@ Every request except `GET /v1/health` needs a token.
 ```
 limand token create <name>                         # prints the token once
 limand token create <name> --write-client <file>   # writes a client.yaml instead
-limand token list
+limand token create <name> --expires 90d           # stops working after 90 days (or 12h)
+limand token list                                  # with scope and expiry
 limand token revoke <name>
 ```
 
 Only a hash of each token is stored; a lost token cannot be recovered, only
 replaced.
+
+A token without `--expires` works until it is revoked; tokens created
+before expiry existed are of that kind. An expired token is refused with
+`401 token expired` (every other refusal says only `invalid token`), its
+use is logged as `expired token used` with the token's name, and it stays
+in `token list` until it is revoked. There is no renewing: create a new
+token and revoke the old one, so that a value that may have leaked is
+replaced as well. `GET /v1/info` reports `token_expires_at`, and the panel
+warns from 14 days before the end.
 
 ### The client side
 
@@ -402,7 +412,8 @@ is equivalent to root. The API is built around keeping everyone else out:
 
 Known limits: the `liman` user's sudo rule makes root parse Nginx config that user
 writes, no TLS of its own, only two scopes (an `admin` token can do
-everything, for every app), tokens do not expire, and the failed-attempt limit is per address and kept in
+everything, for every app), tokens expire only when created with
+`--expires`, and the failed-attempt limit is per address and kept in
 memory.
 
 ## Installing on a server
@@ -513,7 +524,8 @@ limand backup restore /var/backups/liman/liman-20261120-031500.db
   is given. It checks the backup first, keeps
   the database it replaces as `liman.db.replaced-<date>-<time>`, and lists
   the tokens that are valid afterwards: one that was revoked after the
-  backup was made is valid again.
+  backup was made is valid again. (Expiry is not turned back: a token
+  that has expired since stays expired.)
 
 The panel's Backups page does `create` and `verify` from the browser. It
 uses the directory and count from `config.yaml`:
