@@ -151,6 +151,11 @@ h2 { font-size: 13px; font-weight: 600; margin: 0; color: var(--fg) }
 .input { min-height: 34px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: var(--r); background: var(--panel); width: 100%; min-width: 0 }
 select.input { width: auto; max-width: 100% }
 .input[aria-invalid="true"] { border-color: var(--crit) }
+/* On a touch screen, Safari zooms the page in when a field with text
+   smaller than 16px gets the focus, and a dialog then no longer fits.
+   16px is the size at which it does not. .input.mono, because .mono sets
+   a size of its own further down. */
+@media (pointer: coarse) { .input, .input.mono { font-size: 16px } }
 .hint { font-size: 12.5px; color: var(--fg-3) }
 .err { font-size: 12.5px; color: var(--crit); min-height: 18px }
 .pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px 2px 8px; border-radius: 999px; font-size: 12.5px; font-weight: 500; white-space: nowrap;
@@ -240,7 +245,9 @@ code { font-family: var(--mono); font-size: 12.5px; background: var(--panel-2); 
 body.gated { overflow: auto }
 
 /* ---------- dialogs ---------- */
-dialog { border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); color: var(--fg); padding: 0; width: min(520px, calc(100vw - 32px)); max-height: calc(100vh - 32px); box-shadow: var(--shadow) }
+/* dvh is the height that is really visible on a phone, without the
+   browser's bars; vh first for browsers that do not know dvh. */
+dialog { border: 1px solid var(--line-strong); border-radius: 8px; background: var(--panel); color: var(--fg); padding: 0; width: min(520px, calc(100vw - 32px)); max-height: calc(100vh - 32px); max-height: calc(100dvh - 32px); box-shadow: var(--shadow) }
 dialog::backdrop { background: rgba(8, 12, 18, .55) }
 .dlg { display: flex; flex-direction: column; gap: 14px; padding: 18px; min-width: 0 }
 .dlg h3 { margin: 0; font-size: 16px; font-weight: 600; overflow-wrap: anywhere } .dlg p { margin: 0; color: var(--fg-2); overflow-wrap: anywhere }
