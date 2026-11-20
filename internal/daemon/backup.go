@@ -30,7 +30,7 @@ import (
 //   - containers and images. They are rebuilt by deploying again.
 //   - the Nginx config. It is generated on every deploy.
 
-const backupSynopsis = "limand backup create <dir> [--keep <n>] | verify <file> | restore <file>"
+const backupSynopsis = "limand backup create <dir> [--keep <n>] | verify <file> | restore <file> | identity <file>"
 
 // backupNameRe is the shape of the file names "backup create" writes.
 var backupNameRe = backup.NameRe
@@ -46,6 +46,8 @@ func (d *Daemon) runBackup(ctx context.Context, args []string) int {
 		return d.backupVerify(ctx, args[1:])
 	case "restore":
 		return d.backupRestore(ctx, args[1:])
+	case "identity":
+		return d.backupIdentity(args[1:])
 	default:
 		return d.usageError(backupSynopsis)
 	}
@@ -166,9 +168,47 @@ func (d *Daemon) backupCreate(ctx context.Context, args []string) int {
 		}
 	}
 
-	if rep.Secrets > 0 {
+	switch {
+	case rep.Encrypted:
+		fmt.Fprintf(d.Stdout, "\nThe backup is encrypted with the master key, which is not part of it. Without a copy of %s it cannot be opened at all; keep that copy somewhere else, not next to the backups.\n", d.keyPath(cfg))
+	case rep.Secrets > 0:
 		fmt.Fprintf(d.Stdout, "\nThe master key is not part of the backup. Without a copy of %s the secrets in it are lost; keep that copy somewhere else, not next to the backups.\n", d.keyPath(cfg))
 	}
+	return exitOK
+}
+
+// backupIdentity writes the age identities of the master keys to a new
+// file, for opening backups with the age tool where liman is not at hand:
+// age -d -i <file> liman-….db.age > liman.db
+func (d *Daemon) backupIdentity(args []string) int {
+	if len(args) != 1 || args[0] == "" || args[0][0] == '-' {
+		return d.usageError("limand backup identity <file>")
+	}
+	cfg, err := config.Load(filepath.Join(d.Home, "config.yaml"))
+	if err != nil {
+		return d.fail(err)
+	}
+	ring, err := secrets.LoadKeyring(d.keyPath(cfg))
+	if err != nil {
+		return d.fail(err)
+	}
+	text, err := ring.BackupIdentityFile()
+	if err != nil {
+		return d.fail(err)
+	}
+	// New, and private from its first moment: this file opens every
+	// backup, like the master key itself.
+	f, err := os.OpenFile(args[0], os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return d.fail(err)
+	}
+	_, writeErr := f.WriteString(text)
+	if err := errors.Join(writeErr, f.Close()); err != nil {
+		_ = os.Remove(args[0])
+		return d.fail(err)
+	}
+	fmt.Fprintf(d.Stdout, "Wrote the backup identities of %s to %s.\nOpen a backup with: age -d -i %s liman-….db.age > liman.db\nThis file opens every backup: keep it like the master key, or delete it.\n",
+		count(len(ring.IDs()), "key"), args[0], args[0])
 	return exitOK
 }
 
@@ -225,6 +265,12 @@ func (d *Daemon) backupRestore(ctx context.Context, args []string) int {
 
 	target := filepath.Join(d.Home, "liman.db")
 	staged := target + ".restoring"
+	// The copy keeps the original's suffix: that is how the checks know an
+	// encrypted backup.
+	copied := staged
+	if backup.Encrypted(source) {
+		copied = staged + backup.EncryptedSuffix
+	}
 	stamp := time.Now().UTC().Format(asideStamp)
 
 	// 1. Copy the backup next to the database, then check the copy. The
@@ -232,13 +278,16 @@ func (d *Daemon) backupRestore(ctx context.Context, args []string) int {
 	// and copying it afterwards would leave a moment in which it could be
 	// swapped for another. The copy is private and nobody else can write
 	// to it.
-	_ = os.Remove(staged) // left behind by a run that was interrupted
-	if err := copyFileExclusive(source, staged); err != nil {
+	// Left behind by a run that was interrupted.
+	_ = os.Remove(staged)
+	_ = os.Remove(copied)
+	if err := copyFileExclusive(source, copied); err != nil {
 		return d.fail(fmt.Errorf("copy backup: %w", err))
 	}
 	// Until the copy has become the database, every way out removes it.
 	placed := false
 	defer func() {
+		_ = os.Remove(copied)
 		if !placed {
 			_ = os.Remove(staged)
 		}
@@ -246,7 +295,7 @@ func (d *Daemon) backupRestore(ctx context.Context, args []string) int {
 
 	// The private copy is checked against the signature that came with
 	// the original.
-	rep, err := backup.CheckWithSignature(ctx, staged, source+backup.SigSuffix, d.keyPath(cfg))
+	rep, err := backup.CheckWithSignature(ctx, copied, source+backup.SigSuffix, d.keyPath(cfg))
 	if err != nil {
 		return d.fail(fmt.Errorf("%s: %w", source, err))
 	}
@@ -268,6 +317,13 @@ func (d *Daemon) backupRestore(ctx context.Context, args []string) int {
 	}
 	if len(rep.Undecryptable) > 0 {
 		return d.fail(fmt.Errorf("%d of the %s in the backup cannot be decrypted with %s; put the key that belongs to this backup there first", len(rep.Undecryptable), count(rep.Secrets, "secret"), d.keyPath(cfg)))
+	}
+	// An encrypted backup is opened from the private copy that was just
+	// checked into the file that becomes the database.
+	if copied != staged {
+		if err := backup.DecryptFile(copied, staged, d.keyPath(cfg)); err != nil {
+			return d.fail(err)
+		}
 	}
 
 	// 2. Nobody may be using the database. A running daemon holds it open

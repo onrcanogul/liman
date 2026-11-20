@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,7 +30,7 @@ const nameLayout = "20060102-150405"
 // not match it is ever listed, opened or removed: a directory shared with
 // other files loses nothing, and a name from a request cannot point
 // outside the directory.
-var NameRe = regexp.MustCompile(`^liman-\d{8}-\d{6}\.db$`)
+var NameRe = regexp.MustCompile(`^liman-\d{8}-\d{6}\.db(\.age)?$`)
 
 // ErrBusy is returned when a backup is requested while one is being made.
 var ErrBusy = errors.New("a backup is already being made")
@@ -49,6 +50,8 @@ type Report struct {
 	// MissingKeys are the IDs of keys some of the secrets were sealed with
 	// and the keyring does not hold.
 	MissingKeys []string
+	// Encrypted is true for a backup in the age format.
+	Encrypted bool
 	// Signature is one of the Sig constants.
 	Signature string
 	// SignedBy is the ID of the key that signed the file, when known.
@@ -64,8 +67,9 @@ func (r Report) Usable() bool {
 
 // Entry describes one backup file.
 type Entry struct {
-	Name string
-	Size int64
+	Name      string
+	Encrypted bool
+	Size      int64
 	// Created is taken from the file's name, which cannot change by
 	// copying the file around the way its modification time can.
 	Created time.Time
@@ -89,12 +93,28 @@ func CheckWithSignature(ctx context.Context, path, sigPath, keyPath string) (Rep
 	if err != nil {
 		return Report{}, err
 	}
-	rep := Report{Signature: sig, SignedBy: signedBy}
+	rep := Report{Signature: sig, SignedBy: signedBy, Encrypted: Encrypted(path)}
 	if sig == SigInvalid || sig == SigUnknownKey {
 		return rep, nil
 	}
 
-	st, err := store.OpenReadOnly(ctx, path)
+	// An encrypted backup is opened into a private temporary file, the
+	// checks run on that, and it is removed at once. SQLite reads files,
+	// not streams, so there is no way around a plain copy for a moment.
+	dbPath := path
+	if rep.Encrypted {
+		dir, err := os.MkdirTemp("", "liman-check-*")
+		if err != nil {
+			return rep, err
+		}
+		defer func() { _ = os.RemoveAll(dir) }()
+		dbPath = filepath.Join(dir, "backup.db")
+		if err := DecryptFile(path, dbPath, keyPath); err != nil {
+			return rep, err
+		}
+	}
+
+	st, err := store.OpenReadOnly(ctx, dbPath)
 	if err != nil {
 		return rep, err
 	}
@@ -158,23 +178,50 @@ func CreateBeforeUpgrade(ctx context.Context, path, dir, keyPath string) (string
 	return create(ctx, st, dir, keyPath, true)
 }
 
-func create(ctx context.Context, st *store.Store, dir, keyPath string, legacySignature bool) (string, Report, error) {
+func create(ctx context.Context, st *store.Store, dir, keyPath string, legacy bool) (string, Report, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", Report{}, fmt.Errorf("create backup directory: %w", err)
 	}
 
-	dest := filepath.Join(dir, "liman-"+time.Now().UTC().Format(nameLayout)+".db")
+	base := filepath.Join(dir, "liman-"+time.Now().UTC().Format(nameLayout)+".db")
 	// Names have a resolution of one second. Asked twice within one, the
 	// second request is told that a backup was just made, which is true,
 	// instead of failing on the name.
-	if _, err := os.Lstat(dest); err == nil {
-		return "", Report{}, fmt.Errorf("%w: one was written less than a second ago", ErrBusy)
+	for _, name := range []string{base, base + EncryptedSuffix} {
+		if _, err := os.Lstat(name); err == nil {
+			return "", Report{}, fmt.Errorf("%w: one was written less than a second ago", ErrBusy)
+		}
 	}
-	if err := st.Snapshot(ctx, dest); err != nil {
+
+	// Encrypted whenever there is a master key to encrypt with, except a
+	// backup taken before an upgrade: the previous version, which is what
+	// restores it, may not know the format.
+	ring, err := loadKeyring(keyPath)
+	if err != nil {
+		return "", Report{}, err
+	}
+	dest := base
+	if ring != nil && !legacy {
+		dest = base + EncryptedSuffix
+		// The plain snapshot lives in a private directory for as long as
+		// encrypting it takes.
+		tmp, err := os.MkdirTemp(dir, ".liman-plain-*")
+		if err != nil {
+			return "", Report{}, fmt.Errorf("prepare backup: %w", err)
+		}
+		defer func() { _ = os.RemoveAll(tmp) }()
+		plain := filepath.Join(tmp, "snapshot.db")
+		if err := st.Snapshot(ctx, plain); err != nil {
+			return "", Report{}, err
+		}
+		if err := encryptFile(plain, dest, ring); err != nil {
+			return "", Report{}, err
+		}
+	} else if err := st.Snapshot(ctx, dest); err != nil {
 		return "", Report{}, err
 	}
 
-	if _, err := sign(dest, keyPath, legacySignature); err != nil {
+	if _, err := sign(dest, keyPath, legacy); err != nil {
 		return dest, Report{}, err
 	}
 
@@ -209,14 +256,19 @@ func List(dir string) ([]Entry, error) {
 		if err != nil {
 			continue // removed between the listing and this line
 		}
-		created, err := time.Parse("liman-"+nameLayout+".db", e.Name())
+		created, err := createdAt(e.Name())
 		if err != nil {
 			continue // digits that are not a date, such as month 13
 		}
-		out = append(out, Entry{Name: e.Name(), Size: info.Size(), Created: created})
+		out = append(out, Entry{Name: e.Name(), Encrypted: Encrypted(e.Name()), Size: info.Size(), Created: created})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name > out[j].Name })
 	return out, nil
+}
+
+// createdAt reads the time from a backup's name.
+func createdAt(name string) (time.Time, error) {
+	return time.Parse("liman-"+nameLayout+".db", strings.TrimSuffix(name, EncryptedSuffix))
 }
 
 // Prune removes all but the newest keep backups in dir and returns how
@@ -273,11 +325,11 @@ func (s *Service) Create(ctx context.Context) (Entry, Report, int, error) {
 	if err != nil {
 		return Entry{}, rep, 0, err
 	}
-	entry := Entry{Name: filepath.Base(path)}
+	entry := Entry{Name: filepath.Base(path), Encrypted: Encrypted(path)}
 	if info, err := os.Stat(path); err == nil {
 		entry.Size = info.Size()
 	}
-	entry.Created, _ = time.Parse("liman-"+nameLayout+".db", entry.Name)
+	entry.Created, _ = createdAt(entry.Name)
 
 	// Older backups go only when the new one is good in every respect.
 	removed := 0

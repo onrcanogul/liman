@@ -60,6 +60,9 @@ Usage:
                                   check it; with --keep, remove all but the
                                   newest <n> backups there. Safe while the
                                   daemon is running
+  limand backup identity <file>   Write the age identities that open the
+                                  backups (encrypted with the master key), for
+                                  the age tool: age -d -i <file> <backup>
   limand backup verify <file>     Check a backup: is it intact, and can its
                                   secrets be decrypted with this master key
   limand backup restore <file> [--allow-unsigned]

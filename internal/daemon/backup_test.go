@@ -1,11 +1,13 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -13,6 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"filippo.io/age"
+
+	"github.com/onrcanogul/liman/internal/backup"
 	"github.com/onrcanogul/liman/internal/secrets"
 	"github.com/onrcanogul/liman/internal/store"
 )
@@ -104,7 +109,7 @@ func TestBackupCreateWritesACheckedPrivateCopy(t *testing.T) {
 	}
 
 	out := td.stdout.String()
-	for _, want := range []string{names[0], "signature valid", "1 event,", "1 token,", "1 secret,", "the one secret can be decrypted", "master key is not part of the backup"} {
+	for _, want := range []string{names[0], "signature valid", "1 event,", "1 token,", "1 secret,", "the one secret can be decrypted", "encrypted with the master key, which is not part of it"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output does not mention %q:\n%s", want, out)
 		}
@@ -199,12 +204,12 @@ func TestBackupVerify(t *testing.T) {
 		t.Errorf("verify with the wrong key does not report the signature:\n%s", out)
 	}
 
-	// Without any key it says so instead of claiming success for them.
+	// Without any key an encrypted backup cannot even be opened.
 	if err := os.Remove(filepath.Join(td.Home, "master.key")); err != nil {
 		t.Fatal(err)
 	}
-	if code := td.Run(ctx, []string{"backup", "verify", file}); code != exitOK || !strings.Contains(td.stdout.String(), "secrets NOT checked") || !strings.Contains(td.stdout.String(), "signature NOT checked") {
-		t.Errorf("verify without a key: code %d, output %q", code, td.stdout.String())
+	if code := td.Run(ctx, []string{"backup", "verify", file}); code != exitError || !strings.Contains(td.stderr.String(), "is encrypted, and there is no master key") {
+		t.Errorf("verify without a key: code %d, stderr %q", code, td.stderr.String())
 	}
 
 	// Something that is not a backup at all.
@@ -354,7 +359,7 @@ func TestBackupRestoreRefusesABackupItCannotUse(t *testing.T) {
 	if err := os.Remove(filepath.Join(td.Home, "master.key")); err != nil {
 		t.Fatal(err)
 	}
-	if code := td.Run(ctx, []string{"backup", "restore", file}); code != exitError || !strings.Contains(td.stderr.String(), "could not be checked (unchecked)") {
+	if code := td.Run(ctx, []string{"backup", "restore", file}); code != exitError || !strings.Contains(td.stderr.String(), "is encrypted, and there is no master key") {
 		t.Errorf("restore without a key: code %d, stderr %q", code, td.stderr.String())
 	}
 	untouched("no key")
@@ -422,10 +427,12 @@ func TestAChangedBackupIsRefused(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 
-	if code := td.Run(ctx, []string{"backup", "create", dir}); code != exitOK {
-		t.Fatal(td.stderr.String())
+	// An unencrypted backup, such as the one taken before an upgrade: its
+	// contents can be edited by anyone, only the signature notices.
+	file, _, err := backup.CreateBeforeUpgrade(ctx, filepath.Join(td.Home, "liman.db"), dir, filepath.Join(td.Home, "master.key"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	file := filepath.Join(dir, backupsIn(t, dir)[0])
 
 	token := forge(t, file)
 
@@ -772,5 +779,116 @@ func TestBackupsWithAV1SignatureStillVerify(t *testing.T) {
 
 	if code := td.Run(ctx, []string{"backup", "verify", file}); code != exitOK || !strings.Contains(td.stdout.String(), "what key "+oldID.String()) {
 		t.Errorf("verify of a v1 signature: code %d, stdout:\n%s", code, td.stdout.String())
+	}
+}
+
+func TestBackupsAreEncrypted(t *testing.T) {
+	td := newTestDaemon(t)
+	seed(t, td)
+	dir := t.TempDir()
+	ctx := context.Background()
+	if code := td.Run(ctx, []string{"backup", "create", dir}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	names := backupsIn(t, dir)
+	if len(names) != 1 || !strings.HasSuffix(names[0], ".db.age") {
+		t.Fatalf("backups = %v, want one .db.age", names)
+	}
+	file := filepath.Join(dir, names[0])
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(data, []byte("age-encryption.org/v1\n")) {
+		t.Errorf("the backup does not start with the age header: %q", data[:min(40, len(data))])
+	}
+	// What a plain database would give away is not there.
+	for _, plain := range []string{"SQLite format 3", "Pull image", "web", "laptop"} {
+		if bytes.Contains(data, []byte(plain)) {
+			t.Errorf("%q is readable in the encrypted backup", plain)
+		}
+	}
+	if st, _ := os.Stat(file); st.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %o, want 600", st.Mode().Perm())
+	}
+	// No plain copy is left anywhere in the directory.
+	leftovers, _ := filepath.Glob(filepath.Join(dir, ".liman-*"))
+	if len(leftovers) != 0 {
+		t.Errorf("temporary files left behind: %v", leftovers)
+	}
+
+	if code := td.Run(ctx, []string{"backup", "restore", file}); code != exitOK {
+		t.Fatalf("restore of an encrypted backup: code %d, stderr %q", code, td.stderr.String())
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(td.Home, "liman.db.restoring*")); len(leftovers) != 0 {
+		t.Errorf("restore left %v behind", leftovers)
+	}
+}
+
+func TestAChangedEncryptedBackupIsRefused(t *testing.T) {
+	td := newTestDaemon(t)
+	seed(t, td)
+	dir := t.TempDir()
+	ctx := context.Background()
+	if code := td.Run(ctx, []string{"backup", "create", dir}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	file := filepath.Join(dir, backupsIn(t, dir)[0])
+	data, _ := os.ReadFile(file)
+	data[len(data)/2] ^= 1
+	if err := os.WriteFile(file, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if code := td.Run(ctx, []string{"backup", "restore", file}); code != exitError || !strings.Contains(td.stderr.String(), "does not match its signature") {
+		t.Errorf("restore of a changed encrypted backup: code %d, stderr %q", code, td.stderr.String())
+	}
+	// Even without its signature, and told to accept that, the change is
+	// caught: every chunk of an age file is authenticated.
+	if err := os.Remove(file + backup.SigSuffix); err != nil {
+		t.Fatal(err)
+	}
+	if code := td.Run(ctx, []string{"backup", "restore", file, "--allow-unsigned"}); code != exitError || !strings.Contains(td.stderr.String(), "decrypt") {
+		t.Errorf("restore of a changed, unsigned encrypted backup: code %d, stderr %q", code, td.stderr.String())
+	}
+}
+
+func TestBackupIdentityOpensBackupsWithAge(t *testing.T) {
+	td := newTestDaemon(t)
+	seed(t, td)
+	dir := t.TempDir()
+	ctx := context.Background()
+	if code := td.Run(ctx, []string{"backup", "create", dir}); code != exitOK {
+		t.Fatal(td.stderr.String())
+	}
+	file := filepath.Join(dir, backupsIn(t, dir)[0])
+
+	idFile := filepath.Join(t.TempDir(), "identity.txt")
+	if code := td.Run(ctx, []string{"backup", "identity", idFile}); code != exitOK {
+		t.Fatalf("backup identity: code %d, stderr %q", code, td.stderr.String())
+	}
+	if st, _ := os.Stat(idFile); st.Mode().Perm() != 0o600 {
+		t.Errorf("identity file mode = %o", st.Mode().Perm())
+	}
+	if code := td.Run(ctx, []string{"backup", "identity", idFile}); code != exitError {
+		t.Error("backup identity overwrote an existing file")
+	}
+
+	// What the age tool does with -i: parse the identities, decrypt.
+	f, _ := os.Open(idFile)
+	ids, err := age.ParseIdentities(f)
+	_ = f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, _ := os.Open(file)
+	defer func() { _ = enc.Close() }()
+	r, err := age.Decrypt(enc, ids...)
+	if err != nil {
+		t.Fatalf("age cannot open the backup with the written identities: %v", err)
+	}
+	plain, _ := io.ReadAll(r)
+	if !bytes.HasPrefix(plain, []byte("SQLite format 3\x00")) {
+		t.Errorf("decrypted backup is not a database: %q", plain[:min(16, len(plain))])
 	}
 }
