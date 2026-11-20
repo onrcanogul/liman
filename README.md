@@ -284,6 +284,7 @@ monitor disabled those two charts are empty.
 | `config.yaml` | Optional settings, see below |
 | `liman.db` | SQLite database: step and restart history, releases, token hashes, encrypted secrets, seven days of health checks |
 | `master.key` | The key the secrets are encrypted with; created on first start |
+| `acme-account.key` | The key of the ACME account, when `acme` is set up; created on first use |
 
 ```yaml
 # config.yaml
@@ -633,7 +634,57 @@ before the old container is removed. If anything fails the previous config is
 restored and reloaded.
 
 A domain is served over HTTPS when `cert_dir/<domain>/fullchain.pem` and
-`privkey.pem` exist. liman does not obtain certificates yet.
+`privkey.pem` exist. liman obtains them itself when `acme` is set up (next
+section); certificates put there by hand work as well.
+
+### Certificates from Let's Encrypt
+
+With an `acme` section, liman obtains and renews certificates over ACME,
+the protocol Let's Encrypt speaks:
+
+```yaml
+nginx:
+  conf_dir: /etc/nginx/liman
+  cert_dir: /etc/liman/certs
+  acme_root: /var/lib/liman/acme
+acme:
+  directory: https://acme-staging-v02.api.letsencrypt.org/directory
+  email: ops@example.com          # optional: the CA's expiry and problem notices
+```
+
+Setting `directory` means agreeing to that CA's terms of service; liman
+accepts them when it registers the account. Try things with the staging
+directory above (its certificates are not trusted by browsers, but its
+limits are generous), then switch to
+`https://acme-v02.api.letsencrypt.org/directory`; the account is registered
+again with the new CA by itself.
+
+- **After a deploy**, an app whose domain has no certificate gets one: the
+  CA's HTTP-01 challenge is written into `acme_root`, which Nginx serves on
+  port 80, and once the certificate is in `cert_dir` the app's config is
+  written again with HTTPS. This needs the domain's DNS pointing at the
+  server and port 80 reachable from the internet.
+- **If that fails**, the deploy still succeeds and the app is served over
+  plain HTTP; the output says why. The daemon tries again at its next
+  check, as does the next deploy.
+- **Twice a day** the daemon renews every certificate with less than a third
+  of its lifetime left (30 days, for Let's Encrypt's 90) and reloads Nginx. A
+  failed renewal keeps the old certificate and is logged; an expired one is
+  logged as an error. Only domains an app still has are renewed: after
+  `liman stop` the certificate stays in `cert_dir` for a later deploy, but
+  is left to expire.
+- `.localhost` domains are left alone: no CA can validate them.
+
+```
+limand cert list               # domain, issuer, expiry, "renewal due" / "EXPIRED"
+limand cert renew <domain>     # a new certificate now, and an Nginx reload
+```
+
+The certificate's key is made on the server and never sent; the CA only
+gets a signing request. `privkey.pem` and `acme-account.key` are `0600`. The
+account key is not part of `limand backup`: losing it costs nothing but a
+new registration. For a test CA whose own HTTPS certificate is not publicly
+trusted (such as Pebble), `acme.ca_file` names the CA file to trust for it.
 
 Defaults assume Nginx runs on the host: `test_command: [nginx, -t]`,
 `reload_command: [nginx, -s, reload]`, `upstream_host: 127.0.0.1`,
