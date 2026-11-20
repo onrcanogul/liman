@@ -80,6 +80,10 @@ type CLI struct {
 // Run executes the CLI with the given arguments (without the program name)
 // and returns the process exit code.
 func (c *CLI) Run(ctx context.Context, args []string) int {
+	// Everything printed from here on passes through a filter that removes
+	// terminal control characters; see safeWriter.
+	c.Stdout, c.Stderr = safe(c.Stdout), safe(c.Stderr)
+
 	if len(args) == 0 {
 		fmt.Fprint(c.Stderr, usage)
 		return exitUsage
