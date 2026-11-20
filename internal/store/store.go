@@ -178,6 +178,13 @@ var migrations = []string{
 		updated_at TEXT NOT NULL
 	);
 	`,
+
+	// 11: the checksum of each value as written in app.yaml, ${NAME} and
+	// all, besides the one of the value it was filled in with. A preview
+	// of a pull request has no secrets to fill in; it compares these.
+	`
+	ALTER TABLE app_state ADD COLUMN templates TEXT NOT NULL DEFAULT '{}';
+	`,
 }
 
 // SchemaVersion is the schema version this build reads and writes.

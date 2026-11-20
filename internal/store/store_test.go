@@ -1001,7 +1001,7 @@ func TestRegistrations(t *testing.T) {
 		t.Errorf("Registrations() = %+v, %v", list, err)
 	}
 
-	st := DeployState{App: "web", Release: "r1", Image: "ghcr.io/team/web@sha256:x", Checksum: "c1", Fields: map[string]string{"port": "f1"}}
+	st := DeployState{App: "web", Release: "r1", Image: "ghcr.io/team/web@sha256:x", Checksum: "c1", Fields: map[string]string{"port": "f1"}, Templates: map[string]string{"port": "t1"}}
 	if err := s.SaveDeployState(ctx, st); err != nil {
 		t.Fatal(err)
 	}
@@ -1009,7 +1009,7 @@ func TestRegistrations(t *testing.T) {
 	if err := s.SaveDeployState(ctx, st); err != nil {
 		t.Fatal(err)
 	}
-	if got, found, err := s.DeployStateOf(ctx, "web"); err != nil || !found || got.Release != "r2" || got.Checksum != "c2" || got.Fields["port"] != "f1" {
+	if got, found, err := s.DeployStateOf(ctx, "web"); err != nil || !found || got.Release != "r2" || got.Checksum != "c2" || got.Fields["port"] != "f1" || got.Templates["port"] != "t1" {
 		t.Errorf("DeployStateOf() = %+v, %v, %v", got, found, err)
 	}
 	if err := s.ForgetDeployState(ctx, "web"); err != nil {
@@ -1042,6 +1042,15 @@ func TestDeployKeysNameTheirApps(t *testing.T) {
 	}
 	if err := s.Register(ctx, Registration{Name: "web", Repo: "web", Domain: "web.example.com"}); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := s.CreateScopedToken(ctx, "pr", ScopePreview, time.Time{}); err == nil {
+		t.Error("a preview key for every app was created")
+	}
+	if _, err := s.CreateScopedToken(ctx, "pr", ScopePreview, time.Time{}, "api"); err == nil {
+		t.Error("a preview key for an app that is not registered was created")
+	}
+	if _, err := s.CreateScopedToken(ctx, "pr", ScopePreview, time.Time{}, "web"); err != nil {
+		t.Errorf("preview key: %v", err)
 	}
 	tok, err := s.CreateScopedToken(ctx, "ci", ScopeDeploy, time.Time{}, "web")
 	if err != nil {

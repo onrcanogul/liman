@@ -35,6 +35,10 @@ const (
 	// nothing else: it is refused everywhere but on the trigger endpoint,
 	// which in turn takes no other kind. It always names its apps.
 	ScopeDeploy = "deploy"
+	// ScopePreview may ask what a deploy of its apps would change, and
+	// nothing else: it deploys nothing. It is the key for pull request
+	// pipelines, whose workflow file the pull request itself can change.
+	ScopePreview = "preview"
 )
 
 // TokenInfo describes a token without revealing it.
@@ -92,13 +96,14 @@ func (s *Store) CreateScopedToken(ctx context.Context, name, scope string, expir
 	if len(name) > 64 || !tokenNameRe.MatchString(name) {
 		return "", fmt.Errorf("token name %q: use up to 64 letters, digits, dots, dashes and underscores", name)
 	}
-	if scope != ScopeAdmin && scope != ScopeRead && scope != ScopeDeploy {
+	if scope != ScopeAdmin && scope != ScopeRead && scope != ScopeDeploy && scope != ScopePreview {
 		return "", fmt.Errorf("unknown token scope %q", scope)
 	}
 	// A deploy key for every app would be a key that can roll out any
-	// image of any app from anywhere: it is always limited.
-	if scope == ScopeDeploy && len(apps) == 0 {
-		return "", fmt.Errorf("token %q: a deploy key must name its apps", name)
+	// image of any app from anywhere: it is always limited. A preview key
+	// is too, for the same registrations.
+	if (scope == ScopeDeploy || scope == ScopePreview) && len(apps) == 0 {
+		return "", fmt.Errorf("token %q: a %s key must name its apps", name, scope)
 	}
 	for _, a := range apps {
 		if a == "" {
@@ -124,8 +129,8 @@ func (s *Store) CreateScopedToken(ctx context.Context, name, scope string, expir
 	defer func() { _ = tx.Rollback() }()
 
 	// A deploy key is for registered apps: the registration is what fixes
-	// the repository and the domain it cannot change.
-	if scope == ScopeDeploy {
+	// the repository and the domain it cannot change. So is a preview key.
+	if scope == ScopeDeploy || scope == ScopePreview {
 		for _, a := range apps {
 			var one int
 			err := tx.QueryRowContext(ctx, `SELECT 1 FROM apps WHERE name = ?`, a).Scan(&one)

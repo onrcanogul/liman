@@ -17,7 +17,7 @@ import (
 var oldSchema = store.SchemaVersion() - 1
 
 // downgrade turns the database in home back into what the previous schema
-// version left: the last migration (registrations) undone. A new
+// version left: the last migration (template checksums) undone. A new
 // migration has to be undone here instead.
 func downgrade(t *testing.T, home string) {
 	t.Helper()
@@ -27,7 +27,7 @@ func downgrade(t *testing.T, home string) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
-	for _, q := range []string{"DROP TABLE apps", "DROP TABLE app_state", "CREATE TABLE app_definitions (app TEXT PRIMARY KEY, definition BLOB NOT NULL, updated_at TEXT NOT NULL)", fmt.Sprintf("PRAGMA user_version = %d", oldSchema)} {
+	for _, q := range []string{"ALTER TABLE app_state DROP COLUMN templates", fmt.Sprintf("PRAGMA user_version = %d", oldSchema)} {
 		if _, err := db.ExecContext(ctx, q); err != nil {
 			t.Fatalf("%s: %v", q, err)
 		}

@@ -137,8 +137,13 @@ type DeployState struct {
 	// Checksum is the HMAC of the whole definition, Fields that of each
 	// value by its path ("env.LOG_LEVEL"): enough to tell whether and
 	// where a definition changed, without keeping any value.
-	Checksum  string
-	Fields    map[string]string
+	Checksum string
+	Fields   map[string]string
+	// Templates holds the HMAC of each value as the definition writes it,
+	// before its variables are filled in: what a preview, which has no
+	// secrets, can compare. Empty for a state saved before there were
+	// any.
+	Templates map[string]string
 	UpdatedAt time.Time
 }
 
@@ -148,11 +153,16 @@ func (s *Store) SaveDeployState(ctx context.Context, st DeployState) error {
 	if err != nil {
 		return fmt.Errorf("save deploy state of %s: %w", st.App, err)
 	}
+	templates, err := json.Marshal(st.Templates)
+	if err != nil {
+		return fmt.Errorf("save deploy state of %s: %w", st.App, err)
+	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO app_state (app, release, image, checksum, fields, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO app_state (app, release, image, checksum, fields, templates, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (app) DO UPDATE SET release = excluded.release, image = excluded.image,
-		   checksum = excluded.checksum, fields = excluded.fields, updated_at = excluded.updated_at`,
-		st.App, st.Release, st.Image, st.Checksum, string(fields), formatTime(time.Now()))
+		   checksum = excluded.checksum, fields = excluded.fields, templates = excluded.templates,
+		   updated_at = excluded.updated_at`,
+		st.App, st.Release, st.Image, st.Checksum, string(fields), string(templates), formatTime(time.Now()))
 	if err != nil {
 		return fmt.Errorf("save deploy state of %s: %w", st.App, err)
 	}
@@ -162,9 +172,9 @@ func (s *Store) SaveDeployState(ctx context.Context, st DeployState) error {
 // DeployStateOf returns app's deploy state; found is false if there is
 // none.
 func (s *Store) DeployStateOf(ctx context.Context, app string) (st DeployState, found bool, err error) {
-	var fields, updated string
-	err = s.db.QueryRowContext(ctx, `SELECT app, release, image, checksum, fields, updated_at FROM app_state WHERE app = ?`, app).
-		Scan(&st.App, &st.Release, &st.Image, &st.Checksum, &fields, &updated)
+	var fields, templates, updated string
+	err = s.db.QueryRowContext(ctx, `SELECT app, release, image, checksum, fields, templates, updated_at FROM app_state WHERE app = ?`, app).
+		Scan(&st.App, &st.Release, &st.Image, &st.Checksum, &fields, &templates, &updated)
 	if errors.Is(err, sql.ErrNoRows) {
 		return DeployState{}, false, nil
 	}
@@ -172,6 +182,9 @@ func (s *Store) DeployStateOf(ctx context.Context, app string) (st DeployState, 
 		return DeployState{}, false, fmt.Errorf("read deploy state of %s: %w", app, err)
 	}
 	if err := json.Unmarshal([]byte(fields), &st.Fields); err != nil {
+		return DeployState{}, false, fmt.Errorf("read deploy state of %s: %w", app, err)
+	}
+	if err := json.Unmarshal([]byte(templates), &st.Templates); err != nil {
 		return DeployState{}, false, fmt.Errorf("read deploy state of %s: %w", app, err)
 	}
 	if st.UpdatedAt, err = parseTime(updated); err != nil {
