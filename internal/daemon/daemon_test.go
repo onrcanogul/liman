@@ -829,3 +829,93 @@ func TestAppCreateRefusals(t *testing.T) {
 		t.Errorf("a taken domain: code %d, stderr %q", code, td.stderr.String())
 	}
 }
+
+func TestAppKeysLifecycle(t *testing.T) {
+	td := newTestDaemon(t)
+	ctx := context.Background()
+	lookup := func(token string) (store.TokenInfo, bool) {
+		t.Helper()
+		st, err := store.Open(ctx, filepath.Join(td.Home, "liman.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = st.Close() }()
+		info, ok, err := st.LookupToken(ctx, token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info, ok
+	}
+	run := func(args ...string) string {
+		t.Helper()
+		td.stdout.buf.Reset()
+		if code := td.Run(ctx, args); code != exitOK {
+			t.Fatalf("%v: code %d, %s", args, code, td.stderr.String())
+		}
+		return td.stdout.String()
+	}
+
+	out := run("app", "create", "web", "--repo", "r.example.com/web", "--domain", "web.example.com", "--preview-key")
+	keys := tokenRe.FindAllString(out, -1)
+	if len(keys) != 2 || !strings.Contains(out, `preview key "web-pr" for web`) {
+		t.Fatalf("app create --preview-key printed:\n%s", out)
+	}
+	deployKey, previewKey := keys[0], keys[1]
+	if out := run("app", "list"); !strings.Contains(out, "web-ci (deploy), web-pr (preview)") {
+		t.Errorf("app list:\n%s", out)
+	}
+
+	// At once: the old deploy key stops, the preview key is untouched.
+	out = run("app", "rotate-key", "web", "--key", "web-ci-2")
+	second := tokenRe.FindString(out)
+	if _, ok := lookup(deployKey); ok || !strings.Contains(out, "Revoked: web-ci.") {
+		t.Errorf("rotate-key left the old key working:\n%s", out)
+	}
+	if info, ok := lookup(second); !ok || info.Scope != store.ScopeDeploy || !slices.Equal(info.Apps, []string{"web"}) {
+		t.Errorf("the new key = %+v, %v", info, ok)
+	}
+	if _, ok := lookup(previewKey); !ok {
+		t.Error("rotating the deploy key revoked the preview key")
+	}
+
+	// Later: the old one keeps working for the hour, and says so.
+	out = run("app", "rotate-key", "web", "--keep-old", "1h")
+	if info, ok := lookup(second); !ok || info.ExpiresAt.IsZero() || !strings.Contains(out, "Still working until") {
+		t.Errorf("rotate-key --keep-old: %+v, %v\n%s", info, ok, out)
+	}
+	if out := run("app", "list"); !regexp.MustCompile(`web-ci-2 \(deploy, until [^)]+\), web-ci-\d{8}-\d{6} \(deploy\)`).MatchString(out) {
+		t.Errorf("app list after keeping the old key:\n%s", out)
+	}
+
+	// Deleting the app takes every key with it, and registering the name
+	// again brings none back.
+	out = run("app", "delete", "web")
+	if !strings.Contains(out, "Revoked: ") || !strings.Contains(out, "web-pr") {
+		t.Errorf("app delete:\n%s", out)
+	}
+	run("app", "create", "web", "--repo", "r.example.com/web", "--domain", "web.example.com")
+	for _, k := range []string{second, previewKey} {
+		if _, ok := lookup(k); ok {
+			t.Error("a key of the deleted app works again after registering the name anew")
+		}
+	}
+
+	for _, tt := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"app", "rotate-key", "web", "--keep-old", "1d"}, "--keep-old"},
+		{[]string{"app", "rotate-key", "web", "--keep-old", "200h"}, "at most 168h"},
+		{[]string{"app", "create", "api", "--repo", "r.example.com/api", "--domain", "api.example.com", "--preview-client", "x"}, "only makes sense together with --preview-key"},
+		{[]string{"app", "create", "api", "--repo", "r.example.com/api", "--domain", "api.example.com", "--preview-key", "--write-client", "x"}, "together, or neither"},
+	} {
+		td.stderr.buf.Reset()
+		if code := td.Run(ctx, tt.args); code != exitUsage || !strings.Contains(td.stderr.String(), tt.want) {
+			t.Errorf("%v: code %d, stderr %q; want %q", tt.args, code, td.stderr.String(), tt.want)
+		}
+	}
+	td.stderr.buf.Reset()
+	if code := td.Run(ctx, []string{"app", "rotate-key", "nope"}); code != exitError || !strings.Contains(td.stderr.String(), "not registered") {
+		t.Errorf("rotate-key of an app that is not registered: code %d, %s", code, td.stderr.String())
+	}
+}

@@ -68,12 +68,20 @@ Usage:
                                   what a deploy would change
   limand app create <name> --repo <repository> --domain <domain>
                       [--key <name>] [--write-client <file>] [--url <url>]
+                      [--preview-key [--preview-client <file>]]
                                   Register an app for deploys from CI: its
                                   image repository (no tag) and its domain,
                                   which its pipeline cannot change. Creates
                                   its deploy key, named <name>-ci unless
-                                  --key, printed once
-  limand app list                 List registered apps and their last trigger
+                                  --key, printed once; with --preview-key
+                                  also a preview key, <name>-pr
+  limand app list                 List registered apps, their last trigger
+                                  and their keys
+  limand app rotate-key <name> [--preview] [--keep-old <1h>] [--key <name>]
+                      [--write-client <file>] [--url <url>]
+                                  Give an app a new deploy (or preview) key
+                                  and retire the old ones: at once, or, with
+                                  --keep-old, when that time has passed
   limand app delete <name>        Unregister an app and revoke its deploy and
                                   preview keys; its containers keep running
                                   until stopped
