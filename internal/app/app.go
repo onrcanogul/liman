@@ -55,8 +55,14 @@ type App struct {
 	Domain string `yaml:"domain"`
 
 	// Port is the port the app listens on inside the container. The host
-	// port is not part of the definition; liman allocates it.
+	// port is not part of the definition; liman allocates it, unless the
+	// app is published on a fixed one.
 	Port int `yaml:"port"`
+
+	// Publish puts the app on fixed endpoints of the server, for a load
+	// balancer or a proxy liman does not drive. With one endpoint a
+	// release replaces the one before; with two they take turns.
+	Publish Publish `yaml:"publish"`
 
 	// Env holds environment variables passed to the container.
 	Env map[string]string `yaml:"env"`
@@ -89,12 +95,17 @@ type App struct {
 // Worker reports whether the app is a worker: no domain, no port, no proxy.
 func (a *App) Worker() bool { return a.Kind == KindWorker }
 
-// Strategy is the deploy strategy, with the default filled in.
+// Strategy is the deploy strategy, with the default filled in. One fixed
+// port cannot hold two releases, so an app published on one replaces.
 func (a *App) Strategy() string {
-	if a.Deploy.Strategy == "" {
+	switch {
+	case a.Deploy.Strategy != "":
+		return a.Deploy.Strategy
+	case len(a.Publish) == 1:
+		return StrategyReplace
+	default:
 		return StrategyOverlap
 	}
-	return a.Deploy.Strategy
 }
 
 // DefaultSettle is how long a worker without a health check of its own must

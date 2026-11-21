@@ -107,9 +107,9 @@ func (a *App) Validate() error {
 
 	switch a.Kind {
 	case "", KindWeb:
-		if a.Domain == "" {
-			errs = append(errs, errors.New("domain: is required for a web app; for a process that serves no requests (a queue consumer, a scheduler, a bot) write kind: worker"))
-		} else if len(a.Domain) > maxDomainLength || !domainRe.MatchString(a.Domain) {
+		if a.Domain == "" && len(a.Publish) == 0 {
+			errs = append(errs, errors.New("domain: a web app needs a domain, or publish for a fixed port; for a process that serves no requests (a queue consumer, a scheduler, a bot) write kind: worker"))
+		} else if a.Domain != "" && (len(a.Domain) > maxDomainLength || !domainRe.MatchString(a.Domain)) {
 			errs = append(errs, fmt.Errorf("domain: must be a lowercase host name such as api.example.com, got %q", a.Domain))
 		}
 		if a.Port < 1 || a.Port > 65535 {
@@ -126,6 +126,9 @@ func (a *App) Validate() error {
 		}
 		if a.Healthcheck != nil && a.Healthcheck.Path != "" {
 			errs = append(errs, errors.New("healthcheck.path: a worker has no port to ask; give the image a HEALTHCHECK, or rely on healthcheck.settle"))
+		}
+		if len(a.Publish) > 0 {
+			errs = append(errs, errors.New("publish: a worker listens on no port; remove it, or make it kind: web"))
 		}
 	default:
 		errs = append(errs, fmt.Errorf("kind: must be web or worker, got %q", a.Kind))
@@ -147,6 +150,25 @@ func (a *App) Validate() error {
 	case "", StrategyOverlap, StrategyReplace:
 	default:
 		errs = append(errs, fmt.Errorf("deploy.strategy: must be overlap or replace, got %q", a.Deploy.Strategy))
+	}
+
+	switch {
+	case len(a.Publish) > 2:
+		errs = append(errs, fmt.Errorf("publish: at most two endpoints (one, or two the releases take turns on), got %d", len(a.Publish)))
+	case len(a.Publish) == 2 && a.Publish[0].Address() == a.Publish[1].Address():
+		errs = append(errs, fmt.Errorf("publish: the two endpoints are the same, %s", a.Publish[0].Address()))
+	case len(a.Publish) == 1 && a.Deploy.Strategy == StrategyOverlap:
+		errs = append(errs, errors.New("deploy.strategy: one fixed port cannot hold two releases at once; leave it out (they replace each other), or publish two ports"))
+	}
+	// The proxy reaches an app on the loopback address; one published on
+	// another address only is out of its reach.
+	if a.Domain != "" {
+		for _, e := range a.Publish {
+			if ip := e.IP(); ip != DefaultPublishHost && ip != "0.0.0.0" && ip != "::" {
+				errs = append(errs, fmt.Errorf("publish: with a domain, publish on 127.0.0.1 or 0.0.0.0, where the proxy reaches the app; %s is out of its reach", e.Address()))
+				break
+			}
+		}
 	}
 
 	if len(a.Env) > maxEnvVars {

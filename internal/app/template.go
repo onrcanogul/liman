@@ -125,6 +125,9 @@ func (a *App) Fields() map[string]string {
 	if a.Deploy.Strategy != "" && a.Deploy.Strategy != StrategyOverlap {
 		f["deploy.strategy"] = a.Deploy.Strategy
 	}
+	if len(a.Publish) > 0 {
+		f["publish"] = a.Publish.String()
+	}
 	return f
 }
 
