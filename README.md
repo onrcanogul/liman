@@ -4,7 +4,8 @@
 
 A small PaaS for a single server, written in Go. It automates the deploy steps
 usually done by hand over SSH: pull an image, start a container with limits,
-health check it, point Nginx at it, remove the old one.
+health check it, point the proxy (Nginx, Caddy or Traefik) at it, remove the
+old one.
 
 This is a learning project. See [ROADMAP.md](ROADMAP.md) for the plan and
 current status.
@@ -13,7 +14,7 @@ current status.
 
 ```
 your machine                         the server
-liman (CLI)  ──HTTP + token──>  limand (daemon)  ──>  Docker, Nginx
+liman (CLI)  ──HTTP + token──>  limand (daemon)  ──>  Docker or Podman, a proxy
 ```
 
 - `limand` runs on the server and does the work.
