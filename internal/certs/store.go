@@ -23,12 +23,26 @@ import (
 	"github.com/onrcanogul/liman/internal/app"
 )
 
-// Issuable reports whether a CA could issue a certificate for domain.
-// Nothing can prove control of a .localhost name from outside, so asking
-// would only fail; such domains stay on plain HTTP quietly.
+// Issuable reports whether a public CA could issue a certificate for
+// domain. Names under the top-level domains reserved for local and test use
+// can never be proven from outside, so asking would only fail; such domains
+// stay on plain HTTP quietly.
 func Issuable(domain string) bool {
-	return domain != "" && domain != "localhost" && !strings.HasSuffix(domain, ".localhost") && app.ValidDomain(domain)
+	if !app.ValidDomain(domain) {
+		return false
+	}
+	for _, tld := range reservedTLDs {
+		if domain == tld || strings.HasSuffix(domain, "."+tld) {
+			return false
+		}
+	}
+	return true
 }
+
+// reservedTLDs are never delegated in public DNS: RFC 2606 and 6761
+// (localhost, test, example, invalid), RFC 6762 (local), RFC 8375
+// (home.arpa) and ICANN's private-use internal.
+var reservedTLDs = []string{"localhost", "test", "example", "invalid", "local", "home.arpa", "internal"}
 
 // ErrNoCertificate is returned for a domain without a certificate on disk.
 var ErrNoCertificate = errors.New("no certificate")
