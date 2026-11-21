@@ -40,6 +40,7 @@ type installer struct {
 	choices     Choices
 	proxyBinary string
 	upgrade     bool
+	uid         int // the liman user's, once it exists
 	oldVersion  string
 	newVersion  string
 	wroteConfig bool
@@ -106,7 +107,7 @@ func (in *installer) settle() error {
 		if err != nil {
 			return fmt.Errorf("%s exists but cannot be read: %w", path, err)
 		}
-		in.choices = Choices{Engine: cfg.Engine.Driver, Proxy: cfg.Proxy.Driver, Listen: cfg.Daemon.Listen, HooksListen: cfg.Hooks.Listen}
+		in.choices = Choices{Engine: cfg.Engine.Driver, Rootless: cfg.Engine.Rootless, Proxy: cfg.Proxy.Driver, Listen: cfg.Daemon.Listen, HooksListen: cfg.Hooks.Listen}
 		if in.choices.Engine == "" {
 			in.choices.Engine = "docker"
 		}
@@ -141,7 +142,7 @@ func (in *installer) settle() error {
 		hooks = "trigger endpoint on " + c.HooksListen
 	}
 	fmt.Fprintf(in.Stdout, "\nInstalling: %s, proxy %s, API on %s, %s.\nThe same without questions:\n  sudo limand install --binary %s %s\n\n",
-		c.Engine, c.Proxy, c.Listen, hooks, in.Binary, c.Flags())
+		c.EngineLabel(), c.Proxy, c.Listen, hooks, in.Binary, c.Flags())
 	return nil
 }
 
@@ -174,6 +175,11 @@ func (in *installer) check() error {
 	if c.Engine == "docker" {
 		if _, err := in.Run(in.ctx, "getent", "group", "docker"); err != nil {
 			return errors.New("there is no docker group; is Docker installed from a package?")
+		}
+	}
+	if c.Engine == "podman" && c.Rootless {
+		if err := in.checkRootless(); err != nil {
+			return err
 		}
 	}
 	if c.Proxy == "none" {
@@ -213,6 +219,46 @@ func (in *installer) check() error {
 	return nil
 }
 
+// checkRootless refuses a machine where the liman user's own Podman cannot
+// run, or cannot keep the limits an app asks for.
+func (in *installer) checkRootless() error {
+	for _, prog := range []string{"newuidmap", "newgidmap"} {
+		if in.Look(prog) == "" {
+			return fmt.Errorf("%s is missing; rootless Podman needs it (the uidmap package), or install with --rootful", prog)
+		}
+	}
+	for _, prog := range []string{"loginctl", "usermod"} {
+		if in.Look(prog) == "" {
+			return fmt.Errorf("%s is missing; it is needed to set up rootless Podman", prog)
+		}
+	}
+	found := false
+	for _, f := range []string{"/etc/systemd/user/podman.socket", "/usr/lib/systemd/user/podman.socket", "/lib/systemd/user/podman.socket"} {
+		if _, err := os.Stat(f); err == nil {
+			found = true
+		}
+	}
+	if !found {
+		return errors.New("podman.socket for users (under /usr/lib/systemd/user) is missing; is Podman installed from a package?")
+	}
+	// Limits need cgroup v2, and the cpu and memory controllers given to
+	// the user. Checked again on the real directory once liman's systemd
+	// runs; here what systemd would give it, before anything changes.
+	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
+		return errors.New("rootless Podman needs cgroup v2 to enforce memory and CPU limits, and this machine has v1; install with --rootful")
+	}
+	uid := 65534
+	if u, err := user.Lookup("liman"); err == nil {
+		uid, _ = strconv.Atoi(u.Uid)
+	}
+	out, _ := in.Run(in.ctx, "systemctl", "show", "-P", "DelegateControllers", fmt.Sprintf("user@%d.service", uid))
+	// Empty: this systemd does not say; the real directory is checked later.
+	if have := strings.TrimSpace(out); have != "" && !Delegated(have) {
+		return errors.New(DelegationHelp(have))
+	}
+	return nil
+}
+
 func (in *installer) user() error {
 	in.step("User liman")
 	if _, err := user.Lookup("liman"); err == nil {
@@ -226,10 +272,43 @@ func (in *installer) user() error {
 		}
 		in.detail("created")
 	}
-	if in.choices.Engine == "docker" {
+	u, err := user.Lookup("liman")
+	if err != nil {
+		return err
+	}
+	in.uid, _ = strconv.Atoi(u.Uid)
+	switch {
+	case in.choices.Engine == "docker":
 		// Also for a user that already existed.
 		return in.cmd("usermod", "-aG", "docker", "liman")
+	case in.choices.Rootless:
+		return in.subIDs()
 	}
+	return nil
+}
+
+// subIDs gives the liman user subordinate ids for its containers:
+// useradd --system gives a system user none (a trial).
+func (in *installer) subIDs() error {
+	uids, _ := os.ReadFile("/etc/subuid")
+	gids, _ := os.ReadFile("/etc/subgid")
+	if HasSubIDs(uids, "liman") && HasSubIDs(gids, "liman") {
+		in.detail("has subordinate ids")
+		return nil
+	}
+	start := FreeSubIDStart(uids, gids)
+	r := fmt.Sprintf("%d-%d", start, start+SubIDCount-1)
+	args := []string{}
+	if !HasSubIDs(uids, "liman") {
+		args = append(args, "--add-subuids", r)
+	}
+	if !HasSubIDs(gids, "liman") {
+		args = append(args, "--add-subgids", r)
+	}
+	if err := in.cmd("usermod", append(args, "liman")...); err != nil {
+		return err
+	}
+	in.detail("subordinate ids %s, for its containers", r)
 	return nil
 }
 
@@ -275,7 +354,7 @@ func (in *installer) state() error {
 		in.detail("config.yaml exists, left as it is")
 		return nil
 	}
-	data, err := ConfigYAML(in.choices, in.proxyBinary)
+	data, err := ConfigYAML(in.choices, in.proxyBinary, in.uid)
 	if err != nil {
 		return err
 	}
@@ -290,6 +369,9 @@ func (in *installer) state() error {
 func (in *installer) engine() error {
 	if in.choices.Engine != "podman" {
 		return nil
+	}
+	if in.choices.Rootless {
+		return in.rootlessEngine()
 	}
 	in.step("Podman's API socket, for the liman group")
 	if err := writeFile(PodmanSocketDropIn, []byte(PodmanSocketConf()), 0o644, ""); err != nil {
@@ -310,6 +392,53 @@ func (in *installer) engine() error {
 	}
 	in.detail("/run/podman/podman.sock, group liman")
 	return nil
+}
+
+// rootlessEngine starts the liman user's own systemd at boot, and Podman's
+// socket under it.
+func (in *installer) rootlessEngine() error {
+	in.step("Podman, rootless: the liman user's own")
+	// Linger: the user's systemd runs from boot, without a login.
+	if err := in.cmd("loginctl", "enable-linger", "liman"); err != nil {
+		return err
+	}
+	unit := fmt.Sprintf("user@%d.service", in.uid)
+	if !in.waitFor(30*time.Second, func() bool {
+		out, _ := in.Run(in.ctx, "systemctl", "is-active", unit)
+		return strings.TrimSpace(out) == "active"
+	}) {
+		return fmt.Errorf("%s did not start after loginctl enable-linger liman", unit)
+	}
+	in.detail("%s runs from boot (linger)", unit)
+	controllers := fmt.Sprintf("/sys/fs/cgroup/user.slice/user-%d.slice/%s/cgroup.controllers", in.uid, unit)
+	if data, err := os.ReadFile(controllers); err == nil && !Delegated(string(data)) {
+		return errors.New(DelegationHelp(string(data)))
+	}
+	if err := in.cmd("systemctl", "--user", "-M", "liman@", "enable", "--now", "podman.socket"); err != nil {
+		return err
+	}
+	socket := RootlessSocket(in.uid)
+	if !in.waitFor(10*time.Second, func() bool {
+		fi, err := os.Stat(socket)
+		return err == nil && fi.Mode()&fs.ModeSocket != 0
+	}) {
+		return fmt.Errorf("no Podman socket at %s after starting podman.socket for liman", socket)
+	}
+	in.detail("%s, the liman user's only", socket)
+	return nil
+}
+
+// waitFor polls ok every half second until it holds or limit passes.
+func (in *installer) waitFor(limit time.Duration, ok func() bool) bool {
+	for end := time.Now().Add(limit); ; {
+		if ok() {
+			return true
+		}
+		if time.Now().After(end) {
+			return false
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func (in *installer) proxy() error {
@@ -411,7 +540,7 @@ var (
 
 func (in *installer) daemonUnit() error {
 	in.step("systemd unit")
-	unit, err := DaemonUnit(in.choices.Engine, in.choices.Proxy)
+	unit, err := DaemonUnit(in.choices, in.uid)
 	if err != nil {
 		return err
 	}

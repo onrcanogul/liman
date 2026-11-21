@@ -17,7 +17,7 @@ import (
 )
 
 func (d *Daemon) runInstall(ctx context.Context, args []string) int {
-	const synopsis = "limand install [--binary <limand>] [--engine docker|podman] [--proxy nginx|caddy|traefik|none]\n" +
+	const synopsis = "limand install [--binary <limand>] [--engine docker|podman [--rootful]] [--proxy nginx|caddy|traefik|none]\n" +
 		"                      [--listen <private address:port>] [--hooks-listen <address:port> | --no-hooks] [--yes]"
 
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
@@ -25,6 +25,7 @@ func (d *Daemon) runInstall(ctx context.Context, args []string) int {
 	var f install.Flags
 	binary := fs.String("binary", "", "the limand to install (default: this one)")
 	fs.StringVar(&f.Engine, "engine", "", "docker or podman")
+	fs.BoolVar(&f.Rootful, "rootful", false, "Podman as root, instead of as the liman user")
 	fs.StringVar(&f.Proxy, "proxy", "", "nginx, caddy, traefik or none")
 	fs.StringVar(&f.Listen, "listen", "", "the API's address, on a private network")
 	fs.StringVar(&f.HooksListen, "hooks-listen", "", "turn on the trigger endpoint, at this address")

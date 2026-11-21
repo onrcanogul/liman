@@ -17,13 +17,18 @@ type Flags struct {
 	Listen      string // the API's address
 	HooksListen string // the trigger endpoint's address
 	NoHooks     bool   // no trigger endpoint
+	// Rootful runs Podman as root, as Docker runs, instead of as the
+	// liman user (the default).
+	Rootful bool
 	// Yes takes what the installer found without asking.
 	Yes bool
 }
 
 // Choices are what will be installed.
 type Choices struct {
-	Engine      string
+	Engine string
+	// Rootless: Podman runs as the liman user. Only with podman.
+	Rootless    bool
 	Proxy       string // "none" for none
 	Listen      string
 	HooksListen string // "" for none
@@ -31,13 +36,28 @@ type Choices struct {
 
 // Flags returns the command line that installs the same without questions.
 func (c Choices) Flags() string {
-	parts := []string{"--engine " + c.Engine, "--proxy " + c.Proxy, "--listen " + c.Listen}
+	parts := []string{"--engine " + c.Engine}
+	if c.Engine == "podman" && !c.Rootless {
+		parts = append(parts, "--rootful")
+	}
+	parts = append(parts, "--proxy "+c.Proxy, "--listen "+c.Listen)
 	if c.HooksListen != "" {
 		parts = append(parts, "--hooks-listen "+c.HooksListen)
 	} else {
 		parts = append(parts, "--no-hooks")
 	}
 	return strings.Join(parts, " ")
+}
+
+// EngineLabel is the engine as the installer says it: "podman (rootless)".
+func (c Choices) EngineLabel() string {
+	switch {
+	case c.Engine != "podman":
+		return c.Engine
+	case c.Rootless:
+		return "podman (rootless)"
+	}
+	return "podman (rootful)"
 }
 
 // Option is one answer to a question.
@@ -75,6 +95,9 @@ func Choose(f Facts, flags Flags, ask Asker) (Choices, error) {
 	var c Choices
 	var err error
 	if c.Engine, err = chooseEngine(f, flags.Engine, ask); err != nil {
+		return Choices{}, err
+	}
+	if c.Rootless, err = chooseRootless(c.Engine, flags, ask); err != nil {
 		return Choices{}, err
 	}
 	if c.Proxy, err = chooseProxy(f, flags.Proxy, ask); err != nil {
@@ -134,6 +157,22 @@ func chooseEngine(f Facts, flag string, ask Asker) (string, error) {
 		return "", err
 	}
 	return options[i].Value, nil
+}
+
+// chooseRootless: Podman runs as the liman user unless --rootful says
+// otherwise, or the person answers no.
+func chooseRootless(engine string, flags Flags, ask Asker) (bool, error) {
+	switch {
+	case engine != "podman" && flags.Rootful:
+		return false, fmt.Errorf("--rootful is for Podman; %s is the engine", engine)
+	case engine != "podman":
+		return false, nil
+	case flags.Rootful:
+		return false, nil
+	case ask == nil:
+		return true, nil
+	}
+	return ask.Confirm("Podman rootless: containers run as the liman user, which is then not root's equal?", true)
 }
 
 // firstTrue is the index of the first true, or 0.

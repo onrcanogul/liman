@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"embed"
 	"fmt"
+	"strconv"
 	"strings"
 	"text/template"
 
@@ -54,13 +55,17 @@ type configFile struct {
 	Hooks *struct {
 		Listen string `yaml:"listen"`
 	} `yaml:"hooks,omitempty"`
-	Engine *struct {
-		Driver string `yaml:"driver"`
-	} `yaml:"engine,omitempty"`
-	Proxy  *proxyFile `yaml:"proxy,omitempty"`
+	Engine *engineFile `yaml:"engine,omitempty"`
+	Proxy  *proxyFile  `yaml:"proxy,omitempty"`
 	Backup struct {
 		Dir string `yaml:"dir"`
 	} `yaml:"backup"`
+}
+
+type engineFile struct {
+	Driver   string `yaml:"driver"`
+	Rootless bool   `yaml:"rootless,omitempty"`
+	Socket   string `yaml:"socket,omitempty"`
 }
 
 type proxyFile struct {
@@ -71,8 +76,9 @@ type proxyFile struct {
 }
 
 // ConfigYAML is config.yaml for c. proxyBinary is the proxy's program, for
-// the commands that run it through sudo.
-func ConfigYAML(c Choices, proxyBinary string) ([]byte, error) {
+// the commands that run it through sudo; uid is the liman user's, whose
+// runtime directory holds rootless Podman's socket.
+func ConfigYAML(c Choices, proxyBinary string, uid int) ([]byte, error) {
 	var f configFile
 	f.Daemon.Listen = c.Listen
 	f.Backup.Dir = BackupDir
@@ -82,9 +88,13 @@ func ConfigYAML(c Choices, proxyBinary string) ([]byte, error) {
 		}{c.HooksListen}
 	}
 	if c.Engine != "docker" {
-		f.Engine = &struct {
-			Driver string `yaml:"driver"`
-		}{c.Engine}
+		f.Engine = &engineFile{Driver: c.Engine}
+		if c.Rootless {
+			// Written out, not derived: which engine the daemon talks to
+			// is in the file, not guessed from what it finds.
+			f.Engine.Rootless = true
+			f.Engine.Socket = RootlessSocket(uid)
+		}
 	}
 	if p, ok := proxyFor(c.Proxy, proxyBinary); ok {
 		pf := &proxyFile{Driver: c.Proxy, ConfDir: p.ConfDir}
@@ -181,26 +191,99 @@ func PodmanTmpfilesConf() string {
 		"d /run/podman 0750 root liman -\n"
 }
 
+// RuntimeDir is a user's runtime directory, which systemd makes for a
+// lingering user and empties when the user's manager stops.
+func RuntimeDir(uid int) string { return "/run/user/" + strconv.Itoa(uid) }
+
+// RootlessSocket is the API socket of a user's own Podman, which that
+// user's systemd opens with podman.socket.
+func RootlessSocket(uid int) string { return RuntimeDir(uid) + "/podman/podman.sock" }
+
+// HasSubIDs reports whether /etc/subuid (or /etc/subgid) content gives
+// name a range.
+func HasSubIDs(content []byte, name string) bool {
+	for _, line := range strings.Split(string(content), "\n") {
+		if n, _, ok := strings.Cut(line, ":"); ok && n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// SubIDCount is how many subordinate ids the liman user gets: a whole
+// 16-bit range, what images expect (uid 65534 for nobody).
+const SubIDCount = 65536
+
+// FreeSubIDStart is the first id after every range in the files, and not
+// below 100000: a range nobody else has in either.
+func FreeSubIDStart(files ...[]byte) int {
+	start := 100000
+	for _, content := range files {
+		for _, line := range strings.Split(string(content), "\n") {
+			f := strings.Split(strings.TrimSpace(line), ":")
+			if len(f) != 3 {
+				continue
+			}
+			first, err1 := strconv.Atoi(f[1])
+			count, err2 := strconv.Atoi(f[2])
+			if err1 == nil && err2 == nil && first+count > start {
+				start = first + count
+			}
+		}
+	}
+	return start
+}
+
+// Delegated reports whether a cgroup.controllers list (or systemd's
+// DelegateControllers) has what rootless limits need: cpu and memory.
+func Delegated(controllers string) bool {
+	have := map[string]bool{}
+	for _, c := range strings.Fields(controllers) {
+		have[c] = true
+	}
+	return have["cpu"] && have["memory"]
+}
+
+// DelegationHelp says how to let a user's containers have limits.
+func DelegationHelp(have string) string {
+	if strings.TrimSpace(have) == "" {
+		have = "none"
+	}
+	return "rootless Podman cannot enforce memory and CPU limits here: systemd does not give users the cpu and memory\n" +
+		"cgroup controllers (it gives: " + have + "). liman does not promise limits it cannot keep. Either let it:\n\n" +
+		"  mkdir -p /etc/systemd/system/user@.service.d\n" +
+		"  printf '[Service]\\nDelegate=cpu memory pids\\n' > /etc/systemd/system/user@.service.d/delegate.conf\n" +
+		"  systemctl daemon-reload\n\n" +
+		"and run this again, or install with --rootful."
+}
+
 //go:embed units
 var units embed.FS
 
 // unitData fills in limand.service.
 type unitData struct {
-	EngineUnit         string // docker.service, podman.socket
+	EngineUnit         string // docker.service, podman.socket, user@<uid>.service
 	SupplementaryGroup string // docker, or none
-	ProxyName          string // Nginx, Caddy, Traefik, or ""
-	ProxyUnit          string
-	ConfDir            string
+	// RuntimeDir is the liman user's runtime directory, for rootless
+	// Podman's socket; "" otherwise.
+	RuntimeDir string
+	ProxyName  string // Nginx, Caddy, Traefik, or ""
+	ProxyUnit  string
+	ConfDir    string
 }
 
-// DaemonUnit is limand.service for an engine and a proxy.
-func DaemonUnit(engine, proxy string) ([]byte, error) {
+// DaemonUnit is limand.service for the choices; uid is the liman user's.
+func DaemonUnit(c Choices, uid int) ([]byte, error) {
 	d := unitData{EngineUnit: "docker.service", SupplementaryGroup: "docker"}
-	if engine == "podman" {
+	switch {
+	case c.Engine == "podman" && c.Rootless:
+		// The engine is the liman user's own, under its systemd.
+		d = unitData{EngineUnit: "user@" + strconv.Itoa(uid) + ".service", RuntimeDir: RuntimeDir(uid)}
+	case c.Engine == "podman":
 		// The socket is the liman group's (PodmanSocketConf).
 		d = unitData{EngineUnit: "podman.socket"}
 	}
-	if p, ok := proxyFor(proxy, ""); ok {
+	if p, ok := proxyFor(c.Proxy, ""); ok {
 		d.ProxyName, d.ProxyUnit, d.ConfDir = p.Name, p.Unit, p.ConfDir
 	}
 	text, err := units.ReadFile("units/limand.service.tmpl")

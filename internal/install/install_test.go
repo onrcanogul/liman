@@ -114,8 +114,17 @@ func TestChooseWithoutQuestions(t *testing.T) {
 
 	// Flags win, and are checked.
 	c, err = Choose(server(), Flags{Engine: "podman", Proxy: "caddy", Listen: "10.8.0.1:9000", HooksListen: "127.0.0.1:7443"}, nil)
-	if err != nil || c != (Choices{"podman", "caddy", "10.8.0.1:9000", "127.0.0.1:7443"}) {
+	if err != nil || c != (Choices{Engine: "podman", Rootless: true, Proxy: "caddy", Listen: "10.8.0.1:9000", HooksListen: "127.0.0.1:7443"}) {
 		t.Errorf("with flags: %+v, %v", c, err)
+	}
+	if got := c.Flags(); got != "--engine podman --proxy caddy --listen 10.8.0.1:9000 --hooks-listen 127.0.0.1:7443" || c.EngineLabel() != "podman (rootless)" {
+		t.Errorf("rootless: Flags() = %s, label %s", got, c.EngineLabel())
+	}
+
+	// Podman is rootless unless --rootful says otherwise.
+	c, err = Choose(server(), Flags{Engine: "podman", Rootful: true, Proxy: "none", Listen: "10.8.0.1:9000"}, nil)
+	if err != nil || c.Rootless || c.Flags() != "--engine podman --rootful --proxy none --listen 10.8.0.1:9000 --no-hooks" || c.EngineLabel() != "podman (rootful)" {
+		t.Errorf("--rootful: %+v, %v, %s", c, err, c.Flags())
 	}
 }
 
@@ -141,6 +150,7 @@ func TestChooseRefuses(t *testing.T) {
 		{"public address", server(), Flags{Listen: "203.0.113.5:7070"}, "--listen 203.0.113.5:7070"},
 		{"proxies but none running", idle, Flags{}, "give --proxy"},
 		{"hooks both ways", server(), Flags{NoHooks: true, HooksListen: "127.0.0.1:7443"}, "contradict"},
+		{"rootful docker", server(), Flags{Rootful: true}, "--rootful is for Podman; docker is the engine"},
 	} {
 		if _, err := Choose(tt.facts, tt.flags, nil); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 			t.Errorf("%s: error = %v, want %q", tt.name, err, tt.wantErr)
@@ -154,14 +164,14 @@ func TestChooseAsks(t *testing.T) {
 	ask := &fakeAsker{
 		choices:  []int{1, 1},                       // Podman, Caddy
 		texts:    []string{"8.8.8.8", "10.1.0.168"}, // a public address first: asked again
-		confirms: []bool{true},
+		confirms: []bool{true, true},                // rootless, the trigger endpoint
 	}
 	c, err := Choose(noWG, Flags{}, ask)
-	want := Choices{Engine: "podman", Proxy: "caddy", Listen: "10.1.0.168:7070", HooksListen: DefaultHooksListen}
+	want := Choices{Engine: "podman", Rootless: true, Proxy: "caddy", Listen: "10.1.0.168:7070", HooksListen: DefaultHooksListen}
 	if err != nil || c != want {
 		t.Fatalf("Choose() = %+v, %v; want %+v", c, err, want)
 	}
-	if len(ask.asked) != 5 || !strings.Contains(ask.asked[3], "not usable") {
+	if len(ask.asked) != 6 || !strings.Contains(ask.asked[1], "rootless") || !strings.Contains(ask.asked[4], "not usable") {
 		t.Errorf("asked %q", ask.asked)
 	}
 
@@ -188,8 +198,9 @@ func TestConfigYAMLLoads(t *testing.T) {
 		{Engine: "podman", Proxy: "caddy", Listen: "10.8.0.1:7070"},
 		{Engine: "docker", Proxy: "traefik", Listen: "10.8.0.1:7070"},
 		{Engine: "podman", Proxy: "none", Listen: "10.8.0.1:7070"},
+		{Engine: "podman", Rootless: true, Proxy: "caddy", Listen: "10.8.0.1:7070"},
 	} {
-		data, err := ConfigYAML(c, "/usr/sbin/nginx")
+		data, err := ConfigYAML(c, "/usr/sbin/nginx", 999)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -205,8 +216,16 @@ func TestConfigYAMLLoads(t *testing.T) {
 		if cfg.Engine.Driver == "" {
 			wantDriver = "docker"
 		}
-		if wantDriver != c.Engine || cfg.Daemon.Listen != c.Listen || cfg.Hooks.Listen != c.HooksListen {
+		if wantDriver != c.Engine || cfg.Daemon.Listen != c.Listen || cfg.Hooks.Listen != c.HooksListen || cfg.Engine.Rootless != c.Rootless {
 			t.Errorf("%+v loaded as %+v", c, cfg)
+		}
+		// The rootless socket is written out; the rootful one is the default.
+		wantSocket := ""
+		if c.Rootless {
+			wantSocket = "/run/user/999/podman/podman.sock"
+		}
+		if cfg.Engine.Socket != wantSocket {
+			t.Errorf("%+v: engine.socket %q, want %q", c, cfg.Engine.Socket, wantSocket)
 		}
 		switch c.Proxy {
 		case "none":
@@ -266,7 +285,7 @@ func TestTraefikWatches(t *testing.T) {
 }
 
 func TestDaemonUnit(t *testing.T) {
-	docker, err := DaemonUnit("docker", "nginx")
+	docker, err := DaemonUnit(Choices{Engine: "docker", Proxy: "nginx"}, 999)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,12 +295,14 @@ func TestDaemonUnit(t *testing.T) {
 		"Wants=network-online.target docker.service\n",
 		"SupplementaryGroups=docker\n",
 		"ReadWritePaths=-/etc/nginx/liman.d\n",
+		"ProtectHome=true\n",
+		"equivalent to root",
 	} {
 		if !strings.Contains(string(docker), want) {
 			t.Errorf("docker+nginx unit lacks %q", want)
 		}
 	}
-	podman, _ := DaemonUnit("podman", "caddy")
+	podman, _ := DaemonUnit(Choices{Engine: "podman", Proxy: "caddy"}, 999)
 	for _, want := range []string{"After=network-online.target podman.socket caddy.service", "ReadWritePaths=-/etc/caddy/liman.d\n"} {
 		if !strings.Contains(string(podman), want) {
 			t.Errorf("podman+caddy unit lacks %q", want)
@@ -290,8 +311,50 @@ func TestDaemonUnit(t *testing.T) {
 	if strings.Contains(string(podman), "SupplementaryGroups") {
 		t.Error("podman unit puts liman in a group; the socket is the liman group's")
 	}
-	none, _ := DaemonUnit("docker", "none")
+	none, _ := DaemonUnit(Choices{Engine: "docker", Proxy: "none"}, 999)
 	if strings.Contains(string(none), "ReadWritePaths") || strings.Contains(string(none), "behind") {
 		t.Errorf("unit without a proxy names one:\n%s", none)
+	}
+
+	// Rootless: after the user's systemd, its runtime directory and
+	// nothing else under /run/user (ProtectHome=true hides the socket: a
+	// trial).
+	rootless, _ := DaemonUnit(Choices{Engine: "podman", Rootless: true, Proxy: "caddy"}, 999)
+	for _, want := range []string{
+		"After=network-online.target user@999.service caddy.service",
+		"Environment=XDG_RUNTIME_DIR=/run/user/999\n",
+		"ProtectHome=tmpfs\nBindPaths=/run/user/999\n",
+		"root's",
+	} {
+		if !strings.Contains(string(rootless), want) {
+			t.Errorf("rootless unit lacks %q:\n%s", want, rootless)
+		}
+	}
+	if strings.Contains(string(rootless), "ProtectHome=true") || strings.Contains(string(rootless), "equivalent to root") || strings.Contains(string(rootless), "SupplementaryGroups") {
+		t.Errorf("rootless unit:\n%s", rootless)
+	}
+}
+
+func TestSubIDs(t *testing.T) {
+	// The runner's /etc/subuid, as the trial found it.
+	subuid := []byte("packer:100000:65536\nrunner:165536:65536\n")
+	if HasSubIDs(subuid, "liman") || !HasSubIDs(subuid, "runner") || HasSubIDs(subuid, "run") {
+		t.Error("HasSubIDs is wrong")
+	}
+	// After every range in either file.
+	if got := FreeSubIDStart(subuid, []byte("packer:100000:65536\nother:300000:10\n")); got != 300010 {
+		t.Errorf("FreeSubIDStart = %d, want 300010", got)
+	}
+	if got := FreeSubIDStart(nil, []byte("# nothing\n")); got != 100000 {
+		t.Errorf("FreeSubIDStart of empty files = %d, want 100000", got)
+	}
+}
+
+func TestDelegated(t *testing.T) {
+	if !Delegated("cpu memory pids\n") || Delegated("pids") || Delegated("memory pids") {
+		t.Error("Delegated is wrong")
+	}
+	if h := DelegationHelp("pids"); !strings.Contains(h, "it gives: pids") || !strings.Contains(h, "Delegate=cpu memory pids") || !strings.Contains(h, "--rootful") {
+		t.Errorf("help:\n%s", h)
 	}
 }

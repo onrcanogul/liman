@@ -25,11 +25,18 @@ Type=simple
 ExecStart=/usr/local/bin/limand
 
 # A user of its own, so the daemon's files belong to nobody else and nothing
-# else's files belong to it. Access to the engine's socket (the docker
-# group, or Podman's socket given to the liman group) is what lets it start
-# containers. That access is equivalent to root (anyone who can talk to the
-# engine can mount the host's disk); the separate user protects against
-# accidents, not against a compromised daemon.
+# else's files belong to it.
+{{- if .RuntimeDir}}
+# The engine is this user's own rootless Podman: its containers run under
+# the user's subordinate ids, and taking over the daemon gives the liman
+# user's rights, not root's.
+{{- else}}
+# Access to the engine's socket (the docker group, or Podman's socket
+# given to the liman group) is what lets it start containers. That access
+# is equivalent to root (anyone who can talk to the engine can mount the
+# host's disk); the separate user protects against accidents, not against
+# a compromised daemon.
+{{- end}}
 User=liman
 Group=liman
 {{- if .SupplementaryGroup}}
@@ -39,6 +46,10 @@ SupplementaryGroups={{.SupplementaryGroup}}
 # The database, the master key and config.yaml live here. systemd creates
 # /var/lib/liman with these permissions before the first start.
 Environment=LIMAN_HOME=/var/lib/liman
+{{- if .RuntimeDir}}
+# Where rootless Podman's socket and podman login's credentials are.
+Environment=XDG_RUNTIME_DIR={{.RuntimeDir}}
+{{- end}}
 StateDirectory=liman
 StateDirectoryMode=0700
 
@@ -61,8 +72,16 @@ ProtectSystem=full
 {{- if .ConfDir}}
 ReadWritePaths=-{{.ConfDir}}
 {{- end}}
+{{- if .RuntimeDir}}
+# /home and /root do not exist for it, nor /run/user but for its own
+# directory there, which holds Podman's socket. (The plain "true" setting
+# would hide that one too.)
+ProtectHome=tmpfs
+BindPaths={{.RuntimeDir}}
+{{- else}}
 # /home and /root do not exist for it.
 ProtectHome=true
+{{- end}}
 # A /tmp of its own, removed when it stops.
 PrivateTmp=true
 ProtectKernelTunables=true
