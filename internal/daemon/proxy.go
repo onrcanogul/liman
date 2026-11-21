@@ -7,6 +7,7 @@ import (
 
 	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/proxy"
+	"github.com/onrcanogul/liman/internal/proxy/caddy"
 	"github.com/onrcanogul/liman/internal/proxy/nginx"
 )
 
@@ -15,6 +16,7 @@ import (
 // *proxy.Manager, whatever proxy is behind it.
 var dialects = map[string]proxy.Dialect{
 	"nginx": nginx.Dialect{},
+	"caddy": caddy.Dialect{},
 }
 
 // newProxy returns the manager for the proxy cfg describes, or nil when
