@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -92,7 +93,7 @@ func (d *Daemon) appCreate(ctx context.Context, args []string) int {
 	token, err := st.CreateScopedToken(ctx, *keyName, store.ScopeDeploy, time.Time{}, name)
 	if err != nil {
 		// A registration nobody can deploy to is no use: undo it.
-		_ = st.Unregister(ctx, name)
+		_, _ = st.Unregister(ctx, name)
 		return d.fail(err)
 	}
 	rec := d.auditor(st)
@@ -104,7 +105,8 @@ func (d *Daemon) appCreate(ctx context.Context, args []string) int {
 		writeClient: *writeClient, url: *url, scope: store.ScopeDeploy,
 	})
 	if code != exitOK {
-		_ = st.Unregister(ctx, name)
+		// Unregistering takes the keys with it.
+		_, _ = st.Unregister(ctx, name)
 		return code
 	}
 	fmt.Fprintf(d.Stdout, "Registered %s: images from %s, served at %s. Its pipeline deploys it with:\n  liman trigger --digest <digest> --file app.yaml\n", name, *repo, *domain)
@@ -155,10 +157,41 @@ func (d *Daemon) appDelete(ctx context.Context, args []string) int {
 	}
 	defer func() { _ = st.Close() }()
 
-	if err := st.Unregister(ctx, name); err != nil {
+	changes, err := st.Unregister(ctx, name)
+	if err != nil {
 		return d.fail(err)
 	}
-	d.auditor(st).Record(ctx, audit.ServerActor(), audit.AppUnregister, name, "", nil)
-	fmt.Fprintf(d.Stdout, "Unregistered %s: its pipeline can no longer deploy it. What runs keeps running (liman stop %s), and its deploy keys stay until revoked (limand token revoke <name>).\n", name, name)
+	rec := d.auditor(st)
+	rec.Record(ctx, audit.ServerActor(), audit.AppUnregister, name, "", nil)
+	d.recordKeyChanges(ctx, rec, name, changes)
+	fmt.Fprintf(d.Stdout, "Unregistered %s: its pipeline can no longer deploy it.\n", name)
+	d.printKeyChanges(name, changes)
+	fmt.Fprintf(d.Stdout, "What runs keeps running (liman stop %s).\n", name)
 	return exitOK
+}
+
+// recordKeyChanges writes what happened to an app's keys into the audit
+// trail, one record per key.
+func (d *Daemon) recordKeyChanges(ctx context.Context, rec *audit.Recorder, app string, c store.KeyChanges) {
+	for _, k := range c.Revoked {
+		rec.Record(ctx, audit.ServerActor(), audit.TokenRevoke, "", k, nil)
+	}
+	for _, k := range c.Detached {
+		rec.Record(ctx, audit.ServerActor(), audit.TokenRevoke, "", k+" (for "+app+" only; it keeps its other apps)", nil)
+	}
+	for _, k := range c.Expiring {
+		rec.Record(ctx, audit.ServerActor(), audit.TokenRevoke, "", k+" (expires "+c.Until.UTC().Format(time.RFC3339)+")", nil)
+	}
+}
+
+func (d *Daemon) printKeyChanges(app string, c store.KeyChanges) {
+	if len(c.Revoked) > 0 {
+		fmt.Fprintf(d.Stdout, "Revoked: %s.\n", strings.Join(c.Revoked, ", "))
+	}
+	if len(c.Expiring) > 0 {
+		fmt.Fprintf(d.Stdout, "Still working until %s, then expiring: %s.\n", c.Until.Local().Format("2006-01-02 15:04"), strings.Join(c.Expiring, ", "))
+	}
+	if len(c.Detached) > 0 {
+		fmt.Fprintf(d.Stdout, "No longer for %s, still for their other apps: %s.\n", app, strings.Join(c.Detached, ", "))
+	}
 }

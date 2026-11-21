@@ -74,8 +74,9 @@ Usage:
                                   its deploy key, named <name>-ci unless
                                   --key, printed once
   limand app list                 List registered apps and their last trigger
-  limand app delete <name>        Unregister an app; its containers keep
-                                  running until stopped
+  limand app delete <name>        Unregister an app and revoke its deploy and
+                                  preview keys; its containers keep running
+                                  until stopped
   limand token list               List tokens, when they expire and were last used
   limand token revoke <name>      Revoke a token
   limand audit verify             Check the audit trail: that no entry was

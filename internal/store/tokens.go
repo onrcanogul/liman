@@ -111,14 +111,6 @@ func (s *Store) CreateScopedToken(ctx context.Context, name, scope string, expir
 		}
 	}
 
-	// crypto/rand reads from the operating system's secure random source.
-	// math/rand must never be used for secrets: its output is predictable.
-	raw := make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
-		return "", fmt.Errorf("generate token: %w", err)
-	}
-	token := TokenPrefix + hex.EncodeToString(raw)
-
 	// The token and its apps are written together: a token that exists
 	// without the limits it was meant to have would be one that may use
 	// every app.
@@ -127,7 +119,19 @@ func (s *Store) CreateScopedToken(ctx context.Context, name, scope string, expir
 		return "", fmt.Errorf("store token: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	token, err := insertToken(ctx, tx, name, scope, expiresAt, apps)
+	if err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("store token: %w", err)
+	}
+	return token, nil
+}
 
+// insertToken generates a token and stores it, with its apps, in tx. The
+// arguments have been checked.
+func insertToken(ctx context.Context, tx *sql.Tx, name, scope string, expiresAt time.Time, apps []string) (string, error) {
 	// A deploy key is for registered apps: the registration is what fixes
 	// the repository and the domain it cannot change. So is a preview key.
 	if scope == ScopeDeploy || scope == ScopePreview {
@@ -142,6 +146,14 @@ func (s *Store) CreateScopedToken(ctx context.Context, name, scope string, expir
 			}
 		}
 	}
+
+	// crypto/rand reads from the operating system's secure random source.
+	// math/rand must never be used for secrets: its output is predictable.
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate token: %w", err)
+	}
+	token := TokenPrefix + hex.EncodeToString(raw)
 
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO tokens (name, hash, scope, created_at, expires_at) VALUES (?, ?, ?, ?, ?)
@@ -160,9 +172,6 @@ func (s *Store) CreateScopedToken(ctx context.Context, name, scope string, expir
 		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO token_apps (token, app) VALUES (?, ?)`, name, a); err != nil {
 			return "", fmt.Errorf("store token: %w", err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return "", fmt.Errorf("store token: %w", err)
 	}
 	return token, nil
 }

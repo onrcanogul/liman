@@ -1020,14 +1020,118 @@ func TestRegistrations(t *testing.T) {
 	}
 
 	_ = s.SaveDeployState(ctx, st)
-	if err := s.Unregister(ctx, "web"); err != nil {
+	if _, err := s.Unregister(ctx, "web"); err != nil {
 		t.Fatal(err)
 	}
 	if _, found, _ := s.DeployStateOf(ctx, "web"); found {
 		t.Error("the state survived Unregister")
 	}
-	if err := s.Unregister(ctx, "web"); !errors.Is(err, ErrNotFound) {
+	if _, err := s.Unregister(ctx, "web"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("Unregister() twice = %v; want ErrNotFound", err)
+	}
+}
+
+func TestUnregisterTakesTheKeysWithIt(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	for _, app := range []string{"web", "api"} {
+		if err := s.Register(ctx, Registration{Name: app, Repo: "r/" + app, Domain: app + ".example.com"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	web, _ := s.CreateScopedToken(ctx, "web-ci", ScopeDeploy, time.Time{}, "web")
+	pr, _ := s.CreateScopedToken(ctx, "web-pr", ScopePreview, time.Time{}, "web")
+	both, _ := s.CreateScopedToken(ctx, "both", ScopeDeploy, time.Time{}, "web", "api")
+	admin, _ := s.CreateScopedToken(ctx, "web-admin", ScopeAdmin, time.Time{}, "web")
+
+	changes, err := s.Unregister(ctx, "web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(changes.Revoked, []string{"web-ci", "web-pr"}) || !slices.Equal(changes.Detached, []string{"both"}) {
+		t.Errorf("Unregister() = %+v", changes)
+	}
+	for _, tok := range []string{web, pr} {
+		if _, ok, _ := s.LookupToken(ctx, tok); ok {
+			t.Error("a key of the unregistered app still works")
+		}
+	}
+	if info, ok, _ := s.LookupToken(ctx, both); !ok || !slices.Equal(info.Apps, []string{"api"}) {
+		t.Errorf("the shared key = %+v, %v; want it for api only", info, ok)
+	}
+	if info, ok, _ := s.LookupToken(ctx, admin); !ok || !info.MayUse("web") {
+		t.Error("an admin token limited to the app was revoked")
+	}
+
+	// Registered again, the name brings back none of the old keys.
+	if err := s.Register(ctx, Registration{Name: "web", Repo: "r/web", Domain: "web.example.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if info, ok, _ := s.LookupToken(ctx, both); !ok || info.MayUse("web") {
+		t.Error("the shared key came back for the app registered again")
+	}
+}
+
+func TestRotateKey(t *testing.T) {
+	s := openTest(t)
+	ctx := context.Background()
+	for _, app := range []string{"web", "api"} {
+		_ = s.Register(ctx, Registration{Name: app, Repo: "r/" + app, Domain: app + ".example.com"})
+	}
+	old, _ := s.CreateScopedToken(ctx, "web-ci", ScopeDeploy, time.Time{}, "web")
+	soon := time.Now().Add(10 * time.Minute)
+	expiring, _ := s.CreateScopedToken(ctx, "web-ci-short", ScopeDeploy, soon, "web")
+	shared, _ := s.CreateScopedToken(ctx, "shared", ScopeDeploy, time.Time{}, "web", "api")
+	pr, _ := s.CreateScopedToken(ctx, "web-pr", ScopePreview, time.Time{}, "web")
+
+	// Keeping the old ones for an hour: they get an end, the one that
+	// ends sooner keeps its own, the shared one loses the app at once,
+	// and keys of another scope are not touched.
+	fresh, c, err := s.RotateKey(ctx, "web", ScopeDeploy, "web-ci-2", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(c.Expiring, []string{"web-ci", "web-ci-short"}) || !slices.Equal(c.Detached, []string{"shared"}) || len(c.Revoked) != 0 {
+		t.Errorf("RotateKey() = %+v", c)
+	}
+	if info, ok, _ := s.LookupToken(ctx, old); !ok || info.ExpiresAt.Before(time.Now().Add(59*time.Minute)) || info.ExpiresAt.After(time.Now().Add(61*time.Minute)) {
+		t.Errorf("the old key = %+v, %v; want it to work for another hour", info, ok)
+	}
+	if info, ok, _ := s.LookupToken(ctx, expiring); !ok || info.ExpiresAt.After(soon.Add(time.Second)) {
+		t.Errorf("the key that ended sooner = %+v; want its own end kept", info)
+	}
+	if info, _, _ := s.LookupToken(ctx, shared); info.MayUse("web") || !info.MayUse("api") {
+		t.Errorf("the shared key = %+v; want it for api only", info)
+	}
+	if info, ok, _ := s.LookupToken(ctx, fresh); !ok || info.Scope != ScopeDeploy || !slices.Equal(info.Apps, []string{"web"}) || !info.ExpiresAt.IsZero() {
+		t.Errorf("the new key = %+v, %v", info, ok)
+	}
+	if _, ok, _ := s.LookupToken(ctx, pr); !ok {
+		t.Error("rotating the deploy key touched the preview key")
+	}
+
+	// Without keeping: the old ones (the new one of before among them)
+	// are gone at once.
+	if _, c, err = s.RotateKey(ctx, "web", ScopeDeploy, "web-ci-3", 0); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(c.Revoked, []string{"web-ci", "web-ci-2", "web-ci-short"}) {
+		t.Errorf("RotateKey() = %+v", c)
+	}
+	if _, ok, _ := s.LookupToken(ctx, fresh); ok {
+		t.Error("the replaced key still works")
+	}
+
+	// Kept for a while, the old key keeps its name: the new one needs
+	// another. Refused as a whole, nothing changes.
+	if _, _, err := s.RotateKey(ctx, "web", ScopeDeploy, "web-ci-3", time.Hour); !errors.Is(err, ErrExists) {
+		t.Errorf("RotateKey() with a taken name = %v", err)
+	}
+	if list, _ := s.Tokens(ctx); !slices.ContainsFunc(list, func(i TokenInfo) bool { return i.Name == "web-ci-3" && i.ExpiresAt.IsZero() }) {
+		t.Error("a refused rotation changed the key it would have replaced")
+	}
+	if _, _, err := s.RotateKey(ctx, "nope", ScopeDeploy, "nope-ci", 0); err == nil || !strings.Contains(err.Error(), "not registered") {
+		t.Errorf("RotateKey() for an app that is not registered = %v", err)
 	}
 }
 

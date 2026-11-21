@@ -130,10 +130,11 @@ func TestTriggerRefusals(t *testing.T) {
 	h, key, _ := registered(t)
 	h.Register(t, "billing", "ghcr.io/user/billing", "billing.example.com")
 	other, _ := h.DeployKey(t, "billing-ci", "billing")
-	// A key for an app whose registration is gone afterwards.
+	// A key for an app whose registration is gone afterwards: it went
+	// with it.
 	h.Register(t, "gone", "ghcr.io/user/gone", "gone.example.com")
 	goneKey, _ := h.DeployKey(t, "gone-ci", "gone")
-	if err := h.Store.Unregister(ctx(), "gone"); err != nil {
+	if _, err := h.Store.Unregister(ctx(), "gone"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -155,10 +156,10 @@ func TestTriggerRefusals(t *testing.T) {
 	}{
 		{"admin token", h.Client.Token, jsonOf(t, ok), http.StatusForbidden, "only deploy and preview keys"},
 		{"another app's key", other, jsonOf(t, ok), http.StatusForbidden, "limited to billing"},
-		{"not registered", goneKey, with(func(r *api.TriggerRequest) {
+		{"key of an unregistered app", goneKey, with(func(r *api.TriggerRequest) {
 			r.App = "gone"
 			r.Definition = strings.Replace(pipelineApp, "orders-api", "gone", 2)
-		}), http.StatusNotFound, "limand app create gone"},
+		}), http.StatusUnauthorized, "invalid token"},
 		{"bad digest", key, with(func(r *api.TriggerRequest) { r.Digest = "sha256:abc" }), http.StatusBadRequest, "invalid digest"},
 		{"unknown field", key, `{"app":"orders-api","digets":"x"}`, http.StatusBadRequest, "unknown field"},
 		{"no definition", key, with(func(r *api.TriggerRequest) { r.Definition = "" }), http.StatusBadRequest, "--file app.yaml"},
