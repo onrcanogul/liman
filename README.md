@@ -245,14 +245,38 @@ may not change, the image's repository and the domain, and creates its
 deploy key:
 
 ```
-limand app create orders-api --repo ghcr.io/team/orders-api --domain api.example.com
-limand app list
+limand app create orders-api --repo ghcr.io/team/orders-api --domain api.example.com [--preview-key]
+limand app list                       # with each app's keys
 limand app delete orders-api          # its pipeline can no longer deploy it
 ```
 
 Store the key as a secret variable of the CI system, `LIMAN_TOKEN`, and the
-public address as `LIMAN_URL` (`https://ops.example.com`). Another key for
-the same app: `limand token create <name> --deploy --app orders-api`.
+public address as `LIMAN_URL` (`https://ops.example.com`). `--preview-key`
+also creates a key for pull requests (see below).
+
+**Keys** live in CI settings, where they are most likely to leak, so
+replacing one is a single command:
+
+```
+limand app rotate-key orders-api                  # a new deploy key; the old ones stop now
+limand app rotate-key orders-api --keep-old 1h    # ... or in an hour, for a routine rotation
+limand app rotate-key orders-api --preview        # the same for preview keys
+```
+
+The new key is printed once (or written with `--write-client`) under a
+name of its own, `orders-api-ci-<time>`, since the old one may live on for
+a while. Without `--keep-old` the old key stops at once, as after a leak;
+a deploy already running with it still finishes, because a key is checked
+when a request starts. With `--keep-old` it keeps working until then,
+which gives the pipeline's settings time to be updated. A key that serves
+other apps too loses this app at once and keeps the others.
+
+**Deleting** an app revokes its deploy and preview keys in the same
+transaction; a key that serves other apps too only loses this one. Before,
+the keys stayed, refused for want of a registration, and came back to
+life when the name was registered again: whoever registered it next would
+have inherited keys they never saw (found in a trial). Admin and read
+tokens limited to the app stay, since what runs may still need managing.
 
 **In the repository**, app.yaml names the repository without a version
 (the digest says which image) and refers to secrets by name:
@@ -597,6 +621,7 @@ limand token create <name> --expires 90d           # stops working after 90 days
 limand token create <name> --app orders-api        # only this app; repeat --app for more
 limand token create <name> --deploy --app orders-api  # another deploy key for a registered app
 limand token create <name> --preview --app orders-api # a key that can only preview, for pull requests
+                                                      # (for registered apps, limand app rotate-key is the simpler way)
 limand token list                                  # with scope, apps, expiry and last use
 limand token revoke <name>
 ```
@@ -777,8 +802,9 @@ is equivalent to root. The API is built around keeping everyone else out:
   everything else, env values included: a leaked key could point the app
   at another database, or deploy an older image of its repository, at
   most six times a minute. It cannot read the values that run, nor run an
-  image of its own. Revoke it and create another; the audit trail shows
-  what it deployed and which values it changed. A preview key (`--preview`)
+  image of its own. Replace it with `limand app rotate-key`; the audit
+  trail shows what it deployed and which values it changed. Deleting an
+  app revokes its keys. A preview key (`--preview`)
   works there too, for pull requests, and can only preview: leaked, it
   tells which values of a definition differ from the running one, never
   what they are. Behind Nginx every caller has Nginx's address, so the lockout
