@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# liman on rootful Podman, as CI runs it: the engine's integration tests
-# against Podman's socket, then deploys from a pipeline through a registry
-# that wants a password, logged in to with podman login.
+# liman on Podman, as CI runs it, rootless (the default) or rootful:
+# limand install as a service behind Caddy, the engine's integration tests
+# against the socket the daemon uses, then deploys from a pipeline through
+# a registry that wants a password, logged in to with podman login. Rootless
+# also: the limits inside a container, and the apps back after the liman
+# user's systemd restarts.
 #
-#   scripts/ci-podman.sh            # on a throwaway machine only
+#   scripts/ci-podman.sh rootless   # on a throwaway machine only
+#   scripts/ci-podman.sh rootful
 #
 # It changes the machine it runs on (systemd units, registries.conf.d), so
 # it refuses to run unless CI=true or LIMAN_E2E_THROWAWAY=yes.
@@ -13,6 +17,9 @@ if [ "${CI:-}" != true ] && [ "${LIMAN_E2E_THROWAWAY:-}" != yes ]; then
     echo "ci-podman: this changes the machine it runs on; run it on a throwaway one (LIMAN_E2E_THROWAWAY=yes)" >&2
     exit 2
 fi
+
+MODE=${1:-rootless}
+case "$MODE" in rootless|rootful) ;; *) echo "ci-podman: rootless or rootful, not $MODE" >&2; exit 2 ;; esac
 
 cd "$(dirname "$0")/.."
 SOCK=/run/podman/podman.sock
@@ -29,7 +36,8 @@ on_exit() {
     echo "::endgroup::"
     if [ "$code" -ne 0 ]; then
         echo "::group::limand log"; sudo journalctl -u limand --no-pager -n 60 || true; echo "::endgroup::"
-        echo "::group::containers"; sudo podman ps -a || true; echo "::endgroup::"
+        echo "::group::containers"; sudo podman ps -a || true; if [ -n "${U:-}" ]; then pod ps -a || true; fi; echo "::endgroup::"
+        if [ -n "${U:-}" ]; then echo "::group::the liman user's journal"; sudo journalctl "_UID=$U" --no-pager -n 60 || true; echo "::endgroup::"; fi
     fi
 }
 trap on_exit EXIT
@@ -37,16 +45,30 @@ echo "::group::start"
 
 as_root() { sudo env "PATH=$PATH" "HOME=$HOME" REGISTRY_AUTH_FILE="$AUTH" "$@"; }
 limand() { sudo -u liman env LIMAN_HOME=/var/lib/liman /usr/local/bin/limand "$@"; }
+# As the liman user, in a clean environment: sudo would bring some of
+# this one's along.
+as_liman() { (cd / && sudo -u liman env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    HOME=/var/lib/liman USER=liman LOGNAME=liman "XDG_RUNTIME_DIR=/run/user/$U" "$@"); }
+# The Podman that runs liman's apps.
+pod() { if [ "$MODE" = rootless ]; then as_liman podman "$@"; else sudo podman "$@"; fi; }
 
 step "Podman"
 podman --version
-sudo systemctl enable --now podman.socket
-for _ in $(seq 1 20); do sudo test -S "$SOCK" && break; sleep 0.5; done
-sudo test -S "$SOCK" || fail "no Podman socket at $SOCK"
+if [ "$MODE" = rootless ]; then
+    # The runner writes its own XDG_RUNTIME_DIR and XDG_CONFIG_HOME into
+    # /etc/environment, which PAM loads into every session, the liman
+    # user's systemd too: its Podman then looks in the runner's
+    # /run/user/1001 and fails (a trial). A server has no such lines.
+    sudo sed -i '/^XDG_/d' /etc/environment
+else
+    sudo systemctl enable --now podman.socket
+    for _ in $(seq 1 20); do sudo test -S "$SOCK" && break; sleep 0.5; done
+    sudo test -S "$SOCK" || fail "no Podman socket at $SOCK"
 
-step "The engine's integration tests, against Podman"
-as_root "GOPATH=$(go env GOPATH)" "GOMODCACHE=$(go env GOMODCACHE)" "GOCACHE=$(go env GOCACHE)" \
-    LIMAN_TEST_ENGINE=podman go test -count=1 -tags integration ./internal/docker/
+    step "The engine's integration tests, against rootful Podman"
+    as_root "GOPATH=$(go env GOPATH)" "GOMODCACHE=$(go env GOMODCACHE)" "GOCACHE=$(go env GOCACHE)" \
+        LIMAN_TEST_ENGINE=podman go test -count=1 -tags integration ./internal/docker/
+fi
 
 step "A registry that wants a password"
 # Docker takes localhost for a plain-HTTP registry; Podman must be told.
@@ -67,21 +89,37 @@ echo "$DIGEST"
 # Pulled from the registry, not found here.
 sudo podman rmi -f localhost:5000/whoami:ci >/dev/null
 
-step "limand install: Podman and Caddy, as a service"
+step "limand install: Podman $MODE and Caddy, as a service"
 sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq caddy >/dev/null
 caddy version
 make build >/dev/null
 # Docker is running here too: Podman is named. Caddy is the only proxy
-# running, on port 80, so it is found.
-sudo bin/limand install --binary bin/limand --engine podman --listen 127.0.0.1:7070 --hooks-listen 127.0.0.1:7443 </dev/null | tee "$WORK/install.log"
-grep -q 'Installing: podman, proxy caddy' "$WORK/install.log" || fail "not Podman and Caddy"
+# running, on port 80, so it is found. Rootless unless --rootful.
+rootful=(); [ "$MODE" = rootful ] && rootful=(--rootful)
+sudo bin/limand install --binary bin/limand --engine podman "${rootful[@]}" --listen 127.0.0.1:7070 --hooks-listen 127.0.0.1:7443 </dev/null | tee "$WORK/install.log"
+grep -q "Installing: podman ($MODE), proxy caddy" "$WORK/install.log" || fail "not Podman $MODE and Caddy"
 grep -q 'import /etc/caddy/liman.d/\*.caddy' /etc/caddy/Caddyfile || fail "the Caddyfile does not import liman's directory"
 systemctl is-active limand
-# The socket's directory, as liman's tmpfiles rule makes it at boot even
-# with Podman's own rule there: all of them, as at boot.
-sudo systemd-tmpfiles --create 2>&1 | grep -i podman || true
-stat -c '%A %U:%G' /run/podman
-sudo -u liman curl -fs --unix-socket /run/podman/podman.sock http://d/_ping >/dev/null || fail "the liman user cannot reach Podman's socket"
+U=$(id -u liman)
+if [ "$MODE" = rootless ]; then
+    S=/run/user/$U/podman/podman.sock
+    grep '^liman:' /etc/subuid /etc/subgid || fail "liman has no subordinate ids"
+    sudo grep -q "socket: $S" /var/lib/liman/config.yaml || fail "config.yaml does not name liman's own socket"
+    as_liman curl -fs --unix-socket "$S" http://d/_ping >/dev/null || fail "the liman user cannot reach its own Podman"
+    if sudo -u nobody curl -fs --unix-socket "$S" http://d/_ping >/dev/null 2>&1; then fail "another user reaches liman's Podman"; fi
+
+    step "The engine's integration tests, against liman's rootless Podman"
+    go test -c -tags integration -o "$WORK/docker.test" ./internal/docker/
+    chmod 755 "$WORK/docker.test"
+    as_liman LIMAN_TEST_ENGINE=podman-rootless LIMAN_TEST_SOCKET="$S" "$WORK/docker.test" -test.count=1 ||
+        fail "the integration tests fail on rootless Podman"
+else
+    # The socket's directory, as liman's tmpfiles rule makes it at boot
+    # even with Podman's own rule there: all of them, as at boot.
+    sudo systemd-tmpfiles --create 2>&1 | grep -i podman || true
+    stat -c '%A %U:%G' /run/podman
+    sudo -u liman curl -fs --unix-socket /run/podman/podman.sock http://d/_ping >/dev/null || fail "the liman user cannot reach Podman's socket"
+fi
 # The daemon's login: podman login, into the file the liman user reads.
 sudo install -d -o liman -g liman -m 0700 /var/lib/liman/.config/containers
 echo s3cret | sudo REGISTRY_AUTH_FILE=/var/lib/liman/.config/containers/auth.json podman login -u ci --password-stdin localhost:5000
@@ -103,6 +141,9 @@ name: edge
 image: localhost:5000/whoami
 port: 80
 publish: 127.0.0.1:18090
+resources:
+  memory: 64m
+  cpus: 0.5
 healthcheck:
   path: /health
 YAML
@@ -115,6 +156,16 @@ step "Trigger: the image is pulled with podman login's credentials"
 LIMAN_HOME="$WORK/ci" bin/liman trigger --digest "$DIGEST" --file "$WORK/app.yaml" | tee "$WORK/trigger.log"
 grep -q 'Authenticating to localhost:5000 as ci' "$WORK/trigger.log" || fail "the pull did not use podman login's credentials"
 curl -fsS http://127.0.0.1:18090/ | grep -q '^Hostname:' || fail "nothing answers on 127.0.0.1:18090"
+# The kernel's own record of the limits, read from the host: the image has
+# no shell to ask from inside.
+id=$(pod ps --filter label=liman.app=edge --format '{{.ID}}' --no-trunc | head -1)
+pod inspect --format 'log driver: {{.HostConfig.LogConfig.Type}}' "$id"
+mem=$(sudo find /sys/fs/cgroup -path "*libpod-$id*" -name memory.max -exec cat {} + | sort -u | tr '\n' ' ')
+cpu=$(sudo find /sys/fs/cgroup -path "*libpod-$id*" -name cpu.max -exec cat {} + | sort -u | tr '\n' ' ')
+echo "cgroup of $id: memory.max $mem, cpu.max $cpu"
+if ! grep -qw 67108864 <<<"$mem" || ! grep -q '50000 100000' <<<"$cpu"; then
+    fail "the limits are not applied: memory.max $mem, cpu.max $cpu"
+fi
 
 step "Through Caddy, as installed"
 printf 'name: web\nimage: localhost:5000/whoami\nport: 80\ndomain: web.localhost\nhealthcheck:\n  path: /health\n' > "$WORK/web-app.yaml"
@@ -130,5 +181,20 @@ fi
 echo "$out" | tail -2
 grep -qi 'not in the registry\|does not have\|not found' <<<"$out" || fail "unexpected refusal: $out"
 
+if [ "$MODE" = rootless ]; then
+    step "The liman user's systemd restarted: the health monitor brings the apps back"
+    # As at a reboot, or an upgrade of systemd: its processes, Podman's and
+    # the containers', stop with it.
+    sudo systemctl restart "user@$U"
+    back=no
+    for _ in $(seq 1 30); do
+        if curl -fs -o /dev/null http://127.0.0.1:18090/ && curl -fs -o /dev/null -H 'Host: web.localhost' http://127.0.0.1/; then back=yes; break; fi
+        sleep 2
+    done
+    pod ps --format '{{.Names}} {{.Status}}'
+    [ "$back" = yes ] || fail "the apps did not come back after user@$U restarted"
+    sudo journalctl -u limand --no-pager -n 40 | grep -i 'restart' | tail -4
+fi
+
 step "Done"
-echo "Podman test passed"
+echo "Podman ($MODE) test passed"
