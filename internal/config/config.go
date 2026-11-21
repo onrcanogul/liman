@@ -156,8 +156,13 @@ func (h Hooks) Enabled() bool {
 type Engine struct {
 	Driver string `yaml:"driver"`
 	// Socket is the engine's API socket. Empty means DOCKER_HOST or the
-	// default socket for Docker, /run/podman/podman.sock for Podman.
+	// default socket for Docker; for Podman /run/podman/podman.sock, or,
+	// rootless, the one in $XDG_RUNTIME_DIR.
 	Socket string `yaml:"socket"`
+	// Rootless says Podman runs as the daemon's own user, not as root:
+	// its containers run under that user's subordinate ids. Only for
+	// podman.
+	Rootless bool `yaml:"rootless"`
 }
 
 // DefaultListen is used when daemon.listen is not set.
@@ -315,6 +320,9 @@ func (c *Config) validate() error {
 		}
 	}
 
+	if c.Engine.Rootless && c.Engine.Driver != "podman" {
+		errs = append(errs, fmt.Errorf("engine.rootless: liman runs only Podman rootless, not %q", c.Engine.Driver))
+	}
 	if c.Engine.Socket != "" && !filepath.IsAbs(c.Engine.Socket) {
 		errs = append(errs, fmt.Errorf("engine.socket: must be an absolute path, got %q", c.Engine.Socket))
 	}

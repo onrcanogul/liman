@@ -206,6 +206,7 @@ func TestLoadRejectsBadConfig(t *testing.T) {
 		{"both sections", "nginx:\n  conf_dir: /x\nproxy:\n  conf_dir: /y\n", "keep only the proxy section"},
 		{"nginx section for another proxy", "nginx:\n  driver: caddy\n  conf_dir: /x\n", "write a proxy section"},
 		{"relative proxy conf dir", "proxy:\n  conf_dir: liman.d\n", "proxy.conf_dir: must be an absolute path"},
+		{"rootless docker", "engine:\n  rootless: true\n", "engine.rootless: liman runs only Podman rootless"},
 		{"acme without acme root", "nginx:\n  conf_dir: /x\n  cert_dir: /c\nacme:\n  directory: https://ca.example/dir\n", "acme: needs nginx.cert_dir"},
 	}
 

@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,6 +45,9 @@ type Client struct {
 
 	// opts is what the client was connected with.
 	opts Options
+	// lowestPort is the lowest host port a rootless engine can publish;
+	// 0 for no limit.
+	lowestPort int
 }
 
 // RegistryCheck is how ImageExists asks a registry whether it has an image.
@@ -72,6 +77,15 @@ type Options struct {
 	AuthFiles []string
 	// RegistryCheck is how ImageExists asks the registry.
 	RegistryCheck RegistryCheck
+	// NetworkMode is the network containers start on; empty is the
+	// engine's default (Docker's bridge).
+	NetworkMode string
+	// Rootless says the engine runs as an ordinary user, which cannot
+	// publish ports below net.ipv4.ip_unprivileged_port_start.
+	Rootless bool
+	// LogDriver is where containers write their output; empty is the
+	// engine's default.
+	LogDriver string
 }
 
 // ForDocker is Docker, at host (empty for DOCKER_HOST or the default).
@@ -92,6 +106,49 @@ func ForPodman(socket string) Options {
 		socket = DefaultPodmanSocket
 	}
 	return Options{Name: "Podman", Host: "unix://" + socket, AuthFiles: podmanAuthFiles(), RegistryCheck: CheckRegistry}
+}
+
+// ForPodmanRootless is Podman run by the daemon's own user, at socket
+// (empty for the one in $XDG_RUNTIME_DIR, /run/user/<uid> without it).
+//
+// Its containers start on pasta, each with a network of its own. The
+// Docker API's default, a bridge that all containers share through one
+// pasta process, cannot be taken down on Ubuntu 26.04: pasta's AppArmor
+// profile refuses the signal Podman stops it with, so stopping the last
+// container fails (a trial: "rootless netns: kill network process:
+// permission denied"). A pasta of its own ends with its container.
+//
+// Their output goes to a file, not to the journal, rootless Podman's
+// default: the daemon's user is a system user, whose entries journald
+// keeps in the system journal, which that user cannot read; logs came
+// back empty (CI).
+func ForPodmanRootless(socket string) Options {
+	if socket == "" {
+		dir := os.Getenv("XDG_RUNTIME_DIR")
+		if dir == "" {
+			dir = "/run/user/" + strconv.Itoa(os.Getuid())
+		}
+		socket = filepath.Join(dir, "podman", "podman.sock")
+	}
+	o := ForPodman(socket)
+	o.NetworkMode = "pasta"
+	o.LogDriver = "k8s-file"
+	o.Rootless = true
+	return o
+}
+
+// unprivilegedPortStart is the lowest port an ordinary user may listen
+// on: net.ipv4.ip_unprivileged_port_start, 1024 unless lowered.
+func unprivilegedPortStart() int {
+	data, err := os.ReadFile("/proc/sys/net/ipv4/ip_unprivileged_port_start")
+	if err != nil {
+		return 1024
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 1024
+	}
+	return n
 }
 
 // This line makes the compiler verify that *Client implements engine.Engine.
@@ -124,7 +181,11 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 	if len(opts.AuthFiles) > 0 {
 		creds = newCredentialStoreIn(opts.AuthFiles)
 	}
-	return &Client{api: api, creds: creds, opts: opts}, nil
+	c := &Client{api: api, creds: creds, opts: opts}
+	if opts.Rootless {
+		c.lowestPort = unprivilegedPortStart()
+	}
+	return c, nil
 }
 
 // Pull implements engine.Engine. POST /images/create.
@@ -226,8 +287,19 @@ func (c *Client) Start(ctx context.Context, spec engine.Spec) (string, error) {
 			NanoCPUs: int64(spec.CPUs * 1e9),
 		},
 	}
+	if c.opts.NetworkMode != "" {
+		hostCfg.NetworkMode = container.NetworkMode(c.opts.NetworkMode)
+	}
+	if c.opts.LogDriver != "" {
+		hostCfg.LogConfig = container.LogConfig{Type: c.opts.LogDriver}
+	}
 	// A worker publishes no port: nothing on the host reaches it.
 	if spec.ContainerPort != 0 {
+		if spec.HostPort != 0 && spec.HostPort < c.lowestPort {
+			// Podman would refuse it too, but in pasta's words.
+			return "", fmt.Errorf("port %d: %s runs rootless and cannot publish ports below %d; publish a higher port and have the proxy, or a firewall rule, forward to it",
+				spec.HostPort, c.opts.Name, c.lowestPort)
+		}
 		port, err := network.ParsePort(fmt.Sprintf("%d/tcp", spec.ContainerPort))
 		if err != nil {
 			return "", fmt.Errorf("container port: %w", err)

@@ -232,10 +232,13 @@ func TestFilesAreInTheContainerAndNotInItsConfig(t *testing.T) {
 }
 
 // testEngine is the engine the tests run against: Docker, or Podman with
-// LIMAN_TEST_ENGINE=podman (CI runs both).
+// LIMAN_TEST_ENGINE=podman, or podman-rootless (CI runs all three).
 func testEngine() Options {
-	if os.Getenv("LIMAN_TEST_ENGINE") == "podman" {
+	switch os.Getenv("LIMAN_TEST_ENGINE") {
+	case "podman":
 		return ForPodman(os.Getenv("LIMAN_TEST_SOCKET"))
+	case "podman-rootless":
+		return ForPodmanRootless(os.Getenv("LIMAN_TEST_SOCKET"))
 	}
 	return ForDocker("")
 }

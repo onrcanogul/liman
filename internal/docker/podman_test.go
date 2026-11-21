@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/onrcanogul/liman/internal/engine"
 )
 
 // Podman's login writes auth.json, in the same format; Docker Hub is under
@@ -51,8 +53,32 @@ func TestPresets(t *testing.T) {
 	if last := o.AuthFiles[len(o.AuthFiles)-1]; !strings.HasSuffix(last, filepath.Join(".docker", "config.json")) {
 		t.Errorf("Podman's auth files end with %s, want Docker's config.json, which Podman falls back to", last)
 	}
-	if o := ForDocker(""); o.Host != "" || o.RegistryCheck != CheckDistribution {
+	if o := ForDocker(""); o.Host != "" || o.RegistryCheck != CheckDistribution || o.NetworkMode != "" || o.Rootless {
 		t.Errorf("ForDocker() = %+v", o)
+	}
+	if o := ForPodman(""); o.NetworkMode != "" || o.Rootless {
+		t.Errorf("rootful Podman keeps the default network: %+v", o)
+	}
+}
+
+func TestRootlessPreset(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/999")
+	o := ForPodmanRootless("")
+	if o.Host != "unix:///run/user/999/podman/podman.sock" || o.NetworkMode != "pasta" || o.LogDriver != "k8s-file" || !o.Rootless || o.RegistryCheck != CheckRegistry {
+		t.Errorf("ForPodmanRootless() = %+v", o)
+	}
+	if o := ForPodmanRootless("/elsewhere/podman.sock"); o.Host != "unix:///elsewhere/podman.sock" {
+		t.Errorf("ForPodmanRootless(socket).Host = %s", o.Host)
+	}
+}
+
+// A rootless engine cannot publish a low port; the refusal comes before the
+// engine is asked, and names the way out.
+func TestRootlessRefusesLowPorts(t *testing.T) {
+	c := &Client{opts: ForPodmanRootless("/x.sock"), lowestPort: 1024}
+	_, err := c.Start(context.Background(), engine.Spec{Name: "web", Image: "img", ContainerPort: 80, HostPort: 80})
+	if err == nil || !strings.Contains(err.Error(), "port 80: Podman runs rootless and cannot publish ports below 1024") {
+		t.Errorf("Start(port 80) error = %v", err)
 	}
 }
 

@@ -61,6 +61,9 @@ func engineOptions(cfg config.Engine) (docker.Options, error) {
 	case "", "docker":
 		return docker.ForDocker(socketHost(cfg.Socket)), nil
 	case "podman":
+		if cfg.Rootless {
+			return docker.ForPodmanRootless(cfg.Socket), nil
+		}
 		return docker.ForPodman(cfg.Socket), nil
 	default:
 		return docker.Options{}, fmt.Errorf("engine.driver: unknown engine %q; liman drives docker or podman", cfg.Driver)
