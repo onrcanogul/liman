@@ -1,5 +1,7 @@
 # liman
 
+[![ci](https://github.com/onrcanogul/liman/actions/workflows/ci.yml/badge.svg)](https://github.com/onrcanogul/liman/actions/workflows/ci.yml)
+
 A small PaaS for a single server, written in Go. It automates the deploy steps
 usually done by hand over SSH: pull an image, start a container with limits,
 health check it, point Nginx at it, remove the old one.
@@ -207,8 +209,9 @@ A digest is the hash of the image's content: unlike a tag, it cannot be
 moved to another image while the deploy runs, and the release records
 exactly which image ran.
 
-**On the server, once**, turn the trigger endpoint on. It gets a listener of
-its own, which serves `POST /hooks/deploy` and nothing else:
+**On the server, once**, turn the trigger endpoint on (`install.sh
+--hooks-listen 127.0.0.1:7443` does it on a new server). It gets a listener
+of its own, which serves `POST /hooks/deploy` and nothing else:
 
 ```yaml
 # config.yaml
@@ -856,11 +859,26 @@ memory.
 
 ## Installing on a server
 
-What the server needs: Ubuntu or Debian with systemd, Docker, Nginx, and a
-private network between it and your machine (WireGuard below). The installer
-adds no packages.
+What the server needs: Ubuntu or Debian with systemd, Docker, Nginx (running:
+liman reloads it on every deploy), and a private network between it and your
+machine (WireGuard below). The installer adds no packages.
 
-**1. Build for Linux** (on your machine; no cross-compiler is needed):
+**1. The binaries.** Each [release](https://github.com/onrcanogul/liman/releases)
+has them for amd64 and arm64, with `install.sh`, the systemd units and
+`SHA256SUMS`, built by the release workflow from the tagged commit. Check
+both that the files are intact and where they were built:
+
+```
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify limand-linux-amd64 --repo onrcanogul/liman
+```
+
+The second command checks a signed statement, made by GitHub's builder,
+that the file was built by this repository's release workflow from that
+commit; a checksum alone only proves that the file matches the list next
+to it.
+
+Or build them yourself (no cross-compiler is needed):
 
 ```
 make release        # dist/limand-linux-amd64, dist/limand-linux-arm64, and the CLI
@@ -890,7 +908,8 @@ pubkey`. Open UDP port 51820 in the server's firewall, then
 **3. Install** (copy `deploy/` and the binary to the server first):
 
 ```
-sudo ./install.sh --binary ./limand-linux-amd64 --listen 10.8.0.1:7070
+sudo ./install.sh --binary ./limand-linux-amd64 --listen 10.8.0.1:7070 \
+    --hooks-listen 127.0.0.1:7443    # only for deploys from CI
 ```
 
 The script creates a system user `liman` (member of the `docker` group),
@@ -898,8 +917,11 @@ installs the binary and the systemd unit, writes
 `/var/lib/liman/config.yaml`, creates `/etc/nginx/liman.d` with one include
 line in `/etc/nginx/conf.d/liman.conf`, and allows the `liman` user exactly
 two commands through sudo: `nginx -t` and `systemctl reload nginx`. Existing
-Nginx configuration is not touched. Running it again with a newer binary
-upgrades (see Upgrading) and leaves everything else as it is.
+Nginx configuration is not touched. With `--hooks-listen` the config also
+turns on the endpoint CI pipelines deploy through (see Deploying from CI).
+It stops before changing anything if a requirement is missing, Nginx not
+running included. Running it again with a newer binary upgrades (see
+Upgrading) and leaves everything else as it is.
 
 **4. A token, and the client:**
 
@@ -1229,6 +1251,46 @@ make test-integration   # tests that need a running Docker daemon
 make load-test          # throughput, latency and leak checks (about a minute)
 ```
 
+### CI and releases
+
+Every push to `main` and every pull request runs
+[ci.yml](.github/workflows/ci.yml), three jobs side by side, about four
+minutes in all:
+
+- **lint, vet, test:** golangci-lint, `go vet` also of the files behind the
+  `integration` and `load` build tags (nothing else compiles them),
+  shellcheck, the tests with the race detector, and govulncheck, which
+  fails the job for a known vulnerability in code liman calls. It also
+  checks that Go is the release `go.mod`'s `toolchain` line names.
+- **integration:** `make test-integration`, against the runner's Docker and
+  a fixed Pebble release.
+- **end to end:** [scripts/ci-e2e.sh](scripts/ci-e2e.sh) on the runner's
+  fresh Ubuntu, as on a new server: `install.sh`, a local registry, an app
+  registered with a deploy and a preview key, a preview, deploys through
+  the trigger endpoint, what Nginx serves, the audit anchors in the system
+  log, the backup service, and the keys revoked when the app is deleted.
+  It changes the machine it runs on, so outside CI it runs only with
+  `LIMAN_E2E_THROWAWAY=yes`.
+
+No job uses a secret. Actions are pinned to commit hashes, which
+Dependabot keeps current; a pull request from a fork runs with read
+permissions only. [weekly.yml](.github/workflows/weekly.yml) runs
+govulncheck and the integration tests against the latest Pebble on
+Mondays, as both can break without a commit. The load test runs only by
+hand ([load.yml](.github/workflows/load.yml)): on shared machines its
+numbers vary too much to decide anything.
+
+A tag publishes a release ([release.yml](.github/workflows/release.yml)):
+
+```
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+It runs ci.yml again, builds the binaries with the tag as their version
+(and checks that they say so), and publishes them with `install.sh`, the
+systemd units, `SHA256SUMS` and a provenance attestation. Started by hand
+it does everything but publish.
+
 ### Load tests
 
 `make load-test` starts a complete daemon inside the test process (real HTTP
@@ -1278,5 +1340,6 @@ internal/textdiff/   line diff used to preview config changes
 internal/loadtest/   small load generator used by the load tests
 internal/buildinfo/  version metadata injected at build time
 deploy/              systemd units (daemon, daily backup) and the server install script
-scripts/             local development helpers
+scripts/             local development helpers, and the end-to-end test CI runs
+.github/             CI, release and weekly workflows; Dependabot
 ```
