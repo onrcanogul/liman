@@ -21,7 +21,6 @@ chmod 755 "$WORK"
 # One auth file for podman login and for limand, wherever sudo's
 # environment would otherwise put it.
 AUTH="$WORK/auth.json"
-LIMAN_HOME_DIR="$WORK/home"
 
 step() { echo "::endgroup::"; echo "::group::$*"; }
 fail() { echo "::error::$*"; exit 1; }
@@ -29,7 +28,7 @@ on_exit() {
     local code=$?
     echo "::endgroup::"
     if [ "$code" -ne 0 ]; then
-        echo "::group::limand log"; sudo cat "$WORK/limand.log" 2>/dev/null | tail -60 || true; echo "::endgroup::"
+        echo "::group::limand log"; sudo journalctl -u limand --no-pager -n 60 || true; echo "::endgroup::"
         echo "::group::containers"; sudo podman ps -a || true; echo "::endgroup::"
     fi
 }
@@ -37,7 +36,7 @@ trap on_exit EXIT
 echo "::group::start"
 
 as_root() { sudo env "PATH=$PATH" "HOME=$HOME" REGISTRY_AUTH_FILE="$AUTH" "$@"; }
-limand() { as_root LIMAN_HOME="$LIMAN_HOME_DIR" bin/limand "$@"; }
+limand() { sudo -u liman env LIMAN_HOME=/var/lib/liman /usr/local/bin/limand "$@"; }
 
 step "Podman"
 podman --version
@@ -68,26 +67,36 @@ echo "$DIGEST"
 # Pulled from the registry, not found here.
 sudo podman rmi -f localhost:5000/whoami:ci >/dev/null
 
-step "limand on Podman"
+step "limand install: Podman and Caddy, as a service"
+sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq caddy >/dev/null
+caddy version
 make build >/dev/null
-mkdir -p "$LIMAN_HOME_DIR"
-cat > "$LIMAN_HOME_DIR/config.yaml" <<YAML
-daemon:
-  listen: 127.0.0.1:7070
-hooks:
-  listen: 127.0.0.1:7443
-engine:
-  driver: podman
-monitor:
-  disabled: true
-YAML
+# Docker is running here too: Podman is named. Caddy is the only proxy
+# running, on port 80, so it is found.
+sudo bin/limand install --binary bin/limand --engine podman --listen 127.0.0.1:7070 --hooks-listen 127.0.0.1:7443 </dev/null | tee "$WORK/install.log"
+grep -q 'Installing: podman, proxy caddy' "$WORK/install.log" || fail "not Podman and Caddy"
+grep -q 'import /etc/caddy/liman.d/\*.caddy' /etc/caddy/Caddyfile || fail "the Caddyfile does not import liman's directory"
+systemctl is-active limand
+# The socket's directory, as liman's tmpfiles rule makes it at boot even
+# with Podman's own rule there: all of them, as at boot.
+sudo systemd-tmpfiles --create 2>&1 | grep -i podman || true
+stat -c '%A %U:%G' /run/podman
+sudo -u liman curl -fs --unix-socket /run/podman/podman.sock http://d/_ping >/dev/null || fail "the liman user cannot reach Podman's socket"
+# The daemon's login: podman login, into the file the liman user reads.
+sudo install -d -o liman -g liman -m 0700 /var/lib/liman/.config/containers
+echo s3cret | sudo REGISTRY_AUTH_FILE=/var/lib/liman/.config/containers/auth.json podman login -u ci --password-stdin localhost:5000
+sudo chown liman:liman /var/lib/liman/.config/containers/auth.json
+# The client files are written as the liman user, so into a directory it
+# owns, then handed to this one.
+sudo install -d -o liman -g liman -m 0700 "$WORK/from-liman"
 limand app create edge --repo localhost:5000/whoami --publish 127.0.0.1:18090 \
-    --write-client "$WORK/ci.yaml" --url http://127.0.0.1:7443
-mkdir -m 0700 "$WORK/ci"
-sudo install -m 0600 -o "$(id -u)" -g "$(id -g)" "$WORK/ci.yaml" "$WORK/ci/client.yaml"
-(limand serve > "$WORK/limand.log" 2>&1 &)
-for _ in $(seq 1 40); do curl -fs http://127.0.0.1:7070/v1/health >/dev/null && break; sleep 0.25; done
-grep -o 'engine=[a-z]*' "$WORK/limand.log" | head -1
+    --write-client "$WORK/from-liman/ci.yaml" --url http://127.0.0.1:7443
+limand app create web --repo localhost:5000/whoami --domain web.localhost \
+    --write-client "$WORK/from-liman/web.yaml" --url http://127.0.0.1:7443
+for k in ci web; do
+    mkdir -m 0700 "$WORK/$k"
+    sudo install -m 0600 -o "$(id -u)" -g "$(id -g)" "$WORK/from-liman/$k.yaml" "$WORK/$k/client.yaml"
+done
 
 cat > "$WORK/app.yaml" <<YAML
 name: edge
@@ -106,6 +115,12 @@ step "Trigger: the image is pulled with podman login's credentials"
 LIMAN_HOME="$WORK/ci" bin/liman trigger --digest "$DIGEST" --file "$WORK/app.yaml" | tee "$WORK/trigger.log"
 grep -q 'Authenticating to localhost:5000 as ci' "$WORK/trigger.log" || fail "the pull did not use podman login's credentials"
 curl -fsS http://127.0.0.1:18090/ | grep -q '^Hostname:' || fail "nothing answers on 127.0.0.1:18090"
+
+step "Through Caddy, as installed"
+printf 'name: web\nimage: localhost:5000/whoami\nport: 80\ndomain: web.localhost\nhealthcheck:\n  path: /health\n' > "$WORK/web-app.yaml"
+LIMAN_HOME="$WORK/web" bin/liman trigger --digest "$DIGEST" --file "$WORK/web-app.yaml" | tee "$WORK/web.log"
+grep -q 'Reload Caddy' "$WORK/web.log" || fail "Caddy was not reloaded"
+curl -fsS -H 'Host: web.localhost' http://127.0.0.1/ | grep -q '^Hostname:' || fail "Caddy does not route web.localhost"
 
 step "An image the registry does not have is refused"
 missing="sha256:$(printf '0%.0s' $(seq 1 64))"

@@ -53,16 +53,26 @@ step "install.sh refuses a stopped Nginx"
 command -v nginx >/dev/null || { sudo apt-get update -qq; sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx >/dev/null; }
 sudo systemctl stop nginx
 had_liman=no; id liman >/dev/null 2>&1 && had_liman=yes
-if out=$(sudo deploy/install.sh --binary dist/limand-linux-amd64 --listen 127.0.0.1:7070 --hooks-listen "$HOOKS" 2>&1); then
+# Named on the command line, and found stopped: refused before anything
+# is changed.
+if out=$(sudo deploy/install.sh --binary dist/limand-linux-amd64 --proxy nginx --listen 127.0.0.1:7070 --hooks-listen "$HOOKS" 2>&1); then
     fail "install.sh went ahead with Nginx stopped"
 fi
-grep -q 'not running' <<<"$out" || fail "unexpected refusal: $out"
+grep -q 'Nginx is installed but not running' <<<"$out" || fail "unexpected refusal: $out"
+# Not named, and none running: no guess, the flag to give.
+if out=$(sudo deploy/install.sh --binary dist/limand-linux-amd64 --listen 127.0.0.1:7070 2>&1 </dev/null); then
+    fail "install.sh picked a stopped proxy by itself"
+fi
+grep -q 'give --proxy' <<<"$out" || fail "unexpected refusal: $out"
 [ "$had_liman" = yes ] || ! id liman >/dev/null 2>&1 || fail "install.sh changed the machine before refusing"
 echo "refused, nothing changed"
 
-step "install.sh"
+step "install.sh, engine and proxy as found"
 sudo systemctl enable --now nginx
-sudo deploy/install.sh --binary dist/limand-linux-amd64 --listen 127.0.0.1:7070 --hooks-listen "$HOOKS"
+# No --engine, no --proxy, no terminal: Docker because it runs (Podman is
+# installed too), Nginx because it holds port 80.
+sudo deploy/install.sh --binary dist/limand-linux-amd64 --listen 127.0.0.1:7070 --hooks-listen "$HOOKS" </dev/null | tee "$WORK/install.log"
+grep -q 'Installing: docker, proxy nginx' "$WORK/install.log" || fail "not what was found"
 systemctl is-active limand
 sudo ss -ltn | grep -q " $HOOKS " || fail "nothing listens on $HOOKS"
 
