@@ -10,6 +10,7 @@
 package certs
 
 import (
+	"cmp"
 	"context"
 	"crypto/ecdsa"
 	"crypto/x509"
@@ -26,7 +27,10 @@ import (
 	"time"
 )
 
-const pebbleImage = "ghcr.io/letsencrypt/pebble:latest"
+// pebbleImage is a fixed release, so that a new Pebble cannot turn the
+// tests red without a change here. LIMAN_PEBBLE_IMAGE overrides it: the
+// weekly CI run tries the latest.
+var pebbleImage = cmp.Or(os.Getenv("LIMAN_PEBBLE_IMAGE"), "ghcr.io/letsencrypt/pebble:2.10.3")
 
 // pebble starts Pebble with its HTTP-01 checks sent to httpPort on this
 // machine, for every name in names. It returns the directory URL and the
