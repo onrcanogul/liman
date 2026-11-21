@@ -15,10 +15,16 @@ import (
 type Registration struct {
 	Name string
 	// Repo is the image's repository, without a tag or a digest.
-	Repo      string
-	Domain    string
+	Repo string
+	// Domain is "" for a worker, which is reached from nowhere.
+	Domain string
+	// Kind is "web" or "worker".
+	Kind      string
 	CreatedAt time.Time
 }
+
+// Worker reports whether the registration is of a worker.
+func (r Registration) Worker() bool { return r.Kind == "worker" }
 
 // ErrDomainTaken is returned when a domain is registered to another app.
 var ErrDomainTaken = errors.New("domain is registered to another app")
@@ -40,9 +46,14 @@ func (s *Store) Register(ctx context.Context, r Registration) error {
 	case !errors.Is(err, sql.ErrNoRows):
 		return fmt.Errorf("register %s: %w", r.Name, err)
 	}
+	kind := r.Kind
+	if kind == "" {
+		kind = "web"
+	}
+	// No domain is NULL, not "": two workers would collide on "".
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO apps (name, repo, domain, created_at) VALUES (?, ?, ?, ?)`,
-		r.Name, r.Repo, r.Domain, formatTime(time.Now()))
+		`INSERT INTO apps (name, repo, domain, kind, created_at) VALUES (?, ?, NULLIF(?, ''), ?, ?)`,
+		r.Name, r.Repo, r.Domain, kind, formatTime(time.Now()))
 	// SQLite names the column in a constraint failure; there is no error
 	// type to look at.
 	if err != nil && strings.Contains(err.Error(), "apps.domain") {
@@ -58,8 +69,8 @@ func (s *Store) Register(ctx context.Context, r Registration) error {
 // not registered.
 func (s *Store) Registration(ctx context.Context, app string) (r Registration, found bool, err error) {
 	var created string
-	err = s.db.QueryRowContext(ctx, `SELECT name, repo, domain, created_at FROM apps WHERE name = ?`, app).
-		Scan(&r.Name, &r.Repo, &r.Domain, &created)
+	err = s.db.QueryRowContext(ctx, `SELECT name, repo, COALESCE(domain, ''), kind, created_at FROM apps WHERE name = ?`, app).
+		Scan(&r.Name, &r.Repo, &r.Domain, &r.Kind, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Registration{}, false, nil
 	}
@@ -72,6 +83,11 @@ func (s *Store) Registration(ctx context.Context, app string) (r Registration, f
 
 // DomainOwner returns the app the domain is registered to, "" for none.
 func (s *Store) DomainOwner(ctx context.Context, domain string) (string, error) {
+	// No domain is nobody's: "domain = NULL" would match nothing anyway,
+	// but not by intent.
+	if domain == "" {
+		return "", nil
+	}
 	var name string
 	err := s.db.QueryRowContext(ctx, `SELECT name FROM apps WHERE domain = ?`, domain).Scan(&name)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -85,7 +101,7 @@ func (s *Store) DomainOwner(ctx context.Context, domain string) (string, error) 
 
 // Registrations returns every registration, by name.
 func (s *Store) Registrations(ctx context.Context) ([]Registration, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name, repo, domain, created_at FROM apps ORDER BY name`)
+	rows, err := s.db.QueryContext(ctx, `SELECT name, repo, COALESCE(domain, ''), kind, created_at FROM apps ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("list registrations: %w", err)
 	}
@@ -94,7 +110,7 @@ func (s *Store) Registrations(ctx context.Context) ([]Registration, error) {
 	for rows.Next() {
 		var r Registration
 		var created string
-		if err := rows.Scan(&r.Name, &r.Repo, &r.Domain, &created); err != nil {
+		if err := rows.Scan(&r.Name, &r.Repo, &r.Domain, &r.Kind, &created); err != nil {
 			return nil, fmt.Errorf("list registrations: %w", err)
 		}
 		if r.CreatedAt, err = parseTime(created); err != nil {

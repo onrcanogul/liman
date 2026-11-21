@@ -185,6 +185,26 @@ var migrations = []string{
 	`
 	ALTER TABLE app_state ADD COLUMN templates TEXT NOT NULL DEFAULT '{}';
 	`,
+
+	// 12: workers. A worker has no domain, and two of them must not
+	// collide on an empty one: domain may be NULL, which UNIQUE lets any
+	// number of rows have, while a real domain still belongs to one app.
+	// The kind is fixed at registration like the domain: a deploy key
+	// cannot turn a worker into something served on the internet. SQLite
+	// cannot change a column's constraints, so the table is built anew.
+	`
+	CREATE TABLE apps_new (
+		name       TEXT PRIMARY KEY,
+		repo       TEXT NOT NULL,
+		domain     TEXT UNIQUE,
+		kind       TEXT NOT NULL DEFAULT 'web',
+		created_at TEXT NOT NULL
+	);
+	INSERT INTO apps_new (name, repo, domain, kind, created_at)
+		SELECT name, repo, domain, 'web', created_at FROM apps;
+	DROP TABLE apps;
+	ALTER TABLE apps_new RENAME TO apps;
+	`,
 }
 
 // SchemaVersion is the schema version this build reads and writes.
