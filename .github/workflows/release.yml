@@ -1,5 +1,5 @@
-# A tag v1.2.3 publishes a release: the binaries for Linux, the files
-# install.sh needs, their checksums and a provenance attestation, after
+# A tag v1.2.3 publishes a release: the binaries for Linux (limand installs
+# itself), install.sh, their checksums and a provenance attestation, after
 # every check in ci.yml has passed. Run by hand, it builds and checks the
 # files without publishing anything.
 name: release
@@ -40,7 +40,7 @@ jobs:
           done
       - name: Files and checksums
         run: |
-          cp deploy/install.sh deploy/limand.service deploy/limand-backup.service deploy/limand-backup.timer dist/
+          cp deploy/install.sh dist/
           cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

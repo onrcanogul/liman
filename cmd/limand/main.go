@@ -29,6 +29,7 @@ func run() int {
 	defer stop()
 
 	d := &daemon.Daemon{
+		Stdin:  os.Stdin,
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,
 		Home:   config.Home(),

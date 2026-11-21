@@ -47,6 +47,15 @@ liman CLI asks for.
 
 Usage:
   limand                          Serve the API (same as "limand serve")
+  limand install [--engine docker|podman] [--proxy nginx|caddy|traefik|none]
+                      [--listen <address:port>] [--hooks-listen <address:port>
+                      | --no-hooks] [--binary <limand>] [--yes]
+                                  Install this limand on the server, as root:
+                                  the liman user, config.yaml, the engine's
+                                  and the proxy's side, the systemd units.
+                                  It looks at what is installed first; in a
+                                  terminal it asks what flags do not say.
+                                  Run again with a newer binary, it upgrades
   limand token create <name> [--read-only | --deploy | --preview]
                       [--expires <90d|12h>]
                       [--app <app>]... [--write-client <file>] [--url <url>]
@@ -134,6 +143,8 @@ While it runs, limand also serves a read-only web panel under /ui/.
 
 // Daemon holds what the limand command needs from the outside world.
 type Daemon struct {
+	// Stdin is read by limand install's questions, in a terminal only.
+	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
 
@@ -192,6 +203,8 @@ func (d *Daemon) Run(ctx context.Context, args []string) int {
 		return d.runAudit(ctx, args[1:])
 	case "version":
 		return d.version(ctx, args[1:])
+	case "install":
+		return d.runInstall(ctx, args[1:])
 	case "help", "-h", "--help":
 		fmt.Fprint(d.Stdout, usage)
 		return exitOK
