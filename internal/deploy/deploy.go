@@ -363,7 +363,7 @@ func (d *Deployer) steps(st *state) []pipeline.Step {
 	// proven healthy, and the previous one is given time to finish the
 	// requests it had already accepted. A worker is routed nowhere; with
 	// replace the previous one is stopped already.
-	if d.Proxy != nil && !st.worker {
+	if d.routed(st) {
 		steps = append(steps, d.proxySteps(st)...)
 		if d.Drain > 0 && !st.replace {
 			steps = append(steps, d.drainStep(st))
@@ -407,6 +407,13 @@ func (d *Deployer) steps(st *state) []pipeline.Step {
 		// roll back from here; and removing the older containers cannot be
 		// undone in any case.
 	})
+}
+
+// routed reports whether the release is routed through the proxy: there
+// is one, and the app has a domain for it. A worker has none, and an app on
+// fixed endpoints may have none either.
+func (d *Deployer) routed(st *state) bool {
+	return d.Proxy != nil && !st.worker && st.domain != ""
 }
 
 // listPrevious records the app's containers before the new one starts,

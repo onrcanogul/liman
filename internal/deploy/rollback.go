@@ -50,7 +50,11 @@ func (d *Deployer) Rollback(ctx context.Context, appName string, opts Options) (
 	if err != nil {
 		return Result{}, err
 	}
-	if d.Proxy != nil && target.Domain == "" && !target.Worker() {
+	// The app is routed through the proxy (it has a config there), and the
+	// release to go back to does not say on which domain: a liman too old
+	// to record it started it. An app without a domain, on fixed
+	// endpoints, has no config and is not routed.
+	if d.Proxy != nil && target.Domain == "" && !target.Worker() && d.hasRoute(appName) {
 		return Result{}, fmt.Errorf("%s was started by a version of liman that did not record its domain, so the proxy cannot be pointed back at it; deploy the version you want instead", target.Name)
 	}
 
@@ -112,7 +116,7 @@ func (d *Deployer) Rollback(ctx context.Context, appName string, opts Options) (
 		},
 	}...)
 
-	if d.Proxy != nil && !st.worker {
+	if d.routed(st) {
 		steps = append(steps, d.proxySteps(st)...)
 		if d.Drain > 0 && !st.replace {
 			steps = append(steps, d.drainStep(st))
@@ -144,4 +148,11 @@ func (d *Deployer) Rollback(ctx context.Context, appName string, opts Options) (
 	}
 
 	return res, pipeline.Run(ctx, steps, popts)
+}
+
+// hasRoute reports whether the proxy has a config for app. An error counts
+// as yes: refusing a rollback is the safe side.
+func (d *Deployer) hasRoute(app string) bool {
+	conf, err := d.Proxy.Current(app)
+	return err != nil || conf != nil
 }

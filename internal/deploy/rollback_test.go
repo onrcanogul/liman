@@ -224,7 +224,10 @@ func TestRollbackWithoutDomainLabelIsRefusedWhenProxyIsUsed(t *testing.T) {
 	fake.Add(engine.Container{Name: "orders-api-r1", App: "orders-api", State: "exited", Release: "r1"})
 	fake.Add(engine.Container{Name: "orders-api-r2", App: "orders-api", Release: "r2"})
 	d := newTestDeployer(fake, io.Discard)
-	d.Proxy = newFakeProxy()
+	proxy := newFakeProxy()
+	// The deploys of that older liman routed the app.
+	proxy.files["orders-api"] = "server { }"
+	d.Proxy = proxy
 
 	_, err := d.Rollback(context.Background(), "orders-api", Options{})
 

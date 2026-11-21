@@ -118,3 +118,48 @@ func TestDryRunOfAFixedPort(t *testing.T) {
 		}
 	}
 }
+
+// What CI's end-to-end test found: an app on a fixed port without a domain
+// got an Nginx server block with an empty server_name, which nginx -t
+// refused. Nothing is routed without a domain.
+func TestAFixedPortWithoutADomainIsNotRouted(t *testing.T) {
+	fake := enginetest.New()
+	var out bytes.Buffer
+	d := newTestDeployer(fake, &out)
+	proxy := newFakeProxy()
+	d.Proxy = proxy
+
+	if _, err := d.Deploy(context.Background(), published("8080"), Options{}); err != nil {
+		t.Fatalf("Deploy() error = %v\n%s", err, out.String())
+	}
+	if strings.Contains(out.String(), "config for") || len(proxy.files) != 0 {
+		t.Errorf("the proxy was written for an app without a domain:\n%s", out.String())
+	}
+
+	// With a domain as well, it is.
+	out.Reset()
+	d.NewRelease = func() string { return "r3" }
+	a := published("8080")
+	a.Domain = "api.example.com"
+	if _, err := d.Deploy(context.Background(), a, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Write Nginx config for api.example.com") {
+		t.Errorf("an app with a domain and a fixed port was not routed:\n%s", out.String())
+	}
+}
+
+func TestRollbackOfAFixedPortWithoutADomain(t *testing.T) {
+	fake := enginetest.New()
+	fake.Add(engine.Container{Name: prevContainer, App: "orders-api", State: "exited", HostPort: 8080, Strategy: app.StrategyReplace, Release: "r1"})
+	fake.Add(engine.Container{Name: newContainer, App: "orders-api", HostPort: 8080, Strategy: app.StrategyReplace, Release: "r2"})
+	d := newTestDeployer(fake, &bytes.Buffer{})
+	d.Proxy = newFakeProxy()
+
+	if _, err := d.Rollback(context.Background(), "orders-api", Options{}); err != nil {
+		t.Fatalf("Rollback() error = %v", err)
+	}
+	if want := []string{"stop " + newContainer, "restart " + prevContainer, "remove " + newContainer}; !slices.Equal(fake.Calls, want) {
+		t.Errorf("calls = %v, want %v", fake.Calls, want)
+	}
+}
