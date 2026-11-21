@@ -93,6 +93,9 @@ type Deployer struct {
 	Drain time.Duration
 	// Sleep waits for d or until ctx is cancelled. Tests replace it.
 	Sleep func(ctx context.Context, d time.Duration) error
+	// WorkerSettle is how long a worker must stay up in a rollback, which
+	// has no definition to read healthcheck.settle from.
+	WorkerSettle time.Duration
 }
 
 // DefaultDrain is how long connections to the previous release are given to
@@ -120,6 +123,8 @@ type Result struct {
 	Release   string
 	Container string
 	HostPort  int
+	// Worker says the release is a worker: no port, nothing routed to it.
+	Worker bool
 }
 
 // New returns a Deployer with production defaults. Progress is written to
@@ -135,6 +140,7 @@ func New(e engine.Engine, out io.Writer) *Deployer {
 		HealthInterval: 500 * time.Millisecond,
 		Drain:          DefaultDrain,
 		Sleep:          sleep,
+		WorkerSettle:   app.DefaultSettle,
 	}
 }
 
@@ -182,7 +188,7 @@ func (d *Deployer) Deploy(ctx context.Context, a *app.App, opts Options) (Result
 	}
 
 	release := d.NewRelease()
-	res := Result{Release: release, Container: a.Name + "-" + release}
+	res := Result{Release: release, Container: a.Name + "-" + release, Worker: a.Worker()}
 
 	// state is shared by the step closures below: one step fills a field
 	// in, a later step reads it.
@@ -196,6 +202,9 @@ func (d *Deployer) Deploy(ctx context.Context, a *app.App, opts Options) (Result
 		container:   res.Container,
 		release:     release,
 		secretFiles: opts.SecretFiles,
+		worker:      a.Worker(),
+		replace:     a.Strategy() == app.StrategyReplace,
+		settle:      a.Settle(),
 	}
 
 	popts := pipeline.Options{
@@ -228,6 +237,13 @@ type state struct {
 	healthPath  string // "" if the app has no health check
 	memoryLimit string // as written in the definition, for messages
 
+	// worker: no port, no domain, no proxy. replace: the running release
+	// is stopped before the new one starts. settle: how long the container
+	// must stay up when nothing else tells whether it is healthy.
+	worker  bool
+	replace bool
+	settle  time.Duration
+
 	memory int64
 	// secretFiles are the values of the app's secret_files, by name.
 	secretFiles map[string][]byte
@@ -238,9 +254,14 @@ type state struct {
 
 	// hostPort is set by the port step.
 	hostPort int
-	// previous is set by the start step: the app's containers that existed
-	// before this deploy.
+	// previous is set by the start step, or before it by the step that
+	// stops the running release: the app's containers that existed before
+	// this deploy. listed says it has been set.
 	previous []engine.Container
+	listed   bool
+	// stopped is the release the replace strategy stopped before the start,
+	// which the undo starts again.
+	stopped string
 
 	// previousConf is set by the proxy config step: the config that was on
 	// disk before this deploy, or nil if there was none.
@@ -252,16 +273,18 @@ type state struct {
 func (d *Deployer) steps(st *state) []pipeline.Step {
 	a := st.app
 
-	steps := []pipeline.Step{
-		{
-			Name:   "Pull image " + a.Image,
-			Manual: func() string { return "docker pull " + a.Image },
-			Run: func(ctx context.Context) error {
-				return d.engine.Pull(ctx, a.Image, indent(d.out))
-			},
-			// No Undo: a pulled image is harmless and speeds up the retry.
+	steps := []pipeline.Step{{
+		Name:   "Pull image " + a.Image,
+		Manual: func() string { return "docker pull " + a.Image },
+		Run: func(ctx context.Context) error {
+			return d.engine.Pull(ctx, a.Image, indent(d.out))
 		},
-		{
+		// No Undo: a pulled image is harmless and speeds up the retry.
+	}}
+
+	// A worker publishes no port, so there is none to find.
+	if !st.worker {
+		steps = append(steps, pipeline.Step{
 			Name: "Allocate a free host port",
 			Run: func(context.Context) error {
 				port, err := d.AllocatePort()
@@ -273,65 +296,71 @@ func (d *Deployer) steps(st *state) []pipeline.Step {
 				return nil
 			},
 			// No Undo: the port is only reserved once a container binds it.
-		},
-		{
-			Name:   "Start container " + st.container,
-			Manual: func() string { return runCommand(st) },
-			Run: func(ctx context.Context) error {
-				// Remember what was running before, so the last step knows
-				// what to remove. This must happen before Start, otherwise
-				// the new container would be in the list too.
-				all, err := d.engine.List(ctx)
-				if err != nil {
-					return err
-				}
-				st.previous = engine.ForApp(all, a.Name)
-
-				id, err := d.engine.Start(ctx, engine.Spec{
-					App:           a.Name,
-					Name:          st.container,
-					Image:         a.Image,
-					ContainerPort: a.Port,
-					HostPort:      st.hostPort,
-					Env:           a.Env,
-					Files:         secretFiles(a, st.secretFiles),
-					MemoryBytes:   st.memory,
-					CPUs:          a.Resources.CPUs,
-					Release:       st.release,
-					HealthPath:    st.healthPath,
-					Domain:        a.Domain,
-				})
-				if err != nil {
-					return err
-				}
-				d.detail("%s", shortID(id))
-				return nil
-			},
-			Undo: func(ctx context.Context) error {
-				return d.engine.Remove(ctx, st.container)
-			},
-		},
-		{
-			Name:   "Health check",
-			Manual: func() string { return healthCommand(st) },
-			Run: func(ctx context.Context) error {
-				err := d.waitHealthy(ctx, st)
-				if err != nil {
-					// The undo of the start step is about to remove the
-					// container, and its logs with it. Show them now.
-					d.showLogs(ctx, st.container)
-				}
-				return err
-			},
-		},
+		})
 	}
+
+	if st.replace {
+		steps = append(steps, d.stopRunningStep(st))
+	}
+
+	steps = append(steps, pipeline.Step{
+		Name:   "Start container " + st.container,
+		Manual: func() string { return runCommand(st) },
+		Run: func(ctx context.Context) error {
+			// Remember what was running before, so the last step knows
+			// what to remove. This must happen before Start, otherwise
+			// the new container would be in the list too.
+			if err := d.listPrevious(ctx, st); err != nil {
+				return err
+			}
+
+			id, err := d.engine.Start(ctx, engine.Spec{
+				App:           a.Name,
+				Name:          st.container,
+				Image:         a.Image,
+				ContainerPort: a.Port,
+				HostPort:      st.hostPort,
+				Command:       a.Command,
+				Env:           a.Env,
+				Files:         secretFiles(a, st.secretFiles),
+				MemoryBytes:   st.memory,
+				CPUs:          a.Resources.CPUs,
+				Release:       st.release,
+				HealthPath:    st.healthPath,
+				Domain:        a.Domain,
+				Kind:          a.Kind,
+				Strategy:      a.Deploy.Strategy,
+			})
+			if err != nil {
+				return err
+			}
+			d.detail("%s", shortID(id))
+			return nil
+		},
+		Undo: func(ctx context.Context) error {
+			return d.engine.Remove(ctx, st.container)
+		},
+	}, pipeline.Step{
+		Name:   "Health check",
+		Manual: func() string { return healthCommand(st) },
+		Run: func(ctx context.Context) error {
+			err := d.waitHealthy(ctx, st)
+			if err != nil {
+				// The undo of the start step is about to remove the
+				// container, and its logs with it. Show them now.
+				d.showLogs(ctx, st.container)
+			}
+			return err
+		},
+	})
 
 	// With a proxy, traffic is switched to the new container after it has
 	// proven healthy, and the previous one is given time to finish the
-	// requests it had already accepted.
-	if d.Proxy != nil {
+	// requests it had already accepted. A worker is routed nowhere; with
+	// replace the previous one is stopped already.
+	if d.Proxy != nil && !st.worker {
 		steps = append(steps, d.proxySteps(st)...)
-		if d.Drain > 0 {
+		if d.Drain > 0 && !st.replace {
 			steps = append(steps, d.drainStep(st))
 		}
 	}
@@ -351,6 +380,10 @@ func (d *Deployer) steps(st *state) []pipeline.Step {
 			// superseded twice and is removed.
 			last := len(st.previous) - 1
 			for i, prev := range st.previous {
+				if i == last && prev.Name == st.stopped {
+					d.detail("%s was stopped before the start (kept for rollback)", prev.Name)
+					continue
+				}
 				if i == last {
 					if err := d.engine.Stop(ctx, prev.Name); err != nil {
 						return err
@@ -369,6 +402,59 @@ func (d *Deployer) steps(st *state) []pipeline.Step {
 		// roll back from here; and removing the older containers cannot be
 		// undone in any case.
 	})
+}
+
+// listPrevious records the app's containers before the new one starts,
+// once: the step that stops the running release lists them first.
+func (d *Deployer) listPrevious(ctx context.Context, st *state) error {
+	if st.listed {
+		return nil
+	}
+	all, err := d.engine.List(ctx)
+	if err != nil {
+		return err
+	}
+	st.previous = engine.ForApp(all, st.name)
+	st.listed = true
+	return nil
+}
+
+// stopRunningStep stops the release in service before the new one starts,
+// for the replace strategy: two of them must never run at once. Its undo
+// starts it again, which is what happens when the new one is not healthy.
+func (d *Deployer) stopRunningStep(st *state) pipeline.Step {
+	return pipeline.Step{
+		Name: "Stop the running release of " + st.name,
+		Manual: func() string {
+			return fmt.Sprintf("docker stop <current container of %s>   # started again if the release replacing it is not healthy", st.name)
+		},
+		Run: func(ctx context.Context) error {
+			if err := d.listPrevious(ctx, st); err != nil {
+				return err
+			}
+			if len(st.previous) == 0 {
+				d.detail("none (first deploy)")
+				return nil
+			}
+			current := st.previous[len(st.previous)-1]
+			if !current.Running() {
+				d.detail("%s is not running", current.Name)
+				return nil
+			}
+			if err := d.engine.Stop(ctx, current.Name); err != nil {
+				return err
+			}
+			st.stopped = current.Name
+			d.detail("stopped %s; it is started again if the release replacing it is not healthy", current.Name)
+			return nil
+		},
+		Undo: func(ctx context.Context) error {
+			if st.stopped == "" {
+				return nil
+			}
+			return d.engine.Restart(ctx, st.stopped)
+		},
+	}
 }
 
 // drainStep waits while the previous release finishes the requests it had
@@ -511,66 +597,6 @@ func (d *Deployer) previewConf(st *state) string {
 	return diff
 }
 
-// waitHealthy blocks until the app is healthy, the container dies, the
-// timeout expires or ctx is cancelled.
-func (d *Deployer) waitHealthy(ctx context.Context, st *state) error {
-	// A derived context carries a deadline. Everything that receives it,
-	// including the HTTP request in Probe, stops when the deadline passes.
-	ctx, cancel := context.WithTimeout(ctx, d.HealthTimeout)
-	defer cancel()
-
-	url := ""
-	if st.healthPath != "" {
-		url = health.URL(st.hostPort, st.healthPath)
-		d.detail("GET %s", url)
-	} else {
-		d.detail("no healthcheck defined; checking that the container stays up")
-	}
-
-	var lastErr error
-	for attempt := 1; ; attempt++ {
-		// A container that has exited will never become healthy. Failing
-		// immediately gives a precise error instead of a timeout.
-		ctr, err := d.engine.Inspect(ctx, st.container)
-		if err != nil {
-			return err
-		}
-		if !ctr.Running() {
-			if ctr.OOMKilled {
-				limit := ""
-				if st.memoryLimit != "" {
-					limit = " (" + st.memoryLimit + ")"
-				}
-				return fmt.Errorf("container was killed for exceeding its memory limit%s", limit)
-			}
-			return fmt.Errorf("container is %s (exit code %d)", ctr.State, ctr.ExitCode)
-		}
-
-		if url == "" {
-			// Without a healthcheck, "still running after one interval" is
-			// the best signal available.
-			if attempt > 1 {
-				return nil
-			}
-			lastErr = errors.New("container has not been up for a full interval yet")
-		} else if lastErr = d.Probe(ctx, url); lastErr == nil {
-			return nil
-		}
-
-		// select waits for whichever happens first: the deadline or the
-		// end of the pause. A plain time.Sleep could not be interrupted.
-		select {
-		case <-ctx.Done():
-			// context.Cause tells a deadline apart from a cancellation.
-			if errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
-				return fmt.Errorf("not healthy after %s: %w", d.HealthTimeout, lastErr)
-			}
-			return ctx.Err()
-		case <-time.After(d.HealthInterval):
-		}
-	}
-}
-
 // showLogs prints the container's recent output. Failures are ignored: this
 // is a diagnostic aid on an error path that already has an error to report.
 func (d *Deployer) showLogs(ctx context.Context, container string) {
@@ -600,8 +626,10 @@ func runCommand(st *state) string {
 	// strings.Builder assembles a string piece by piece without creating a
 	// new string for every addition.
 	var b strings.Builder
-	fmt.Fprintf(&b, "docker run -d --name %s --label %s=%s -p 127.0.0.1:%s:%d",
-		st.container, engine.LabelApp, a.Name, port, a.Port)
+	fmt.Fprintf(&b, "docker run -d --name %s --label %s=%s", st.container, engine.LabelApp, a.Name)
+	if !st.worker {
+		fmt.Fprintf(&b, " -p 127.0.0.1:%s:%d", port, a.Port)
+	}
 	if a.Resources.Memory != "" {
 		fmt.Fprintf(&b, " --memory %s", a.Resources.Memory)
 	}
@@ -621,6 +649,9 @@ func runCommand(st *state) string {
 	}
 
 	fmt.Fprintf(&b, " %s", a.Image)
+	for _, arg := range a.Command {
+		fmt.Fprintf(&b, " %s", shellQuote(arg))
+	}
 	if len(a.SecretFiles) > 0 {
 		// docker run cannot do this part; liman creates the container,
 		// copies the files in, and only then starts it.
@@ -642,17 +673,6 @@ func secretFiles(a *app.App, values map[string][]byte) []engine.File {
 		files = append(files, engine.File{Path: app.SecretFilePath(name), Content: values[name], Mode: 0o444})
 	}
 	return files
-}
-
-func healthCommand(st *state) string {
-	if st.healthPath == "" {
-		return "docker inspect --format '{{.State.Status}}' " + st.container
-	}
-	port := "<free port>"
-	if st.hostPort != 0 {
-		port = fmt.Sprint(st.hostPort)
-	}
-	return fmt.Sprintf("curl --fail http://127.0.0.1:%s%s", port, st.healthPath)
 }
 
 // retireCommand returns the commands equivalent to the retire step.
@@ -703,6 +723,14 @@ func healthPath(a *app.App) string {
 		return ""
 	}
 	return a.Healthcheck.Path
+}
+
+// shellQuote quotes arg for a shell when it needs it, for display.
+func shellQuote(arg string) string {
+	if arg != "" && strings.Trim(arg, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_./=:,@") == "" {
+		return arg
+	}
+	return "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
 }
 
 func shortID(id string) string {

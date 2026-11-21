@@ -46,6 +46,7 @@ func newTestDeployer(e engine.Engine, out io.Writer) *Deployer {
 	// No draining unless a test asks for it; it adds a step.
 	d.Drain = 0
 	d.Sleep = func(context.Context, time.Duration) error { return nil }
+	d.WorkerSettle = 5 * time.Millisecond
 	return d
 }
 

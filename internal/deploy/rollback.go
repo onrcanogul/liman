@@ -50,7 +50,7 @@ func (d *Deployer) Rollback(ctx context.Context, appName string, opts Options) (
 	if err != nil {
 		return Result{}, err
 	}
-	if d.Proxy != nil && target.Domain == "" {
+	if d.Proxy != nil && target.Domain == "" && !target.Worker() {
 		return Result{}, fmt.Errorf("%s was started by a version of liman that did not record its domain, so the proxy cannot be pointed back at it; deploy the version you want instead", target.Name)
 	}
 
@@ -61,13 +61,29 @@ func (d *Deployer) Rollback(ctx context.Context, appName string, opts Options) (
 		container:  target.Name,
 		release:    target.Release,
 		hostPort:   target.HostPort,
+		worker:     target.Worker(),
+		// Either release asking for it is enough: the one running may
+		// have been deployed with replace, the one coming back without.
+		replace: target.Replace() || current.Replace(),
 		// From the point of view of the shared steps, the release being
 		// replaced is "previous": it is what gets drained.
 		previous: []engine.Container{current},
+		listed:   true,
 	}
-	res := Result{Release: target.Release, Container: target.Name, HostPort: target.HostPort}
+	// What healthcheck.settle said is not on the container; a worker gets
+	// the default.
+	if st.worker {
+		st.settle = d.WorkerSettle
+	}
+	res := Result{Release: target.Release, Container: target.Name, HostPort: target.HostPort, Worker: target.Worker()}
 
-	steps := []pipeline.Step{
+	var steps []pipeline.Step
+	// Releases that must never run side by side are swapped one after the
+	// other here too.
+	if st.replace {
+		steps = append(steps, d.stopRunningStep(st))
+	}
+	steps = append(steps, []pipeline.Step{
 		{
 			Name:   "Start previous container " + target.Name,
 			Manual: func() string { return "docker start " + target.Name },
@@ -93,11 +109,11 @@ func (d *Deployer) Rollback(ctx context.Context, appName string, opts Options) (
 				return err
 			},
 		},
-	}
+	}...)
 
-	if d.Proxy != nil {
+	if d.Proxy != nil && !st.worker {
 		steps = append(steps, d.proxySteps(st)...)
-		if d.Drain > 0 {
+		if d.Drain > 0 && !st.replace {
 			steps = append(steps, d.drainStep(st))
 		}
 	}
