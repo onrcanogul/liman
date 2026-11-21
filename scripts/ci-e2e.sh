@@ -144,6 +144,39 @@ sudo systemctl start limand-backup.service
 sudo sh -c "ls /var/backups/liman/*.db.age" >/dev/null || fail "no backup written"
 sudo ls -l /var/backups/liman
 
+step "A worker: no domain, no port, nothing routed"
+docker tag traefik/whoami:v1.10 localhost:5000/mailer:ci
+WORKER_DIGEST=$(docker push localhost:5000/mailer:ci | grep -o 'sha256:[0-9a-f]\{64\}' | tail -1)
+sudo install -d -o liman -g liman -m 0700 "$STATE/e2e"
+as_liman app create mailer --repo localhost:5000/mailer --worker \
+    --write-client "$STATE/e2e/worker.yaml" --url "http://$HOOKS"
+mkdir -m 0700 "$WORK/worker"
+sudo install -m 0600 -o "$(id -u)" -g "$(id -g)" "$STATE/e2e/worker.yaml" "$WORK/worker/client.yaml"
+sudo rm -rf "$STATE/e2e"
+cat > "$WORK/worker.yaml" <<YAML
+name: mailer
+image: localhost:5000/mailer
+kind: worker
+# Any long-running process will do; this one listens only inside.
+command: [/whoami, --port, "8080"]
+deploy:
+  strategy: replace
+YAML
+LIMAN_HOME="$WORK/worker" liman trigger --digest "$WORKER_DIGEST" --file "$WORK/worker.yaml" | tee "$WORK/worker.log"
+grep -q 'as a worker' "$WORK/worker.log" || fail "the worker was not deployed as one"
+grep -q 'must stay up for 10s' "$WORK/worker.log" || fail "the worker was not given its settle time"
+running=$(docker ps --filter label=liman.app=mailer --format '{{.Ports}}')
+[ -z "$running" ] || fail "the worker publishes a port: $running"
+docker ps --filter label=liman.app=mailer --format '{{.Names}}' | grep -q . || fail "the worker is not running"
+sudo test ! -e /etc/nginx/liman.d/mailer.conf || fail "the worker got an Nginx config"
+# Its key cannot put it on the internet.
+printf 'name: mailer\nimage: localhost:5000/mailer\ndomain: mail.test\nport: 8080\n' > "$WORK/worker-web.yaml"
+if out=$(LIMAN_HOME="$WORK/worker" liman trigger --digest "$WORKER_DIGEST" --file "$WORK/worker-web.yaml" 2>&1); then
+    fail "a worker's key deployed it as a web app"
+fi
+grep -q 'registered as a worker' <<<"$out" || fail "unexpected refusal: $out"
+as_liman app list | grep mailer
+
 step "Deleting the app revokes its keys"
 as_liman app delete whoami | tee "$WORK/delete.log"
 grep -q 'Revoked: whoami-ci, whoami-pr' "$WORK/delete.log" || fail "the keys were not revoked"

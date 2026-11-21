@@ -1,0 +1,22 @@
+# Example worker: a process that serves no requests (a queue consumer, a
+# scheduler, a bot). It has no domain and no port; nothing is routed to it.
+# Try it with: liman deploy examples/worker.yaml
+
+name: ticker
+image: traefik/whoami:v1.10
+
+kind: worker
+
+# Optional. Replaces the image's command. whoami serves HTTP, but here only
+# inside the container: a worker publishes nothing.
+command: [/whoami, --port, "8080"]
+
+# Optional. "replace" stops the running release before the new one starts,
+# for a worker of which two must never run at once.
+deploy:
+  strategy: replace
+
+# Optional. Without a HEALTHCHECK in the image, the worker must stay up this
+# long for its deploy to succeed (10s when left out).
+healthcheck:
+  settle: 5s
