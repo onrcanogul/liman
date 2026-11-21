@@ -209,8 +209,10 @@ deploy:
 
 `kind: worker` is written out on purpose: a web app that forgets its
 `domain` is an error, not a worker in disguise. A worker with a `domain`,
-a `port` or a `healthcheck.path` is refused too. `command` works for web
-apps as well.
+a `port`, a `publish` or a `healthcheck.path` is refused too. `command`
+works for web apps as well. Like Compose's `command`, it replaces the
+image's `CMD`: with an `ENTRYPOINT` (as `traefik/whoami` has) it gives that
+program its arguments, it does not replace the program.
 
 **Healthy, without anything to ask.** A worker is healthy when the image's
 own `HEALTHCHECK` says so; liman waits as long as that check may take (by
@@ -242,6 +244,72 @@ give it a domain, nor turn a web app's registration into a worker's:
 ```
 limand app create orders-worker --repo ghcr.io/team/orders-api --worker
 ```
+
+## Fixed ports
+
+An app's own port on the server changes with every release, which is fine
+for the proxy liman drives and for nothing else. A load balancer in front of
+the server (Hetzner's, AWS's), a proxy liman does not drive (a Cloudflare
+Tunnel, someone else's HAProxy), or a service on the private network needs
+an address that stays. `publish` gives the app one:
+
+```yaml
+name: orders-api
+image: ghcr.io/team/orders-api
+port: 3000                 # inside the container
+publish: 8080              # on the server: 127.0.0.1:8080
+# publish: 10.8.0.1:8080   # an address of the private network
+# publish: [8080, 8081]    # two, that releases take turns on
+domain: api.example.com    # optional: the proxy liman drives as well
+```
+
+A web app needs a `domain`, a `publish`, or both; with a domain, publish on
+127.0.0.1 or 0.0.0.0, where the proxy reaches the app.
+
+**One port.** It cannot hold two releases, so they replace each other, and
+the new one is tried first:
+
+```
+==> [2/7] Allocate a free host port
+==> [3/7] Try the new release on a free port
+    healthy; the release itself goes on 127.0.0.1:8080
+==> [4/7] Stop the running release of orders-api
+==> [5/7] Start container orders-api-20261121-095040-516
+==> [6/7] Health check
+==> [7/7] Retire previous containers of orders-api
+```
+
+A release that is not healthy on the free port fails there, and the running
+one is never touched (in a trial, 1,052 requests during such a deploy, none
+failed). The trial does not shorten the gap, though: the release then starts
+again on the fixed port, and nothing answers there until it has. **The gap
+is as long as the app takes to start**: 0.3 seconds for a small Go server, 3
+for an app that takes 3 to start, more for a JVM. An app that does work when
+it starts (a database migration) does it twice.
+
+**Two ports.** With `publish: [8080, 8081]` each release goes on the port
+the running one is not on, next to it, and the old one stops once the new
+one is healthy. A load balancer that checks both and sends traffic to the
+healthy one sees no gap (in a trial, 3,154 requests over two deploys, none
+failed).
+
+**Who may publish where.** Docker's published ports pass by ufw and similar
+firewalls: a port on 0.0.0.0 can be reached from anywhere the server can,
+whatever `ufw` says; only a firewall in front of the server (the provider's)
+stops it. So, like the domain, the endpoints of an app deployed from CI are
+fixed at registration, and a definition that names others is refused:
+
+```
+limand app create orders-api --repo ghcr.io/team/orders-api --publish 10.8.0.1:8080
+limand app create orders-api --repo ghcr.io/team/orders-api --publish 8080,8081 --domain api.example.com
+```
+
+A public address is accepted there with a note about the firewall. Two apps
+cannot be published on one port; a deploy whose endpoint another app holds
+(registered to it, or bound by one of its containers, a stopped one kept for
+a rollback included) is refused with a 409. The health check asks the
+address the app is published on: an app on 10.8.0.1 only does not answer on
+127.0.0.1.
 
 ## More on deploys
 
@@ -307,6 +375,7 @@ deploy key:
 ```
 limand app create orders-api --repo ghcr.io/team/orders-api --domain api.example.com [--preview-key]
 limand app create orders-worker --repo ghcr.io/team/orders-api --worker   # a worker: no domain (see Workers)
+limand app create orders-api --repo ghcr.io/team/orders-api --publish 10.8.0.1:8080   # a fixed port (see Fixed ports)
 limand app list                       # with each app's keys
 limand app delete orders-api          # its pipeline can no longer deploy it
 ```
@@ -1397,7 +1466,8 @@ minutes in all:
   fresh Ubuntu, as on a new server: `install.sh`, a local registry, an app
   registered with a deploy and a preview key, a preview, deploys through
   the trigger endpoint, what Nginx serves, a worker (no port, no Nginx
-  config, its key refused a domain), the audit anchors in the system log,
+  config, its key refused a domain), an app on a fixed port (tried first,
+  its key refused 0.0.0.0), the audit anchors in the system log,
   the backup service, and the keys revoked when the app is deleted.
   It changes the machine it runs on, so outside CI it runs only with
   `LIMAN_E2E_THROWAWAY=yes`.
