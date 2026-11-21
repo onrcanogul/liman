@@ -6,8 +6,29 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"time"
 
 	"go.yaml.in/yaml/v3"
+)
+
+// The kinds of app. A web app serves requests on its domain; a worker serves
+// none (a queue consumer, a scheduler, a bot) and has neither domain nor
+// port.
+const (
+	KindWeb    = "web"
+	KindWorker = "worker"
+)
+
+// The ways a deploy replaces the running release.
+const (
+	// StrategyOverlap starts the new release next to the old one and stops
+	// the old one once the new one is healthy: no gap, but for a moment
+	// both run. The default.
+	StrategyOverlap = "overlap"
+	// StrategyReplace stops the old release first and starts the new one
+	// after: never two at once (a bot, a scheduler), but a gap. If the new
+	// one is not healthy, the old one is started again.
+	StrategyReplace = "replace"
 )
 
 // App is the desired state of one application, as written in app.yaml.
@@ -22,6 +43,13 @@ type App struct {
 	// Image is the full image reference including a tag or digest,
 	// e.g. ghcr.io/user/orders-api:1.4.
 	Image string `yaml:"image"`
+
+	// Kind is "web" (the default) or "worker".
+	Kind string `yaml:"kind"`
+
+	// Command replaces the image's command, so that one image can run as
+	// the web app and as its worker. Empty keeps the image's.
+	Command []string `yaml:"command"`
 
 	// Domain is the public host name that is routed to this app.
 	Domain string `yaml:"domain"`
@@ -53,6 +81,58 @@ type App struct {
 	// Healthcheck is optional. It is a pointer so that "not set" (nil) can
 	// be told apart from "set but empty".
 	Healthcheck *Healthcheck `yaml:"healthcheck"`
+
+	// Deploy says how a release replaces the one before.
+	Deploy Deploy `yaml:"deploy"`
+}
+
+// Worker reports whether the app is a worker: no domain, no port, no proxy.
+func (a *App) Worker() bool { return a.Kind == KindWorker }
+
+// Strategy is the deploy strategy, with the default filled in.
+func (a *App) Strategy() string {
+	if a.Deploy.Strategy == "" {
+		return StrategyOverlap
+	}
+	return a.Deploy.Strategy
+}
+
+// DefaultSettle is how long a worker without a health check of its own must
+// stay up before its deploy counts as a success. A worker that cannot reach
+// its queue typically gives up within a few seconds.
+const DefaultSettle = 10 * time.Second
+
+// Settle is how long the container must stay up when nothing else tells
+// whether it is healthy: healthcheck.settle, or for a worker DefaultSettle.
+// Zero means the old rule for a web app without a health check: still
+// running after one check interval.
+func (a *App) Settle() time.Duration {
+	if a.Healthcheck != nil && a.Healthcheck.Settle != 0 {
+		return time.Duration(a.Healthcheck.Settle)
+	}
+	if a.Worker() {
+		return DefaultSettle
+	}
+	return 0
+}
+
+// Deploy configures how a release is put into service.
+type Deploy struct {
+	// Strategy is "overlap" (the default) or "replace".
+	Strategy string `yaml:"strategy"`
+}
+
+// Duration is a time.Duration written in YAML as "10s" or "1m".
+type Duration time.Duration
+
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
+	parsed, err := time.ParseDuration(node.Value)
+	if err != nil {
+		return fmt.Errorf("line %d: %q is not a duration; write it like 10s or 1m", node.Line, node.Value)
+	}
+	*d = Duration(parsed)
+	return nil
 }
 
 // Resources describes container resource limits.
@@ -66,8 +146,12 @@ type Resources struct {
 
 // Healthcheck describes how to check that the app can serve requests.
 type Healthcheck struct {
-	// Path is requested with HTTP GET on the app's port.
+	// Path is requested with HTTP GET on the app's port. A worker has no
+	// port; an image's own HEALTHCHECK is used when there is one.
 	Path string `yaml:"path"`
+	// Settle is how long the container must stay up to count as healthy
+	// when there is neither a path nor an image HEALTHCHECK.
+	Settle Duration `yaml:"settle"`
 }
 
 // Load reads, parses and validates the app definition at path.

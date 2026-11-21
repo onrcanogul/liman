@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -105,6 +106,24 @@ func (a *App) Fields() map[string]string {
 	}
 	if a.Healthcheck != nil {
 		f["healthcheck.path"] = a.Healthcheck.Path
+		if a.Healthcheck.Settle != 0 {
+			f["healthcheck.settle"] = time.Duration(a.Healthcheck.Settle).String()
+		}
+	}
+	// The fields below came later. Each is there only when it differs
+	// from the default, so that the checksum of a definition written
+	// before them stays what it was, and upgrading liman redeploys
+	// nothing by itself.
+	if a.Kind != "" && a.Kind != KindWeb {
+		f["kind"] = a.Kind
+	}
+	if len(a.Command) > 0 {
+		// The order of a command's arguments is its meaning.
+		b, _ := json.Marshal(a.Command)
+		f["command"] = string(b)
+	}
+	if a.Deploy.Strategy != "" && a.Deploy.Strategy != StrategyOverlap {
+		f["deploy.strategy"] = a.Deploy.Strategy
 	}
 	return f
 }

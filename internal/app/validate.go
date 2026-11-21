@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Compiled once at package initialisation. MustCompile panics on an invalid
@@ -40,6 +41,8 @@ var (
 const (
 	maxImageLength      = 255
 	maxDomainLength     = 253
+	maxCommandArgs      = 64
+	maxSettle           = 10 * time.Minute
 	maxHealthPathLength = 200
 	maxEnvVars          = 200
 )
@@ -102,12 +105,48 @@ func (a *App) Validate() error {
 		errs = append(errs, fmt.Errorf("image: %w", err))
 	}
 
-	if len(a.Domain) > maxDomainLength || !domainRe.MatchString(a.Domain) {
-		errs = append(errs, fmt.Errorf("domain: must be a lowercase host name such as api.example.com, got %q", a.Domain))
+	switch a.Kind {
+	case "", KindWeb:
+		if a.Domain == "" {
+			errs = append(errs, errors.New("domain: is required for a web app; for a process that serves no requests (a queue consumer, a scheduler, a bot) write kind: worker"))
+		} else if len(a.Domain) > maxDomainLength || !domainRe.MatchString(a.Domain) {
+			errs = append(errs, fmt.Errorf("domain: must be a lowercase host name such as api.example.com, got %q", a.Domain))
+		}
+		if a.Port < 1 || a.Port > 65535 {
+			errs = append(errs, fmt.Errorf("port: must be between 1 and 65535, got %d", a.Port))
+		}
+	case KindWorker:
+		// Nothing reaches a worker from outside, so nothing may suggest
+		// that something does.
+		if a.Domain != "" {
+			errs = append(errs, fmt.Errorf("domain: a worker is not reached from outside; remove %q, or make it kind: web", a.Domain))
+		}
+		if a.Port != 0 {
+			errs = append(errs, fmt.Errorf("port: a worker listens on no port; remove %d, or make it kind: web", a.Port))
+		}
+		if a.Healthcheck != nil && a.Healthcheck.Path != "" {
+			errs = append(errs, errors.New("healthcheck.path: a worker has no port to ask; give the image a HEALTHCHECK, or rely on healthcheck.settle"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("kind: must be web or worker, got %q", a.Kind))
 	}
 
-	if a.Port < 1 || a.Port > 65535 {
-		errs = append(errs, fmt.Errorf("port: must be between 1 and 65535, got %d", a.Port))
+	if len(a.Command) > maxCommandArgs {
+		errs = append(errs, fmt.Errorf("command: at most %d arguments are allowed, got %d", maxCommandArgs, len(a.Command)))
+	}
+	for i, arg := range a.Command {
+		if strings.ContainsRune(arg, 0) {
+			errs = append(errs, fmt.Errorf("command: argument %d contains a NUL byte", i+1))
+		}
+	}
+	if len(a.Command) > 0 && a.Command[0] == "" {
+		errs = append(errs, errors.New("command: the first argument names the program and must not be empty"))
+	}
+
+	switch a.Deploy.Strategy {
+	case "", StrategyOverlap, StrategyReplace:
+	default:
+		errs = append(errs, fmt.Errorf("deploy.strategy: must be overlap or replace, got %q", a.Deploy.Strategy))
 	}
 
 	if len(a.Env) > maxEnvVars {
@@ -187,6 +226,11 @@ func (a *App) Validate() error {
 	}
 
 	if a.Healthcheck != nil {
+		if s := time.Duration(a.Healthcheck.Settle); s < 0 || s > maxSettle {
+			errs = append(errs, fmt.Errorf("healthcheck.settle: must be between 0s and %s, got %s", maxSettle, s))
+		}
+	}
+	if a.Healthcheck != nil && (a.Healthcheck.Path != "" || a.Healthcheck.Settle == 0) {
 		path := a.Healthcheck.Path
 		switch {
 		case !strings.HasPrefix(path, "/"):
