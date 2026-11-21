@@ -1584,16 +1584,27 @@ Mondays, as both can break without a commit. The load test runs only by
 hand ([load.yml](.github/workflows/load.yml)): on shared machines its
 numbers vary too much to decide anything.
 
-A tag publishes a release ([release.yml](.github/workflows/release.yml)):
+A tag makes a release ([release.yml](.github/workflows/release.yml)). Its
+notes are written by hand first, in `docs/releases/<tag>.md`; without
+them the release stops before building:
 
 ```
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
 It runs ci.yml again, builds the binaries with the tag as their version
-(and checks that they say so), and publishes them with `install.sh`,
-`SHA256SUMS` and a provenance attestation. Started by hand
-it does everything but publish.
+(and checks that they say so), and makes a **draft** release with them,
+`install.sh`, `SHA256SUMS` and a provenance attestation. v0.x and tags with
+a hyphen (`v1.0.0-rc.1`) are marked pre-releases. Nobody sees a draft;
+after downloading and checking its files, a person publishes it:
+
+```
+gh release download v0.1.0 -D /tmp/v0.1.0 && cd /tmp/v0.1.0 && sha256sum --check SHA256SUMS
+gh release edit v0.1.0 --draft=false
+```
+
+Started by hand, the workflow builds and checks the files without making
+a release.
 
 ### Load tests
 
@@ -1647,5 +1658,6 @@ internal/buildinfo/  version metadata injected at build time
 deploy/              install.sh, which hands over to limand install
 internal/install/    limand install: what is on the server, the choices, the steps; the systemd units
 scripts/             local development helpers, and the end-to-end test CI runs
+docs/releases/       the notes of each release, written before its tag
 .github/             CI, release and weekly workflows; Dependabot
 ```

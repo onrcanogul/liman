@@ -1,7 +1,10 @@
-# A tag v1.2.3 publishes a release: the binaries for Linux (limand installs
-# itself), install.sh, their checksums and a provenance attestation, after
-# every check in ci.yml has passed. Run by hand, it builds and checks the
-# files without publishing anything.
+# A tag v1.2.3 makes a draft release: the binaries for Linux (limand
+# installs itself), install.sh, their checksums and a provenance
+# attestation, after every check in ci.yml has passed, with the notes in
+# docs/releases/v1.2.3.md. v0.x and tags with a hyphen (v1.0.0-rc.1) are
+# pre-releases. A person looks at the draft and publishes it:
+#   gh release edit v1.2.3 --draft=false
+# Run by hand, it builds and checks the files without making a release.
 name: release
 
 on:
@@ -26,6 +29,11 @@ jobs:
           persist-credentials: false
           # git describe needs the history and the tags.
           fetch-depth: 0
+      - name: The release has notes
+        if: github.ref_type == 'tag'
+        run: |
+          test -s "docs/releases/${GITHUB_REF_NAME}.md" ||
+            { echo "::error::docs/releases/${GITHUB_REF_NAME}.md is missing: write the release notes first"; exit 1; }
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
@@ -58,6 +66,11 @@ jobs:
       id-token: write      # the attestation's signature
       attestations: write  # storing the attestation
     steps:
+      # Only the notes; the files come from the build job.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: docs/releases
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist
@@ -66,7 +79,12 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
-      - name: Release
+      - name: Draft release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes dist/*
+        run: |
+          pre=()
+          case "$GITHUB_REF_NAME" in v0.*|*-*) pre=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --draft "${pre[@]}" --title "$GITHUB_REF_NAME" \
+            --notes-file "docs/releases/${GITHUB_REF_NAME}.md" dist/*
