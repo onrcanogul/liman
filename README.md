@@ -901,7 +901,9 @@ it; what was recorded after the backup stays in the database set aside.
 ## Security
 
 Anyone with a valid token can run arbitrary containers on the server, which
-is equivalent to root. The API is built around keeping everyone else out:
+with Docker or rootful Podman is equivalent to root, and with rootless
+Podman to the `liman` user (see Podman). The API is built around keeping
+everyone else out:
 
 - **Network.** Loopback or private network only, enforced on both sides (see
   above). Encryption is delegated to that network (WireGuard).
@@ -1087,9 +1089,14 @@ Then it:
 - with **Traefik**, creates `/etc/traefik/liman.d` but leaves Traefik's
   static configuration alone (its place and format vary): if no file
   provider watches that directory, it says what to add and stops;
-- with **Podman**, gives its API socket to the `liman` group (a drop-in
-  for `podman.socket`, and a tmpfiles rule for `/run/podman`, which
-  Podman's own makes `0700` at every boot);
+- with **Podman**, rootless (the default, asked in a terminal): gives
+  `liman` subordinate ids for its containers, has its systemd start at boot
+  (`loginctl enable-linger`), and starts Podman's socket under it. Before
+  that it checks that containers can have limits (cgroup v2, the `cpu` and
+  `memory` controllers delegated to users) and stops, saying how, if not;
+- with **Podman** `--rootful`, gives root's Podman socket to the `liman`
+  group (a drop-in for `podman.socket`, and a tmpfiles rule for
+  `/run/podman`, which Podman's own makes `0700` at every boot);
 - with `--hooks-listen`, turns on the endpoint CI pipelines deploy through
   (see Deploying from CI).
 
@@ -1120,13 +1127,16 @@ systemctl restart limand         # waits for running deploys, up to two minutes
 ```
 
 The unit restarts the daemon if it crashes and starts it at boot, after
-Docker and WireGuard. It is sandboxed: `/usr` and `/etc` are read-only for
-it (except `/etc/nginx/liman.d`), `/home` and device files are hidden, it
+the engine and WireGuard. It is sandboxed: `/usr` and `/etc` are read-only for
+it (except the proxy's `liman.d`), `/home` and device files are hidden (and
+`/run/user`, but for the `liman` user's own directory when Podman is
+rootless), it
 has a `/tmp` of its own and may not create namespaces or touch kernel
 settings (`systemd-analyze security limand`). The backup unit is locked down
 much further: no capabilities, no network, a read-only file system except
-its two directories. Membership of the `docker` group is still equivalent to root; the
-dedicated user limits accidents, not a compromised daemon.
+its two directories. With Docker or rootful Podman, access to the engine
+is still equivalent to root and the dedicated user limits accidents, not a
+compromised daemon; rootless Podman is what changes that.
 
 The installer also schedules a daily backup; see Backups.
 
@@ -1284,27 +1294,37 @@ stored ones were rejected.
 With Podman, `podman login` works the same way: its `auth.json` is read
 (`$REGISTRY_AUTH_FILE`, `$XDG_RUNTIME_DIR/containers/auth.json`, for root
 `/run/containers/0/auth.json`, then `~/.config/containers/auth.json`), and
-Docker's `config.json` after it.
+Docker's `config.json` after it. `$XDG_RUNTIME_DIR` is emptied at every
+boot, so log in to `~/.config/containers/auth.json` (see Podman).
 
 ## Podman
 
 liman also runs apps with Podman instead of Docker, through the
-Docker-compatible API rootful Podman serves (`podman.socket`):
+Docker-compatible API Podman serves. It runs it two ways:
+
+- **Rootless** (what `limand install --engine podman` sets up): Podman is
+  the `liman` user's own, under that user's systemd, and its containers run
+  under the user's subordinate ids. Taking over the daemon, or breaking out
+  of a container, gives the `liman` user's rights, not root's.
+- **Rootful** (`--rootful`): root's Podman, its socket given to the `liman`
+  group. As with Docker's group, that access amounts to root.
 
 ```yaml
-# config.yaml
+# config.yaml, rootless (limand install writes it)
 engine:
-  driver: podman                    # docker is the default
-  socket: /run/podman/podman.sock   # the default for podman
+  driver: podman
+  rootless: true
+  socket: /run/user/999/podman/podman.sock   # the liman user's; 999 is its uid
+
+# rootful
+engine:
+  driver: podman
+  socket: /run/podman/podman.sock            # the default
 ```
 
-```
-sudo systemctl enable --now podman.socket
-```
-
-Everything works as with Docker; a trial on Ubuntu 26.04 with Podman 5.7 ran
-deploys, workers, fixed ports, secret files, rollbacks and health checks
-unchanged. Two things differ, and liman takes care of them:
+Everything works as with Docker; trials on Ubuntu 26.04 with Podman 5.7 ran
+deploys, workers, fixed ports, secret files, rollbacks, limits and health
+checks. What differs, liman takes care of:
 
 - Podman's compatible API has no endpoint to ask a registry whether it has
   an image, which every trigger and preview does, and its own
@@ -1313,27 +1333,52 @@ unchanged. Two things differ, and liman takes care of them:
   over its HTTP API, with the login `podman login` stored: a `HEAD` of the
   manifest, nothing pulled. Like Docker, it tries plain HTTP after HTTPS
   only for a registry on the machine itself.
-- `podman login` writes elsewhere than `docker login` (see Private images).
+- Rootless, each container gets a network of its own (`pasta`), not the
+  shared bridge the Docker API starts containers on. On Ubuntu 26.04,
+  pasta's AppArmor profile refuses the signal Podman takes the shared one
+  down with, so a container on it could not be stopped.
+- Rootless, containers write their output to a file (`k8s-file`), not to
+  the journal, rootless Podman's default: `liman` is a system user, whose
+  journal entries go to the system journal, which it cannot read, so
+  `liman logs` would show nothing.
+- `podman login` writes elsewhere than `docker login` (below).
 
-Two are yours to know:
+What is yours to know:
 
 - Docker takes a registry on `localhost` for a plain-HTTP one; Podman must
   be told, in `/etc/containers/registries.conf.d/` (`insecure = true`).
-- The socket belongs to root. The daemon needs access to it, which, as
-  with Docker's group, amounts to root. Rootless Podman, where it would not,
-  is not supported yet. `limand install --engine podman` sets the
-  socket's group up (see Installing on a server).
+- **Rootless, limits need the kernel's help.** Memory and CPU limits need
+  cgroup v2, with the `cpu` and `memory` controllers given to users, as
+  Ubuntu and Debian do. Where they are not, Podman refuses to start a
+  container with a limit, and `limand install` stops before changing
+  anything, and says how to allow it.
+- **Rootless, no ports below 1024** (`net.ipv4.ip_unprivileged_port_start`):
+  an app on a fixed port publishes a higher one; the proxy keeps 80 and
+  443, as always.
+- **Rootless, what an app sees of the network.** A connection from the
+  server itself arrives from the server's own address, not 127.0.0.1. A
+  service on the server that listens only on 127.0.0.1 (a database, say)
+  is out of a container's reach; one on the server's private address is
+  reached at `host.containers.internal`.
+- The containers of a rootless install stop with the `liman` user's
+  systemd (at shutdown, or when systemd is upgraded); the health monitor
+  starts them again within a few checks.
+- From rootful (or Docker) to rootless: the images and containers are in
+  another place, so it is a new install and a deploy of every app again.
+  An upgrade keeps the engine config.yaml names.
 
-For private images, log in to the file the daemon's user reads:
+For private images, log in to the file the daemon reads, as the `liman`
+user's:
 
 ```
 sudo REGISTRY_AUTH_FILE=/var/lib/liman/.config/containers/auth.json podman login ghcr.io
 sudo chown -R liman: /var/lib/liman/.config
 ```
 
-CI checks both engines: the engine's integration tests and a deploy from a
-pipeline through a registry that wants a password also run against Podman
-([scripts/ci-podman.sh](scripts/ci-podman.sh)).
+CI checks all of it: the engine's integration tests against Docker, rootful
+Podman and rootless Podman, and on both Podmans `limand install` as a
+service and deploys from a pipeline through a registry that wants a
+password ([scripts/ci-podman.sh](scripts/ci-podman.sh)).
 
 ## Routing through a proxy
 
@@ -1550,7 +1595,7 @@ make load-test          # throughput, latency and leak checks (about a minute)
 ### CI and releases
 
 Every push to `main` and every pull request runs
-[ci.yml](.github/workflows/ci.yml), four jobs side by side, about four
+[ci.yml](.github/workflows/ci.yml), five jobs side by side, about four
 minutes in all:
 
 - **lint, vet, test:** golangci-lint, `go vet` also of the files behind the
@@ -1558,10 +1603,13 @@ minutes in all:
   shellcheck, the tests with the race detector, and govulncheck, which
   fails the job for a known vulnerability in code liman calls. It also
   checks that Go is the release `go.mod`'s `toolchain` line names.
-- **Podman:** [scripts/ci-podman.sh](scripts/ci-podman.sh), the engine's
-  integration tests against rootful Podman, then `limand install` with
-  Podman and Caddy as a service, and deploys from a pipeline through a
-  registry that wants a password: on a fixed port, and through Caddy.
+- **Podman rootless, Podman rootful:** [scripts/ci-podman.sh](scripts/ci-podman.sh),
+  `limand install` with Podman and Caddy as a service, the engine's
+  integration tests against the socket the daemon uses, and deploys from a
+  pipeline through a registry that wants a password: on a fixed port, with
+  its limits checked inside the container, and through Caddy. Rootless
+  also restarts the `liman` user's systemd and waits for the apps to come
+  back.
 - **integration:** `make test-integration`, against the runner's Docker, a
   fixed Pebble release, and real Nginx, Caddy and Traefik containers, each
   switched from one upstream to another under load without a failed
