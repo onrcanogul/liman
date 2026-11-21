@@ -146,35 +146,42 @@ func explainPullError(err error, image string, loggedIn bool) error {
 // Start implements engine.Engine. POST /containers/create, then
 // POST /containers/{id}/start.
 func (c *Client) Start(ctx context.Context, spec engine.Spec) (string, error) {
-	port, err := network.ParsePort(fmt.Sprintf("%d/tcp", spec.ContainerPort))
-	if err != nil {
-		return "", fmt.Errorf("container port: %w", err)
+	// Config describes the container itself: what runs inside it.
+	cfg := &container.Config{
+		Image:  spec.Image,
+		Env:    envList(spec.Env),
+		Labels: labels(spec),
+		// Empty keeps the image's command.
+		Cmd: spec.Command,
+	}
+	// HostConfig describes how it is attached to the host: published
+	// ports and resource limits.
+	hostCfg := &container.HostConfig{
+		Resources: container.Resources{
+			Memory: spec.MemoryBytes,
+			// The API expresses CPU limits in billionths of a core.
+			NanoCPUs: int64(spec.CPUs * 1e9),
+		},
+	}
+	// A worker publishes no port: nothing on the host reaches it.
+	if spec.ContainerPort != 0 {
+		port, err := network.ParsePort(fmt.Sprintf("%d/tcp", spec.ContainerPort))
+		if err != nil {
+			return "", fmt.Errorf("container port: %w", err)
+		}
+		cfg.ExposedPorts = network.PortSet{port: struct{}{}}
+		hostCfg.PortBindings = network.PortMap{
+			port: []network.PortBinding{{
+				HostIP:   loopback,
+				HostPort: strconv.Itoa(spec.HostPort),
+			}},
+		}
 	}
 
 	created, err := c.api.ContainerCreate(ctx, client.ContainerCreateOptions{
-		Name: spec.Name,
-		// Config describes the container itself: what runs inside it.
-		Config: &container.Config{
-			Image:        spec.Image,
-			Env:          envList(spec.Env),
-			Labels:       labels(spec),
-			ExposedPorts: network.PortSet{port: struct{}{}},
-		},
-		// HostConfig describes how it is attached to the host: published
-		// ports and resource limits.
-		HostConfig: &container.HostConfig{
-			PortBindings: network.PortMap{
-				port: []network.PortBinding{{
-					HostIP:   loopback,
-					HostPort: strconv.Itoa(spec.HostPort),
-				}},
-			},
-			Resources: container.Resources{
-				Memory: spec.MemoryBytes,
-				// The API expresses CPU limits in billionths of a core.
-				NanoCPUs: int64(spec.CPUs * 1e9),
-			},
-		},
+		Name:       spec.Name,
+		Config:     cfg,
+		HostConfig: hostCfg,
 	})
 	if err != nil {
 		return "", fmt.Errorf("create container %s: %w", spec.Name, err)
@@ -306,11 +313,17 @@ func (c *Client) Inspect(ctx context.Context, ref string) (engine.Container, err
 		Release:    trusted(info.Config.Labels[engine.LabelRelease], app.ValidRelease),
 		HealthPath: trusted(info.Config.Labels[engine.LabelHealthPath], app.ValidHealthPath),
 		Domain:     trusted(info.Config.Labels[engine.LabelDomain], app.ValidDomain),
+		Kind:       trusted(info.Config.Labels[engine.LabelKind], isWorker),
+		Strategy:   trusted(info.Config.Labels[engine.LabelStrategy], isReplace),
 	}
 	if info.State != nil {
 		out.State = string(info.State.Status)
 		out.ExitCode = info.State.ExitCode
 		out.OOMKilled = info.State.OOMKilled
+		if h := info.State.Health; h != nil && h.Status != container.NoHealthcheck {
+			out.Health = string(h.Status)
+			out.HealthWindow = healthWindow(info.Config.Healthcheck)
+		}
 	}
 	if info.HostConfig != nil {
 		out.HostPort = firstHostPort(info.HostConfig.PortBindings)
@@ -394,6 +407,8 @@ func (c *Client) List(ctx context.Context) ([]engine.Container, error) {
 			Release:    trusted(item.Labels[engine.LabelRelease], app.ValidRelease),
 			HealthPath: trusted(item.Labels[engine.LabelHealthPath], app.ValidHealthPath),
 			Domain:     trusted(item.Labels[engine.LabelDomain], app.ValidDomain),
+			Kind:       trusted(item.Labels[engine.LabelKind], isWorker),
+			Strategy:   trusted(item.Labels[engine.LabelStrategy], isReplace),
 		}
 		if len(item.Names) > 0 {
 			ctr.Name = strings.TrimPrefix(item.Names[0], "/")
@@ -455,7 +470,7 @@ func (c *Client) Logs(ctx context.Context, ref string, follow bool, stdout, stde
 
 // labels returns the labels a container of spec carries.
 func labels(spec engine.Spec) map[string]string {
-	// All four are always set, empty if need be. A label the image itself
+	// All of them are always set, empty if need be. A label the image itself
 	// declares is merged into the container unless the container sets the
 	// same key; leaving one out would let an image supply it, and these
 	// labels are read back later and acted on (the health path is requested
@@ -465,7 +480,60 @@ func labels(spec engine.Spec) map[string]string {
 		engine.LabelRelease:    spec.Release,
 		engine.LabelHealthPath: spec.HealthPath,
 		engine.LabelDomain:     spec.Domain,
+		engine.LabelKind:       kindLabel(spec.Kind),
+		engine.LabelStrategy:   strategyLabel(spec.Strategy),
 	}
+}
+
+func strategyLabel(strategy string) string {
+	if strategy == app.StrategyReplace {
+		return app.StrategyReplace
+	}
+	return app.StrategyOverlap
+}
+
+// isReplace accepts only the replace strategy; "overlap" reads back as "".
+func isReplace(strategy string) bool { return strategy == app.StrategyReplace }
+
+// kindLabel is the value of LabelKind: an image must not be able to turn a
+// web app into a worker by declaring the label itself, so it is always set.
+func kindLabel(kind string) string {
+	if kind == app.KindWorker {
+		return app.KindWorker
+	}
+	return app.KindWeb
+}
+
+// isWorker accepts only the worker kind; "web" reads back as "".
+func isWorker(kind string) bool { return kind == app.KindWorker }
+
+// Docker's defaults for a HEALTHCHECK that leaves them out.
+const (
+	defaultHealthInterval = 30 * time.Second
+	defaultHealthTimeout  = 30 * time.Second
+	defaultHealthRetries  = 3
+)
+
+// healthWindow is the longest a HEALTHCHECK may take to call a container
+// unhealthy after it starts: its start period, then retries checks one
+// interval apart, the last of which may run until its timeout. A healthy
+// verdict comes sooner, with the first passing check; this is how long to
+// wait for one before giving up.
+func healthWindow(hc *container.HealthConfig) time.Duration {
+	interval, timeout, retries, start := defaultHealthInterval, defaultHealthTimeout, defaultHealthRetries, time.Duration(0)
+	if hc != nil {
+		if hc.Interval > 0 {
+			interval = hc.Interval
+		}
+		if hc.Timeout > 0 {
+			timeout = hc.Timeout
+		}
+		if hc.Retries > 0 {
+			retries = hc.Retries
+		}
+		start = hc.StartPeriod
+	}
+	return start + time.Duration(retries)*interval + timeout
 }
 
 // trusted returns a label's value if it has the shape liman itself would

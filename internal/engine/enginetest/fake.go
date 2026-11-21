@@ -64,6 +64,14 @@ type Fake struct {
 	// Specs records the spec of every started container.
 	Specs []engine.Spec
 
+	// Health, when set, plays the engine's own health check (Docker's
+	// HEALTHCHECK) of a started container: it gets the container's name
+	// and how often it has been inspected before, and returns its
+	// Health. HealthWindow is what Inspect reports with it.
+	Health       func(name string, inspections int) string
+	HealthWindow time.Duration
+	inspections  map[string]int
+
 	// clock gives every added container a later creation time than the
 	// previous one, so ordering is deterministic.
 	clock time.Time
@@ -167,6 +175,8 @@ func (f *Fake) Start(_ context.Context, spec engine.Spec) (string, error) {
 		Release:    spec.Release,
 		HealthPath: spec.HealthPath,
 		Domain:     spec.Domain,
+		Kind:       workerOrNot(spec.Kind),
+		Strategy:   replaceOrNot(spec.Strategy),
 	})
 	return f.Containers[spec.Name].ID, nil
 }
@@ -180,7 +190,33 @@ func (f *Fake) Inspect(_ context.Context, ref string) (engine.Container, error) 
 	if !ok {
 		return engine.Container{}, fmt.Errorf("%s: %w", ref, engine.ErrNotFound)
 	}
+	if f.Health != nil {
+		if f.inspections == nil {
+			f.inspections = map[string]int{}
+		}
+		ctr.Health = f.Health(ref, f.inspections[ref])
+		f.inspections[ref]++
+		if ctr.Health != "" {
+			ctr.HealthWindow = f.HealthWindow
+		}
+	}
 	return ctr, nil
+}
+
+// replaceOrNot reads a spec's strategy back the way the Docker engine does.
+func replaceOrNot(strategy string) string {
+	if strategy == "replace" {
+		return strategy
+	}
+	return ""
+}
+
+// workerOrNot reads a spec's kind back the way the Docker engine does.
+func workerOrNot(kind string) string {
+	if kind == "worker" {
+		return kind
+	}
+	return ""
 }
 
 // Remove implements engine.Engine.

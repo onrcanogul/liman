@@ -34,6 +34,21 @@ const (
 	// LabelDomain is the domain the app is served on. A rollback needs it
 	// to point the proxy back at an older container.
 	LabelDomain = "liman.domain"
+	// LabelKind is "web" or "worker". A worker has no domain to route,
+	// which a rollback, the monitor and the panel must know.
+	LabelKind = "liman.kind"
+	// LabelStrategy is "overlap" or "replace": how a rollback must swap the
+	// releases, as the deploy did.
+	LabelStrategy = "liman.strategy"
+)
+
+// The states of an engine's own health check (Docker's HEALTHCHECK), as
+// Container.Health reports them. The empty string means the container has
+// none.
+const (
+	HealthStarting  = "starting"
+	HealthHealthy   = "healthy"
+	HealthUnhealthy = "unhealthy"
 )
 
 // Sentinel errors. Callers compare against them with errors.Is.
@@ -58,9 +73,13 @@ type Spec struct {
 	Image string
 
 	// ContainerPort is the port the app listens on inside the container.
+	// Zero publishes nothing: a worker.
 	ContainerPort int
 	// HostPort is the port on 127.0.0.1 that is forwarded to ContainerPort.
 	HostPort int
+
+	// Command replaces the image's command; empty keeps it.
+	Command []string
 
 	Env map[string]string
 
@@ -73,10 +92,13 @@ type Spec struct {
 	MemoryBytes int64
 	CPUs        float64
 
-	// Release, HealthPath and Domain are stored as labels on the container.
+	// Release, HealthPath, Domain and Kind are stored as labels on the
+	// container.
 	Release    string
 	HealthPath string
 	Domain     string
+	Kind       string
+	Strategy   string
 }
 
 // File is a file to put into a container.
@@ -113,11 +135,30 @@ type Container struct {
 	ExitCode  int
 	OOMKilled bool
 
-	// Release, HealthPath and Domain come from the container's labels.
+	// Release, HealthPath, Domain and Kind come from the container's
+	// labels. Kind is "worker" for a worker and "" otherwise; Strategy is
+	// "replace" or "".
 	Release    string
 	HealthPath string
 	Domain     string
+	Kind       string
+	Strategy   string
+
+	// Health is the state of the engine's own health check (one of the
+	// Health constants), "" when the container has none. HealthWindow is
+	// how long that check may take to reach a verdict after a start:
+	// Docker's default is one check every 30 seconds. Both are only filled
+	// in by Inspect.
+	Health       string
+	HealthWindow time.Duration
 }
+
+// Worker reports whether the container runs a worker.
+func (c Container) Worker() bool { return c.Kind == "worker" }
+
+// Replace reports whether its releases are swapped one after the other
+// rather than side by side.
+func (c Container) Replace() bool { return c.Strategy == "replace" }
 
 // Running reports whether the container is currently running.
 func (c Container) Running() bool {
