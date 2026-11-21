@@ -1,43 +1,35 @@
-// Package nginx generates and applies the reverse proxy configuration.
-//
-// liman owns one file per app in a directory of its own. It never reads or
-// edits any other Nginx file, so hand-written configuration stays untouched.
+// Package nginx is the Nginx dialect of the proxy package: one server
+// block per app in the directory nginx.conf includes, tested with nginx -t
+// and applied with a reload.
 package nginx
 
 import (
 	"bytes"
 	"fmt"
+	"regexp"
 	"text/template"
+
+	"github.com/onrcanogul/liman/internal/proxy"
 )
 
-// Site is everything the template needs to describe one app.
-type Site struct {
-	App    string
-	Domain string
+// Dialect describes Nginx to a proxy.Manager.
+type Dialect struct{}
 
-	// Upstream is the host:port Nginx forwards requests to.
-	Upstream string
+// Name implements proxy.Dialect.
+func (Dialect) Name() string { return "Nginx" }
 
-	// CertFile and KeyFile enable HTTPS when both are set.
-	CertFile string
-	KeyFile  string
+// Ext implements proxy.Dialect: nginx.conf includes "liman.d/*.conf".
+func (Dialect) Ext() string { return ".conf" }
 
-	// ACMERoot, when set, is served under /.well-known/acme-challenge/.
-	ACMERoot string
-
-	// Release identifies the deploy this config belongs to. Nginx reports
-	// it in a response header, which lets liman observe the moment a reload
-	// has actually taken effect.
-	Release string
+// Commands implements proxy.Dialect. On a server the installer replaces
+// them with the same commands through sudo.
+func (Dialect) Commands() (test, reload []string) {
+	return []string{"nginx", "-t"}, []string{"nginx", "-s", "reload"}
 }
 
-// ReleaseHeader is the response header that carries Site.Release.
-const ReleaseHeader = "X-Liman-Release"
-
-// TLS reports whether the site is served over HTTPS.
-func (s Site) TLS() bool {
-	return s.CertFile != "" && s.KeyFile != ""
-}
+// ManagesCertificates implements proxy.Dialect: Nginx serves the
+// certificates liman obtains, it does not obtain any.
+func (Dialect) ManagesCertificates() bool { return false }
 
 // The template uses text/template syntax: {{.Field}} inserts a value,
 // {{if}}...{{end}} is a conditional and {{template "name" .}} includes a
@@ -106,11 +98,24 @@ const proxyTemplate = `{{define "proxy"}}        proxy_pass http://liman-{{.App}
 // first deploy.
 var tmpl = template.Must(template.Must(template.New("site").Parse(siteTemplate)).Parse(proxyTemplate))
 
-// Render returns the Nginx configuration for site.
-func Render(site Site) ([]byte, error) {
+// Render implements proxy.Dialect.
+func (Dialect) Render(site proxy.Site) ([]byte, error) {
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, site); err != nil {
 		return nil, fmt.Errorf("render nginx config for %s: %w", site.App, err)
 	}
 	return buf.Bytes(), nil
+}
+
+// The quoted value of the add_header directive written by the template.
+var releaseRe = regexp.MustCompile(`add_header X-Liman-Release "([^"]*)"`)
+
+// ReleaseOf implements proxy.Dialect.
+func (Dialect) ReleaseOf(content []byte) string {
+	// FindSubmatch returns the whole match followed by the parenthesised
+	// groups, or nil when nothing matches.
+	if m := releaseRe.FindSubmatch(content); m != nil {
+		return string(m[1])
+	}
+	return ""
 }

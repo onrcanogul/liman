@@ -51,9 +51,10 @@ type DeployResult struct {
 	HostPort  int    `json:"host_port,omitempty"`
 
 	// Domain is the app's domain; Routed says whether the proxy now sends
-	// that domain to the new release.
+	// that domain to the new release, and Proxy which one it is ("Nginx").
 	Domain string `json:"domain,omitempty"`
 	Routed bool   `json:"routed"`
+	Proxy  string `json:"proxy,omitempty"`
 
 	DryRun bool `json:"dry_run"`
 
@@ -159,8 +160,10 @@ type Container struct {
 type StopResult struct {
 	// Removed lists the containers that were stopped and removed.
 	Removed []string `json:"removed"`
-	// ProxyConfig is the proxy config file that was removed, if any.
+	// ProxyConfig is the proxy config file that was removed, if any, and
+	// Proxy the proxy it belonged to ("Nginx").
 	ProxyConfig string `json:"proxy_config,omitempty"`
+	Proxy       string `json:"proxy,omitempty"`
 	// KeptSecrets names the app's secrets, which a stop leaves in place:
 	// deploying the app again needs them.
 	KeptSecrets []string `json:"kept_secrets,omitempty"`
@@ -279,13 +282,15 @@ type Info struct {
 	// endpoints about the daemon as a whole.
 	TokenApps []string `json:"token_apps,omitempty"`
 
-	// Proxy says whether the daemon manages a reverse proxy, Secrets whether
-	// it has secret storage, Backups whether it can make backups.
-	Proxy   bool `json:"proxy"`
-	Secrets bool `json:"secrets"`
-	Backups bool `json:"backups"`
+	// Proxy says whether the daemon manages a reverse proxy, and ProxyName
+	// which one; Secrets whether it has secret storage, Backups whether it
+	// can make backups.
+	Proxy     bool   `json:"proxy"`
+	ProxyName string `json:"proxy_name,omitempty"`
+	Secrets   bool   `json:"secrets"`
+	Backups   bool   `json:"backups"`
 
-	// Certificates says whether GET /v1/certs answers (nginx.cert_dir is
+	// Certificates says whether GET /v1/certs answers (proxy.cert_dir is
 	// set), ACME whether the daemon obtains certificates itself.
 	Certificates bool `json:"certificates"`
 	ACME         bool `json:"acme"`

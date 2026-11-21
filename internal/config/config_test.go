@@ -18,13 +18,13 @@ func write(t *testing.T, content string) string {
 	return path
 }
 
-func TestLoadMissingFileDisablesNginx(t *testing.T) {
+func TestLoadMissingFileDisablesTheProxy(t *testing.T) {
 	cfg, err := Load(filepath.Join(t.TempDir(), "nope.yaml"))
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if cfg.Nginx.Enabled() {
-		t.Error("Nginx is enabled without a config file")
+	if cfg.Proxy.Enabled() {
+		t.Error("the proxy is enabled without a config file")
 	}
 	if cfg.Daemon.Listen != DefaultListen {
 		t.Errorf("Daemon.Listen = %q, want the loopback default", cfg.Daemon.Listen)
@@ -118,7 +118,7 @@ func TestLoadClientDefaults(t *testing.T) {
 
 func TestLoadEmptyFile(t *testing.T) {
 	cfg, err := Load(write(t, ""))
-	if err != nil || cfg.Nginx.Enabled() {
+	if err != nil || cfg.Proxy.Enabled() {
 		t.Errorf("Load() = %+v, %v; want an empty config", cfg, err)
 	}
 }
@@ -129,15 +129,38 @@ func TestLoadAppliesHostDefaults(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	n := cfg.Nginx
-	if !n.Enabled() || n.UpstreamHost != "127.0.0.1" || n.ProbeAddr != "127.0.0.1:80" {
-		t.Errorf("Nginx = %+v, want it enabled with upstream 127.0.0.1 and probe 127.0.0.1:80", n)
+	n := cfg.Proxy
+	if !n.Enabled() || n.Driver != "nginx" || n.UpstreamHost != "127.0.0.1" || n.ProbeAddr != "127.0.0.1:80" {
+		t.Errorf("Proxy = %+v, want nginx enabled with upstream 127.0.0.1 and probe 127.0.0.1:80", n)
 	}
-	if want := []string{"nginx", "-t"}; !slices.Equal(n.TestCommand, want) {
-		t.Errorf("TestCommand = %v, want %v", n.TestCommand, want)
+	// The commands are the driver's, filled in by it, not here.
+	if len(n.TestCommand) != 0 || len(n.ReloadCommand) != 0 {
+		t.Errorf("commands = %v, %v; want them left to the driver", n.TestCommand, n.ReloadCommand)
 	}
-	if want := []string{"nginx", "-s", "reload"}; !slices.Equal(n.ReloadCommand, want) {
-		t.Errorf("ReloadCommand = %v, want %v", n.ReloadCommand, want)
+}
+
+func TestLoadProxySection(t *testing.T) {
+	cfg, err := Load(write(t, "proxy:\n  driver: caddy\n  conf_dir: /etc/caddy/liman.d\n"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if p := cfg.Proxy; p.Driver != "caddy" || p.ConfDir != "/etc/caddy/liman.d" || p.Section() != "proxy" {
+		t.Errorf("Proxy = %+v (section %s)", p, p.Section())
+	}
+	// The config package knows settings, not drivers: an unknown one is
+	// refused where the proxy is built.
+	if _, err := Load(write(t, "proxy:\n  driver: nope\n  conf_dir: /x\n")); err != nil {
+		t.Errorf("Load() with an unknown driver error = %v, want it left to the daemon", err)
+	}
+}
+
+func TestLoadNginxSectionIsTheProxyForNginx(t *testing.T) {
+	cfg, err := Load(write(t, "nginx:\n  conf_dir: /etc/nginx/liman.d\n"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if p := cfg.Proxy; p.Driver != "nginx" || p.ConfDir != "/etc/nginx/liman.d" || p.Section() != "nginx" || cfg.LegacyNginx != nil {
+		t.Errorf("Proxy = %+v (section %s), LegacyNginx = %v", p, p.Section(), cfg.LegacyNginx)
 	}
 }
 
@@ -155,9 +178,9 @@ nginx:
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	n := cfg.Nginx
+	n := cfg.Proxy
 	if n.UpstreamHost != "host.docker.internal" || n.CertDir != "/srv/liman/certs" || n.ACMERoot != "/srv/liman/acme" {
-		t.Errorf("Nginx = %+v", n)
+		t.Errorf("Proxy = %+v", n)
 	}
 	if want := []string{"docker", "exec", "liman-nginx", "nginx", "-t"}; !slices.Equal(n.TestCommand, want) {
 		t.Errorf("TestCommand = %v, want %v", n.TestCommand, want)
@@ -179,7 +202,10 @@ func TestLoadRejectsBadConfig(t *testing.T) {
 		{"acme bad email", acmeConfig("directory: https://ca.example/dir\n  email: someone"), "acme.email"},
 		{"acme email with a newline", acmeConfig("directory: https://ca.example/dir\n  email: \"a@b\\nc\""), "acme.email"},
 		{"acme relative ca file", acmeConfig("directory: https://ca.example/dir\n  ca_file: ca.pem"), "acme.ca_file: must be an absolute path"},
-		{"acme without nginx", "acme:\n  directory: https://ca.example/dir\n", "acme: needs nginx.conf_dir"},
+		{"acme without a proxy", "acme:\n  directory: https://ca.example/dir\n", "acme: needs proxy.conf_dir"},
+		{"both sections", "nginx:\n  conf_dir: /x\nproxy:\n  conf_dir: /y\n", "keep only the proxy section"},
+		{"nginx section for another proxy", "nginx:\n  driver: caddy\n  conf_dir: /x\n", "write a proxy section"},
+		{"relative proxy conf dir", "proxy:\n  conf_dir: liman.d\n", "proxy.conf_dir: must be an absolute path"},
 		{"acme without acme root", "nginx:\n  conf_dir: /x\n  cert_dir: /c\nacme:\n  directory: https://ca.example/dir\n", "acme: needs nginx.cert_dir"},
 	}
 

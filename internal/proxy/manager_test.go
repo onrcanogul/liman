@@ -1,12 +1,14 @@
-package nginx
+package proxy
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -15,99 +17,34 @@ import (
 	"github.com/onrcanogul/liman/internal/config"
 )
 
-func TestRenderHTTPOnly(t *testing.T) {
-	got, err := Render(Site{App: "orders-api", Domain: "api.example.com", Upstream: "127.0.0.1:40001", Release: "r2"})
-	if err != nil {
-		t.Fatalf("Render() error = %v", err)
+// testDialect is the smallest dialect: one line per setting. The Manager
+// must work the same whatever the file looks like.
+type testDialect struct {
+	watches bool // no commands: the proxy watches its files
+	tls     bool // obtains certificates itself
+}
+
+func (testDialect) Name() string { return "Test" }
+func (testDialect) Ext() string  { return ".conf" }
+func (testDialect) Render(s Site) ([]byte, error) {
+	return fmt.Appendf(nil, "domain %s\nupstream %s\nrelease %q\nautotls %v\n", s.Domain, s.Upstream, s.Release, s.AutoTLS), nil
+}
+
+var testReleaseRe = regexp.MustCompile(`release "([^"]*)"`)
+
+func (testDialect) ReleaseOf(content []byte) string {
+	if m := testReleaseRe.FindSubmatch(content); m != nil {
+		return string(m[1])
 	}
-
-	// The whole output is compared: in a config file every character
-	// matters, and a golden text makes template changes visible in review.
-	want := `# Managed by liman for app "orders-api".
-# Do not edit: this file is overwritten on every deploy.
-
-upstream liman-orders-api {
-    server 127.0.0.1:40001;
+	return ""
 }
-
-server {
-    listen 80;
-    server_name api.example.com;
-    add_header X-Liman-Release "r2" always;
-
-    location / {
-        proxy_pass http://liman-orders-api;
-        proxy_http_version 1.1;
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-`
-	if string(got) != want {
-		t.Errorf("Render() =\n%s\nwant\n%s", got, want)
+func (d testDialect) Commands() (test, reload []string) {
+	if d.watches {
+		return nil, nil
 	}
+	return []string{"proxy", "-t"}, []string{"proxy", "-s", "reload"}
 }
-
-func TestRenderWithTLSAndACME(t *testing.T) {
-	got, err := Render(Site{
-		App:      "orders-api",
-		Domain:   "api.example.com",
-		Upstream: "127.0.0.1:40001",
-		CertFile: "/certs/api.example.com/fullchain.pem",
-		KeyFile:  "/certs/api.example.com/privkey.pem",
-		ACMERoot: "/var/lib/liman/acme",
-		Release:  "r2",
-	})
-	if err != nil {
-		t.Fatalf("Render() error = %v", err)
-	}
-
-	want := `# Managed by liman for app "orders-api".
-# Do not edit: this file is overwritten on every deploy.
-
-upstream liman-orders-api {
-    server 127.0.0.1:40001;
-}
-
-server {
-    listen 80;
-    server_name api.example.com;
-    add_header X-Liman-Release "r2" always;
-
-    # Lets an ACME client (Let's Encrypt) verify ownership of the domain.
-    location /.well-known/acme-challenge/ {
-        root /var/lib/liman/acme;
-    }
-
-    location / {
-        return 301 https://$host$request_uri;
-    }
-}
-
-server {
-    listen 443 ssl;
-    server_name api.example.com;
-    add_header X-Liman-Release "r2" always;
-
-    ssl_certificate     /certs/api.example.com/fullchain.pem;
-    ssl_certificate_key /certs/api.example.com/privkey.pem;
-
-    location / {
-        proxy_pass http://liman-orders-api;
-        proxy_http_version 1.1;
-        proxy_set_header Host              $host;
-        proxy_set_header X-Real-IP         $remote_addr;
-        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-`
-	if string(got) != want {
-		t.Errorf("Render() =\n%s\nwant\n%s", got, want)
-	}
-}
+func (d testDialect) ManagesCertificates() bool { return d.tls }
 
 // newTestManager returns a manager that writes to a temporary directory and
 // records commands instead of running them.
@@ -115,12 +52,10 @@ func newTestManager(t *testing.T) (*Manager, *[]string) {
 	t.Helper()
 
 	var commands []string
-	m := New(config.Nginx{
-		ConfDir:       filepath.Join(t.TempDir(), "conf"),
-		UpstreamHost:  "127.0.0.1",
-		TestCommand:   []string{"nginx", "-t"},
-		ReloadCommand: []string{"nginx", "-s", "reload"},
-	})
+	m := New(config.Proxy{
+		ConfDir:      filepath.Join(t.TempDir(), "conf"),
+		UpstreamHost: "127.0.0.1",
+	}, testDialect{})
 	m.run = func(_ context.Context, name string, args ...string) ([]byte, error) {
 		commands = append(commands, strings.Join(append([]string{name}, args...), " "))
 		return nil, nil
@@ -150,7 +85,7 @@ func TestWriteCurrentRemove(t *testing.T) {
 		t.Fatal(err)
 	}
 	if perm := info.Mode().Perm(); perm != 0o644 {
-		t.Errorf("file mode = %o, want 644 so Nginx can read it", perm)
+		t.Errorf("file mode = %o, want 644 so the proxy can read it", perm)
 	}
 
 	// No temporary files may be left next to the config.
@@ -205,7 +140,8 @@ func TestTestAndReloadRunConfiguredCommands(t *testing.T) {
 		t.Fatalf("Reload() error = %v", err)
 	}
 
-	want := []string{"nginx -t", "nginx -s reload"}
+	// The dialect's commands, as config.yaml gives none.
+	want := []string{"proxy -t", "proxy -s reload"}
 	if strings.Join(*commands, "|") != strings.Join(want, "|") {
 		t.Errorf("commands = %v, want %v", *commands, want)
 	}
@@ -230,7 +166,7 @@ func TestCommandFailureIncludesOutput(t *testing.T) {
 
 func TestSite(t *testing.T) {
 	certDir := t.TempDir()
-	m := New(config.Nginx{ConfDir: "/conf", UpstreamHost: "host.docker.internal", CertDir: certDir, ACMERoot: "/acme"})
+	m := New(config.Proxy{ConfDir: "/conf", UpstreamHost: "host.docker.internal", CertDir: certDir, ACMERoot: "/acme"}, testDialect{})
 
 	// Without certificate files the site is plain HTTP.
 	site := m.Site("web", "web.example.com", 40001, "r1")
@@ -276,24 +212,7 @@ func TestExecRunnerCapturesOutputAndFailure(t *testing.T) {
 	}
 }
 
-func TestReleaseOf(t *testing.T) {
-	conf, err := Render(Site{App: "web", Domain: "web.example.com", Upstream: "127.0.0.1:1", Release: "20261119-183544"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if got := ReleaseOf(conf); got != "20261119-183544" {
-		t.Errorf("ReleaseOf(rendered) = %q, want the release it was rendered with", got)
-	}
-	if got := ReleaseOf(nil); got != "" {
-		t.Errorf("ReleaseOf(nil) = %q, want empty", got)
-	}
-	if got := ReleaseOf([]byte("server { listen 80; }")); got != "" {
-		t.Errorf("ReleaseOf(foreign config) = %q, want empty", got)
-	}
-}
-
-// probeServer starts an HTTP server that plays the role of Nginx: it reports
+// probeServer starts an HTTP server that plays the role of the proxy: it reports
 // a release per host name. release is a function so tests can change the
 // answer while WaitRelease is polling.
 func probeServer(t *testing.T, release func(host string) string) *Manager {
@@ -309,7 +228,7 @@ func probeServer(t *testing.T, release func(host string) string) *Manager {
 	}))
 	t.Cleanup(srv.Close)
 
-	m := New(config.Nginx{ProbeAddr: strings.TrimPrefix(srv.URL, "http://")})
+	m := New(config.Proxy{ProbeAddr: strings.TrimPrefix(srv.URL, "http://")}, testDialect{})
 	m.waitTimeout = 300 * time.Millisecond
 	m.waitInterval = 5 * time.Millisecond
 	return m
@@ -369,7 +288,7 @@ func TestWaitReleaseTimesOut(t *testing.T) {
 }
 
 func TestWaitReleaseReportsUnreachableProxy(t *testing.T) {
-	m := New(config.Nginx{ProbeAddr: "127.0.0.1:1"}) // nothing listens on port 1
+	m := New(config.Proxy{ProbeAddr: "127.0.0.1:1"}, testDialect{}) // nothing listens on port 1
 	m.waitTimeout = 50 * time.Millisecond
 	m.waitInterval = 5 * time.Millisecond
 
@@ -406,5 +325,56 @@ func TestFileOperationsRefusePathTraversal(t *testing.T) {
 
 	if got, err := os.ReadFile(outside); err != nil || string(got) != "precious\n" {
 		t.Errorf("the file outside the config directory is now %q (error %v)", got, err)
+	}
+}
+
+func TestConfiguredCommandsWinOverTheDialects(t *testing.T) {
+	m := New(config.Proxy{ConfDir: t.TempDir(), ReloadCommand: []string{"sudo", "-n", "systemctl", "reload", "proxy"}}, testDialect{})
+	if got := m.TestCommand(); got != "proxy -t" {
+		t.Errorf("TestCommand() = %q, want the dialect's", got)
+	}
+	if got := m.ReloadCommand(); got != "sudo -n systemctl reload proxy" {
+		t.Errorf("ReloadCommand() = %q, want the configured one", got)
+	}
+}
+
+func TestAProxyThatWatchesItsFilesRunsNothing(t *testing.T) {
+	m, commands := newTestManager(t)
+	m.dialect = testDialect{watches: true}
+	m.cfg.TestCommand, m.cfg.ReloadCommand = nil, nil
+
+	if err := m.Test(context.Background()); err != nil {
+		t.Errorf("Test() error = %v", err)
+	}
+	if err := m.Reload(context.Background()); err != nil {
+		t.Errorf("Reload() error = %v", err)
+	}
+	if len(*commands) != 0 || m.TestCommand() != "" || m.ReloadCommand() != "" {
+		t.Errorf("ran %v, commands %q and %q; want nothing", *commands, m.TestCommand(), m.ReloadCommand())
+	}
+}
+
+func TestAutoTLSOnlyForAProxyWithCertificatesAndAPublicName(t *testing.T) {
+	tests := []struct {
+		tls    bool
+		domain string
+		want   bool
+	}{
+		{true, "api.example.com", true},
+		{true, "web.localhost", false}, // no public CA issues for it
+		{false, "api.example.com", false},
+	}
+	for _, tt := range tests {
+		m := New(config.Proxy{ConfDir: "/conf"}, testDialect{tls: tt.tls})
+		if got := m.Site("web", tt.domain, 1, "r1").AutoTLS; got != tt.want {
+			t.Errorf("tls=%v %s: AutoTLS = %v, want %v", tt.tls, tt.domain, got, tt.want)
+		}
+	}
+}
+
+func TestPathUsesTheDialectsExtension(t *testing.T) {
+	m := New(config.Proxy{ConfDir: "/etc/proxy/liman.d"}, testDialect{})
+	if got := m.Path("web"); got != "/etc/proxy/liman.d/web.conf" {
+		t.Errorf("Path() = %q", got)
 	}
 }

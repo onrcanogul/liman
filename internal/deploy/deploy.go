@@ -26,8 +26,11 @@ import (
 
 // Proxy is what a deploy needs from the reverse proxy. It is declared here,
 // by the package that uses it, and lists only the operations a deploy
-// performs; *nginx.Manager happens to satisfy it.
+// performs; *proxy.Manager happens to satisfy it, for every proxy it has a
+// dialect for.
 type Proxy interface {
+	// Name is the proxy's name, for output: "Nginx".
+	Name() string
 	// Path returns the config file of an app, for display.
 	Path(app string) string
 	// Render returns the config that routes domain to hostPort and reports
@@ -49,7 +52,8 @@ type Proxy interface {
 	WaitRelease(ctx context.Context, domain, release string) error
 	// ReleaseOf returns the release recorded in a config, or "".
 	ReleaseOf(content []byte) string
-	// TestCommand and ReloadCommand describe the commands for display.
+	// TestCommand and ReloadCommand describe the commands for display; ""
+	// when the proxy needs none because it watches its files.
 	TestCommand() string
 	ReloadCommand() string
 }
@@ -395,7 +399,7 @@ func (d *Deployer) drainStep(st *state) pipeline.Step {
 func (d *Deployer) proxySteps(st *state) []pipeline.Step {
 	return []pipeline.Step{
 		{
-			Name:   "Write Nginx config for " + st.domain,
+			Name:   "Write " + d.Proxy.Name() + " config for " + st.domain,
 			Manual: func() string { return "$EDITOR " + d.Proxy.Path(st.name) },
 			// The preview is computed when the step is about to run, so in
 			// a real deploy it shows the allocated port and in a dry run a
@@ -421,21 +425,24 @@ func (d *Deployer) proxySteps(st *state) []pipeline.Step {
 			},
 		},
 		{
-			Name:   "Reload Nginx",
-			Manual: func() string { return d.Proxy.TestCommand() + " && " + d.Proxy.ReloadCommand() },
+			Name:   d.reloadStepName(),
+			Manual: d.reloadManual,
 			Run: func(ctx context.Context) error {
 				// Test first. A reload with a broken config is refused by
 				// Nginx anyway, but testing separately gives a clear error
-				// and never touches the running process.
+				// and never touches the running process. A proxy that
+				// watches its files has neither command, and the wait is
+				// all there is.
 				if err := d.Proxy.Test(ctx); err != nil {
 					return err
 				}
 				if err := d.Proxy.Reload(ctx); err != nil {
 					return err
 				}
-				// The reload command returns before Nginx has switched.
-				// The other release is retired next, so wait until Nginx
-				// itself reports the release being brought into service.
+				// The reload command returns before the proxy has
+				// switched. The other release is retired next, so wait
+				// until the proxy itself reports the release being brought
+				// into service.
 				return d.Proxy.WaitRelease(ctx, st.domain, st.release)
 			},
 			// Undo runs before the undo of the previous step (reverse
@@ -454,11 +461,34 @@ func (d *Deployer) proxySteps(st *state) []pipeline.Step {
 				}
 				// The container that was being brought into service goes
 				// away right after this, by the undo of the start step.
-				// Wait until Nginx is back on the release it served before.
+				// Wait until the proxy is back on the release it served
+				// before.
 				return d.Proxy.WaitRelease(ctx, st.domain, d.Proxy.ReleaseOf(st.previousConf))
 			},
 		},
 	}
+}
+
+// reloadStepName names the step that makes the proxy use the new config.
+func (d *Deployer) reloadStepName() string {
+	if d.Proxy.ReloadCommand() == "" {
+		return "Wait for " + d.Proxy.Name() + " to load the config"
+	}
+	return "Reload " + d.Proxy.Name()
+}
+
+// reloadManual is the manual equivalent of the reload step.
+func (d *Deployer) reloadManual() string {
+	var cmds []string
+	for _, c := range []string{d.Proxy.TestCommand(), d.Proxy.ReloadCommand()} {
+		if c != "" {
+			cmds = append(cmds, c)
+		}
+	}
+	if len(cmds) == 0 {
+		return "# " + d.Proxy.Name() + " picks up the file by itself"
+	}
+	return strings.Join(cmds, " && ")
 }
 
 // previewConf returns the diff between the config on disk and the one that

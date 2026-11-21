@@ -16,7 +16,6 @@ import (
 	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/deploy"
 	"github.com/onrcanogul/liman/internal/engine"
-	"github.com/onrcanogul/liman/internal/nginx"
 )
 
 // issuer returns the certificate issuer config.yaml describes, or nil when
@@ -34,8 +33,8 @@ func (d *Daemon) issuer(cfg config.Config) *certs.Issuer {
 		Email:      cfg.ACME.Email,
 		CAFile:     cfg.ACME.CAFile,
 		AccountKey: key,
-		Webroot:    cfg.Nginx.ACMERoot,
-		Store:      certs.Store{Dir: cfg.Nginx.CertDir},
+		Webroot:    cfg.Proxy.ACMERoot,
+		Store:      certs.Store{Dir: cfg.Proxy.CertDir},
 	}
 }
 
@@ -157,7 +156,7 @@ func (r *certRenewer) renewDue(ctx context.Context, containers []engine.Containe
 		return
 	}
 	if err := r.apply(ctx); err != nil {
-		r.log.Error("certificate: renewed, but Nginx did not take it", "error", err.Error())
+		r.log.Error("certificate: renewed, but the proxy did not take it", "proxy", r.proxy.Name(), "error", err.Error())
 	}
 }
 
@@ -239,16 +238,16 @@ func (d *Daemon) runCert(ctx context.Context, args []string) int {
 }
 
 func (d *Daemon) certList(cfg config.Config) int {
-	if cfg.Nginx.CertDir == "" {
-		return d.fail(errors.New("nginx.cert_dir is not set in config.yaml, so there are no certificates to list"))
+	if cfg.Proxy.CertDir == "" {
+		return d.fail(fmt.Errorf("%s.cert_dir is not set in config.yaml, so there are no certificates to list", cfg.Proxy.Section()))
 	}
-	list, err := certs.Store{Dir: cfg.Nginx.CertDir}.List()
+	list, err := certs.Store{Dir: cfg.Proxy.CertDir}.List()
 	if err != nil {
 		// What could be read is still listed.
 		fmt.Fprintf(d.Stderr, "limand: %v\n", err)
 	}
 	if len(list) == 0 {
-		fmt.Fprintf(d.Stdout, "No certificates in %s.\n", cfg.Nginx.CertDir)
+		fmt.Fprintf(d.Stdout, "No certificates in %s.\n", cfg.Proxy.CertDir)
 		if err != nil {
 			return exitError
 		}
@@ -292,7 +291,7 @@ func certStatus(c certs.Info, now time.Time) string {
 
 // certificatesForAPI is GET /v1/certs.
 func certificatesForAPI(cfg config.Config, connect func(context.Context) (engine.Engine, error)) func(context.Context) (api.Certificates, error) {
-	store := certs.Store{Dir: cfg.Nginx.CertDir}
+	store := certs.Store{Dir: cfg.Proxy.CertDir}
 	return func(ctx context.Context) (api.Certificates, error) {
 		out := api.Certificates{ACME: cfg.ACME.Enabled(), Directory: cfg.ACME.Directory, Certificates: []api.Certificate{}}
 		list, err := store.List()
@@ -359,14 +358,17 @@ func (d *Daemon) certRenew(ctx context.Context, cfg config.Config, domain string
 		return d.fail(err)
 	}
 
-	proxy := nginx.New(cfg.Nginx)
+	proxy, err := newProxy(cfg)
+	if err != nil {
+		return d.fail(err)
+	}
 	if err := proxy.Test(ctx); err != nil {
-		return d.fail(fmt.Errorf("the certificate is saved, but the Nginx config does not pass its test: %w", err))
+		return d.fail(fmt.Errorf("the certificate is saved, but the %s config does not pass its test: %w", proxy.Name(), err))
 	}
 	if err := proxy.Reload(ctx); err != nil {
-		return d.fail(fmt.Errorf("the certificate is saved, but reloading Nginx failed: %w", err))
+		return d.fail(fmt.Errorf("the certificate is saved, but reloading %s failed: %w", proxy.Name(), err))
 	}
-	fmt.Fprintf(d.Stdout, "Certificate for %s saved and Nginx reloaded; valid until %s.\n", domain, info.NotAfter.Local().Format("2006-01-02 15:04"))
+	fmt.Fprintf(d.Stdout, "Certificate for %s saved and %s reloaded; valid until %s.\n", domain, proxy.Name(), info.NotAfter.Local().Format("2006-01-02 15:04"))
 	if !had {
 		fmt.Fprintf(d.Stdout, "%s had no certificate before: its app switches to HTTPS at its next deploy, or at the daemon's next certificate check.\n", domain)
 	}

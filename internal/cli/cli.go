@@ -221,9 +221,9 @@ func (c *CLI) runDeploy(ctx context.Context, args []string, planOnly bool) int {
 
 	fmt.Fprintf(c.Stdout, "\n%s is running on the server at 127.0.0.1:%d (release %s)\n", res.App, res.HostPort, res.Release)
 	if res.Routed {
-		fmt.Fprintf(c.Stdout, "Nginx routes %s to it\n", res.Domain)
+		fmt.Fprintf(c.Stdout, "%s routes %s to it\n", proxyName(res.Proxy), res.Domain)
 	} else {
-		fmt.Fprintln(c.Stdout, "No Nginx is configured on the server, so it is only reachable on that address")
+		fmt.Fprintln(c.Stdout, "No proxy is configured on the server, so it is only reachable on that address")
 	}
 	return exitOK
 }
@@ -331,7 +331,7 @@ func (c *CLI) runRollback(ctx context.Context, args []string) int {
 
 	fmt.Fprintf(c.Stdout, "\n%s is back on release %s, running on the server at 127.0.0.1:%d\n", res.App, res.Release, res.HostPort)
 	if res.Routed {
-		fmt.Fprintln(c.Stdout, "Nginx routes its domain to it")
+		fmt.Fprintf(c.Stdout, "%s routes its domain to it\n", proxyName(res.Proxy))
 	}
 	fmt.Fprintln(c.Stdout, "The release that was rolled back from has been removed; deploy again to move forward")
 	return exitOK
@@ -450,7 +450,7 @@ func (c *CLI) runStop(ctx context.Context, args []string) int {
 	}
 
 	if res.ProxyConfig != "" {
-		fmt.Fprintf(c.Stdout, "Removed Nginx config %s\n", res.ProxyConfig)
+		fmt.Fprintf(c.Stdout, "Removed %s config %s\n", proxyName(res.Proxy), res.ProxyConfig)
 	}
 	for _, name := range res.Removed {
 		fmt.Fprintf(c.Stdout, "Stopped and removed %s\n", name)
@@ -705,4 +705,13 @@ func (c *CLI) fail(err error) int {
 func (c *CLI) usageError(synopsis string) int {
 	fmt.Fprintf(c.Stderr, "usage: %s\n", synopsis)
 	return exitUsage
+}
+
+// proxyName is the proxy a daemon reported, for output. An older daemon
+// reports none, and drove Nginx.
+func proxyName(name string) string {
+	if name == "" {
+		return "Nginx"
+	}
+	return name
 }

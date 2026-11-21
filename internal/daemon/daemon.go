@@ -30,7 +30,6 @@ import (
 	"github.com/onrcanogul/liman/internal/config"
 	"github.com/onrcanogul/liman/internal/engine"
 	"github.com/onrcanogul/liman/internal/monitor"
-	"github.com/onrcanogul/liman/internal/nginx"
 	"github.com/onrcanogul/liman/internal/panel"
 	"github.com/onrcanogul/liman/internal/secrets"
 	"github.com/onrcanogul/liman/internal/server"
@@ -243,7 +242,7 @@ func (d *Daemon) serve(ctx context.Context) int {
 	srv.ChecksumKey, _ = ring.Derive(ring.Primary(), server.ChecksumLabel)
 	srv.Keys = d.keysForAPI(cfg)
 	srv.KeyRotationUnfinished = d.rotationUnfinished
-	if cfg.Nginx.CertDir != "" {
+	if cfg.Proxy.CertDir != "" {
 		srv.Certificates = certificatesForAPI(cfg, connect)
 	}
 	if !cfg.Panel.Disabled {
@@ -260,11 +259,13 @@ func (d *Daemon) serve(ctx context.Context) int {
 		drain := time.Duration(*cfg.Deploy.Drain)
 		srv.Drain = &drain
 	}
-	// Only assign the proxy when it is enabled. Assigning a nil
-	// *nginx.Manager to the interface field would make the field non-nil.
-	var proxy *nginx.Manager
-	if cfg.Nginx.Enabled() {
-		proxy = nginx.New(cfg.Nginx)
+	proxy, err := newProxy(cfg)
+	if err != nil {
+		return d.fail(err)
+	}
+	// Only assign the proxy when there is one. Assigning a nil
+	// *proxy.Manager to the interface field would make the field non-nil.
+	if proxy != nil {
 		srv.Proxy = proxy
 	}
 
@@ -275,7 +276,7 @@ func (d *Daemon) serve(ctx context.Context) int {
 	certsDone := make(chan struct{})
 	// The same check for the issuer: a nil *certs.Issuer in the interface
 	// would look like one that is there. acme is only valid together with
-	// nginx, so proxy is set whenever is is.
+	// a proxy, so proxy is set whenever is is.
 	if is := d.issuer(cfg); is != nil && proxy != nil {
 		srv.Certs = deployCerts{is: is}
 		renewer := &certRenewer{
@@ -355,7 +356,7 @@ func (d *Daemon) serve(ctx context.Context) int {
 		"listen", listener.Addr().String(),
 		"hooks", hooksAddr,
 		"version", buildinfo.Version,
-		"nginx", cfg.Nginx.Enabled(),
+		"proxy", proxyName(proxy),
 		"acme", cfg.ACME.Enabled(),
 		"monitor", !cfg.Monitor.Disabled,
 		"panel", !cfg.Panel.Disabled,

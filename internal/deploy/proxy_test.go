@@ -33,6 +33,7 @@ func newFakeProxy() *fakeProxy {
 	return &fakeProxy{files: map[string]string{}, live: map[string]string{}}
 }
 
+func (p *fakeProxy) Name() string           { return "Nginx" }
 func (p *fakeProxy) Path(app string) string { return "/etc/nginx/liman/" + app + ".conf" }
 func (p *fakeProxy) TestCommand() string    { return "nginx -t" }
 func (p *fakeProxy) ReloadCommand() string  { return "nginx -s reload" }

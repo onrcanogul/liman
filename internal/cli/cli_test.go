@@ -127,7 +127,7 @@ func TestRun(t *testing.T) {
 			name:       "deploy without a proxy says so",
 			args:       []string{"deploy", validFile},
 			wantCode:   exitOK,
-			wantStdout: "No Nginx is configured on the server",
+			wantStdout: "No proxy is configured on the server",
 		},
 
 		{name: "ps with no apps", args: []string{"ps"}, wantCode: exitOK, wantStdout: "No apps."},

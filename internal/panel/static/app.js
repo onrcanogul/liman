@@ -1426,7 +1426,7 @@ function viewDaemon() {
   return [h('h1', { text: 'Daemon' }), h('div', { class: 'grid' },
     panel('Parts', h('dl', { class: 'kv' },
       S.engineError ? part('Docker', 'crit', 'Problem', str(S.engineError, 240)) : part('Docker', 'ok', 'OK', 'answers the daemon'),
-      d.proxy ? part('Reverse proxy', 'ok', 'Managed', 'the daemon writes and reloads the Nginx config') : part('Reverse proxy', 'none', 'Off', 'apps are only reachable on their own port'),
+      d.proxy ? part('Reverse proxy', 'ok', d.proxy_name || 'Managed', 'the daemon writes the config and has the proxy load it') : part('Reverse proxy', 'none', 'Off', 'apps are only reachable on their own port'),
       d.secrets ? part('Secret storage', 'ok', 'On', 'values are encrypted with the master key') : part('Secret storage', 'none', 'Off', 'apps that name secrets cannot be deployed'),
       m ? part('Health monitor', 'ok', 'On', 'checks every ' + span(m.interval_seconds) + ', restarts after ' + fmtNum(m.failure_threshold) + ' failures in a row, keeps ' + span(m.retention_seconds) + ' of history')
         : part('Health monitor', 'none', 'Off', 'apps are not checked or restarted')), { span: 'c6' }),

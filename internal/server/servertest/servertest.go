@@ -24,7 +24,8 @@ import (
 	"github.com/onrcanogul/liman/internal/deploy"
 	"github.com/onrcanogul/liman/internal/engine"
 	"github.com/onrcanogul/liman/internal/engine/enginetest"
-	"github.com/onrcanogul/liman/internal/nginx"
+	"github.com/onrcanogul/liman/internal/proxy"
+	"github.com/onrcanogul/liman/internal/proxy/nginx"
 	"github.com/onrcanogul/liman/internal/secrets"
 	"github.com/onrcanogul/liman/internal/server"
 	"github.com/onrcanogul/liman/internal/store"
@@ -153,14 +154,14 @@ func (h *Harness) DeployKey(t *testing.T, name string, apps ...string) (string, 
 	return token, &api.Client{BaseURL: h.HookURL, Token: token}
 }
 
-// WithProxy gives the server a real nginx.Manager that writes into a
+// WithProxy gives the server a real proxy.Manager for Nginx that writes into a
 // temporary directory. Nginx itself is replaced by two stand-ins:
 //
 //   - the test and reload commands are the standard Unix programs true and
 //     false, which do nothing and exit with success or failure;
 //   - a local HTTP server answers the release probe by looking at the files
 //     in the config directory, as an Nginx that reloads instantly would.
-func (h *Harness) WithProxy(t *testing.T, reloadCommand string) *nginx.Manager {
+func (h *Harness) WithProxy(t *testing.T, reloadCommand string) *proxy.Manager {
 	t.Helper()
 
 	confDir := t.TempDir()
@@ -170,7 +171,7 @@ func (h *Harness) WithProxy(t *testing.T, reloadCommand string) *nginx.Manager {
 		for _, file := range files {
 			content, err := os.ReadFile(file)
 			if err == nil && strings.Contains(string(content), "server_name "+r.Host+";") {
-				w.Header().Set(nginx.ReleaseHeader, nginx.ReleaseOf(content))
+				w.Header().Set(proxy.ReleaseHeader, nginx.Dialect{}.ReleaseOf(content))
 				return
 			}
 		}
@@ -178,13 +179,13 @@ func (h *Harness) WithProxy(t *testing.T, reloadCommand string) *nginx.Manager {
 	}))
 	t.Cleanup(probe.Close)
 
-	m := nginx.New(config.Nginx{
+	m := proxy.New(config.Proxy{
 		ConfDir:       confDir,
 		UpstreamHost:  "127.0.0.1",
 		ProbeAddr:     strings.TrimPrefix(probe.URL, "http://"),
 		TestCommand:   []string{"true"},
 		ReloadCommand: []string{reloadCommand},
-	})
+	}, nginx.Dialect{})
 	h.Server.Proxy = m
 	return m
 }

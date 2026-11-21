@@ -58,6 +58,7 @@ type renewProxy struct {
 	testErr error
 }
 
+func (p *renewProxy) Name() string           { return "Nginx" }
 func (p *renewProxy) Path(app string) string { return "/etc/nginx/liman/" + app + ".conf" }
 func (p *renewProxy) TestCommand() string    { return "nginx -t" }
 func (p *renewProxy) ReloadCommand() string  { return "nginx -s reload" }
@@ -279,7 +280,7 @@ func TestCertificatesForAPI(t *testing.T) {
 	fake.Add(engine.Container{Name: "b-r1", App: "b", State: "exited", Domain: "b.example.com"})
 	connect := func(context.Context) (engine.Engine, error) { return fake, nil }
 
-	cfg := config.Config{Nginx: config.Nginx{CertDir: dir}, ACME: config.ACME{Directory: "https://ca.example/dir"}}
+	cfg := config.Config{Proxy: config.Proxy{CertDir: dir}, ACME: config.ACME{Directory: "https://ca.example/dir"}}
 	out, err := certificatesForAPI(cfg, connect)(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -299,7 +300,7 @@ func TestCertificatesForAPIWithoutDocker(t *testing.T) {
 	saveCert(t, certs.Store{Dir: dir}, "a.example.com", now.Add(-91*24*time.Hour), now.Add(-time.Hour))
 	connect := func(context.Context) (engine.Engine, error) { return nil, errors.New("docker is down") }
 
-	out, err := certificatesForAPI(config.Config{Nginx: config.Nginx{CertDir: dir}}, connect)(context.Background())
+	out, err := certificatesForAPI(config.Config{Proxy: config.Proxy{CertDir: dir}}, connect)(context.Background())
 	if err != nil || len(out.Certificates) != 1 || !out.Certificates[0].InUse || len(out.Errors) != 1 {
 		t.Errorf("certificates without Docker = %+v, %v; want the certificate counted as used, and the reason", out, err)
 	}

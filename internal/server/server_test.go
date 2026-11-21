@@ -583,7 +583,7 @@ func TestStopKeepsEverythingWhenReloadFails(t *testing.T) {
 
 	_, err := h.Client.Stop(ctx(), "web")
 
-	if err == nil || !strings.Contains(err.Error(), "nginx reload failed") {
+	if err == nil || !strings.Contains(err.Error(), "Nginx reload failed") {
 		t.Fatalf("Stop() error = %v, want the reload failure", err)
 	}
 	// The proxy still serves the old config, so the file must be back and

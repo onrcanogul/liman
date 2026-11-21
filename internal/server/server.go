@@ -475,6 +475,7 @@ func (s *Server) runDeploy(w http.ResponseWriter, r *http.Request, a *app.App, r
 		HostPort:  res.HostPort,
 		Domain:    a.Domain,
 		Routed:    err == nil && !dryRun && s.Proxy != nil,
+		Proxy:     s.proxyName(),
 		DryRun:    dryRun,
 	}
 	if err != nil {
@@ -582,6 +583,7 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 		Container: res.Container,
 		HostPort:  res.HostPort,
 		Routed:    err == nil && !dryRun && s.Proxy != nil,
+		Proxy:     s.proxyName(),
 		DryRun:    dryRun,
 	}
 	if err != nil {
@@ -757,8 +759,8 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Take the app out of the proxy first. The other way round there would
-	// be a moment in which Nginx forwards requests to a container that is
-	// already gone.
+	// be a moment in which the proxy forwards requests to a container that
+	// is already gone.
 	if s.Proxy != nil {
 		removed, err := s.unroute(ctx, name)
 		if err != nil {
@@ -768,6 +770,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		}
 		if removed {
 			result.ProxyConfig = s.Proxy.Path(name)
+			result.Proxy = s.Proxy.Name()
 		}
 	}
 
@@ -838,6 +841,7 @@ func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 		StartedAt:      s.Started,
 		Now:            time.Now(),
 		Proxy:          s.Proxy != nil,
+		ProxyName:      s.proxyName(),
 		Secrets:        s.Secrets != nil,
 		Backups:        s.Backups != nil,
 		Certificates:   s.Certificates != nil,
@@ -1094,7 +1098,7 @@ func (s *Server) handleBackupVerify(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCertificates(w http.ResponseWriter, r *http.Request) {
 	if s.Certificates == nil {
-		writeError(w, http.StatusServiceUnavailable, errors.New("this daemon has no certificate directory (nginx.cert_dir)"))
+		writeError(w, http.StatusServiceUnavailable, errors.New("this daemon has no certificate directory (proxy.cert_dir)"))
 		return
 	}
 	out, err := s.Certificates(r.Context())
@@ -1634,6 +1638,14 @@ func (s *Server) containersOf(ctx context.Context, appName string) (engine.Engin
 		return nil, nil, http.StatusNotFound, fmt.Errorf("%s: %w", appName, engine.ErrNotFound)
 	}
 	return eng, containers, http.StatusOK, nil
+}
+
+// proxyName is the name of the proxy, or "" when there is none.
+func (s *Server) proxyName() string {
+	if s.Proxy == nil {
+		return ""
+	}
+	return s.Proxy.Name()
 }
 
 // unroute removes the app's proxy config and reloads the proxy. If the
