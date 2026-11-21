@@ -50,7 +50,8 @@ In a second terminal (with the same `LIMAN_HOME`):
 
 ## Deploying
 
-An app is described by a file, see [examples/app.yaml](examples/app.yaml).
+An app is described by a file, see [examples/app.yaml](examples/app.yaml) (and
+[examples/worker.yaml](examples/worker.yaml) for a worker, see Workers).
 Every deploy is a list of named steps. A dry run shows them, together with the
 command you would have typed by hand, without touching anything:
 
@@ -157,7 +158,9 @@ have stopped working, without being asked:
 - a container that is not running is restarted on the next check;
 - a running container whose health check fails three times in a row is
   restarted too. This catches apps that are up but no longer answering,
-  which Docker on its own does not notice.
+  which Docker on its own does not notice. For an app without a health
+  path (a worker has no port to ask), the image's own `HEALTHCHECK` counts
+  when it has one: "unhealthy" is a failed check.
 
 An app that keeps failing is restarted with growing pauses in between (the
 interval, then twice that, and so on up to five minutes) instead of in a
@@ -185,6 +188,60 @@ monitor:
 
 Nothing is restarted while the daemon itself is not running, so the daemon
 should be kept alive by a service manager such as systemd.
+
+## Workers
+
+Not everything an app consists of serves requests: a queue consumer, a
+scheduler, a bot that connects out. Such a process is a worker. It has no
+domain and no port, nothing is routed to it, and it publishes nothing on the
+host:
+
+```yaml
+name: orders-worker
+image: ghcr.io/team/orders-api     # the web app's image, another command
+kind: worker
+command: [node, worker.js]          # replaces the image's command; optional
+env:
+  QUEUE_URL: ${QUEUE_URL}
+deploy:
+  strategy: replace                 # optional, see below
+```
+
+`kind: worker` is written out on purpose: a web app that forgets its
+`domain` is an error, not a worker in disguise. A worker with a `domain`,
+a `port` or a `healthcheck.path` is refused too. `command` works for web
+apps as well.
+
+**Healthy, without anything to ask.** A worker is healthy when the image's
+own `HEALTHCHECK` says so; liman waits as long as that check may take (by
+Docker's defaults, one check every 30 seconds) and gives up when it reports
+"unhealthy". Without a `HEALTHCHECK` it must stay up for 10 seconds,
+`healthcheck.settle: 30s` for longer. That is what catches a worker that
+cannot reach its queue and gives up after a few seconds: in a trial, calling
+it healthy sooner meant the deploy reported success, retired the release
+that worked, and left nothing running. Now the deploy fails and the previous
+release keeps running.
+
+**Two at once, or never.** By default (`strategy: overlap`) a new release
+starts next to the old one, which stops once the new one is healthy: for a
+worker, both run for its settle time. That is harmless for a queue
+consumer, but a bot would answer twice and a scheduler send its report
+twice. With `strategy: replace` the old release is stopped first and the new
+one started after; if the new one is not healthy, the old one is started
+again. A rollback swaps them the same way. (A web app can use `replace` too,
+at the cost of a gap in which nothing answers.)
+
+A stopped release gets the image's stop signal (`SIGTERM` unless its
+`STOPSIGNAL` says otherwise; the `nginx` images say `SIGQUIT`), and Docker's
+ten seconds to finish what it was doing before it is killed. A worker should
+finish its current job on that signal and exit.
+
+From CI, a worker is registered as one; its key can deploy it but cannot
+give it a domain, nor turn a web app's registration into a worker's:
+
+```
+limand app create orders-worker --repo ghcr.io/team/orders-api --worker
+```
 
 ## More on deploys
 
@@ -249,6 +306,7 @@ deploy key:
 
 ```
 limand app create orders-api --repo ghcr.io/team/orders-api --domain api.example.com [--preview-key]
+limand app create orders-worker --repo ghcr.io/team/orders-api --worker   # a worker: no domain (see Workers)
 limand app list                       # with each app's keys
 limand app delete orders-api          # its pipeline can no longer deploy it
 ```
@@ -1338,8 +1396,9 @@ minutes in all:
 - **end to end:** [scripts/ci-e2e.sh](scripts/ci-e2e.sh) on the runner's
   fresh Ubuntu, as on a new server: `install.sh`, a local registry, an app
   registered with a deploy and a preview key, a preview, deploys through
-  the trigger endpoint, what Nginx serves, the audit anchors in the system
-  log, the backup service, and the keys revoked when the app is deleted.
+  the trigger endpoint, what Nginx serves, a worker (no port, no Nginx
+  config, its key refused a domain), the audit anchors in the system log,
+  the backup service, and the keys revoked when the app is deleted.
   It changes the machine it runs on, so outside CI it runs only with
   `LIMAN_E2E_THROWAWAY=yes`.
 
