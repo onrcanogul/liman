@@ -309,6 +309,15 @@ func (s *Server) checkDefinition(req api.TriggerRequest, reg store.Registration)
 	if repo := engine.Repository(a.Image); repo != reg.Repo {
 		return nil, http.StatusForbidden, fmt.Errorf("image: %s is registered with repository %s, not %q; that is changed on the server, not by a pipeline", reg.Name, reg.Repo, repo)
 	}
+	// A worker is registered without a domain, and its key cannot give it
+	// one: that would put it on the internet. Nor can a web app's key turn
+	// it into a worker.
+	if a.Worker() != reg.Worker() {
+		if reg.Worker() {
+			return nil, http.StatusForbidden, fmt.Errorf("kind: %s is registered as a worker, not a web app; that is changed on the server, not by a pipeline", reg.Name)
+		}
+		return nil, http.StatusForbidden, fmt.Errorf("kind: %s is registered as a web app, not a worker; that is changed on the server, not by a pipeline", reg.Name)
+	}
 	if a.Domain != reg.Domain {
 		return nil, http.StatusForbidden, fmt.Errorf("domain: %s is registered with %s, not %q; that is changed on the server, not by a pipeline", reg.Name, reg.Domain, a.Domain)
 	}

@@ -790,6 +790,25 @@ func TestRegisteredAppIsDeployedFromItsPipelineOnly(t *testing.T) {
 	}
 }
 
+func TestAppCreateWorker(t *testing.T) {
+	td := newTestDaemon(t)
+	ctx := context.Background()
+	if code := td.Run(ctx, []string{"app", "create", "mailer", "--repo", "r.example.com/mailer", "--worker"}); code != exitOK {
+		t.Fatalf("app create --worker: code %d, stderr %s", code, td.stderr.String())
+	}
+	if !strings.Contains(td.stdout.String(), "a worker (its app.yaml says kind: worker)") {
+		t.Errorf("output does not say it is a worker:\n%s", td.stdout.String())
+	}
+	// A second worker: no domain to collide on.
+	if code := td.Run(ctx, []string{"app", "create", "scheduler", "--repo", "r.example.com/scheduler", "--worker"}); code != exitOK {
+		t.Fatalf("second worker: code %d, stderr %s", code, td.stderr.String())
+	}
+	td.stdout.buf.Reset()
+	if code := td.Run(ctx, []string{"app", "list"}); code != exitOK || strings.Count(td.stdout.String(), "(worker)") != 2 {
+		t.Errorf("app list:\n%s", td.stdout.String())
+	}
+}
+
 func TestAppCreateRefusals(t *testing.T) {
 	td := newTestDaemon(t)
 	ctx := context.Background()
@@ -798,7 +817,9 @@ func TestAppCreateRefusals(t *testing.T) {
 		code int
 		want string
 	}{
-		{[]string{"app", "create", "web", "--repo", "r.example.com/web"}, exitUsage, "usage: limand app create"},
+		{[]string{"app", "create", "web", "--repo", "r.example.com/web"}, exitUsage, "give --domain for a web app, or --worker"},
+		{[]string{"app", "create", "web", "--repo", "r.example.com/web", "--domain", "w.example.com", "--worker"}, exitUsage, "not both"},
+		{[]string{"app", "create", "web", "--domain", "w.example.com"}, exitUsage, "usage: limand app create"},
 		{[]string{"app", "create", "Web", "--repo", "r.example.com/web", "--domain", "w.example.com"}, exitUsage, "not a valid app name"},
 		{[]string{"app", "create", "web", "--repo", "r.example.com/web:1.0", "--domain", "w.example.com"}, exitUsage, "without a tag"},
 		{[]string{"app", "create", "web", "--repo", "r.example.com/web", "--domain", "localhost"}, exitUsage, "not a valid domain"},

@@ -474,8 +474,9 @@ func (s *Server) runDeploy(w http.ResponseWriter, r *http.Request, a *app.App, r
 		Container: res.Container,
 		HostPort:  res.HostPort,
 		Domain:    a.Domain,
-		Routed:    err == nil && !dryRun && s.Proxy != nil,
+		Routed:    err == nil && !dryRun && s.Proxy != nil && !res.Worker,
 		Proxy:     s.proxyName(),
+		Worker:    res.Worker,
 		DryRun:    dryRun,
 	}
 	if err != nil {
@@ -582,8 +583,9 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 		Release:   res.Release,
 		Container: res.Container,
 		HostPort:  res.HostPort,
-		Routed:    err == nil && !dryRun && s.Proxy != nil,
+		Routed:    err == nil && !dryRun && s.Proxy != nil && !res.Worker,
 		Proxy:     s.proxyName(),
+		Worker:    res.Worker,
 		DryRun:    dryRun,
 	}
 	if err != nil {
@@ -672,6 +674,7 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 			Domain:      c.Domain,
 			Healthcheck: c.HealthPath,
 			Created:     c.Created,
+			Worker:      c.Worker(),
 
 			Role: "current",
 		}
@@ -969,6 +972,10 @@ func listQuery(w http.ResponseWriter, r *http.Request) (limit int, filter string
 // and has no container yet.
 func (s *Server) claimDomain(ctx context.Context, eng engine.Engine, r *http.Request, a *app.App) (release func(), err error) {
 	domain := a.Domain
+	// A worker has none to claim.
+	if domain == "" {
+		return func() {}, nil
+	}
 	taken := func(other string) error {
 		// The other app is named only to a token that may see it.
 		if visible(r, other) {

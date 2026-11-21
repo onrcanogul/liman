@@ -219,6 +219,10 @@ func (c *CLI) runDeploy(ctx context.Context, args []string, planOnly bool) int {
 		return exitOK
 	}
 
+	if res.Worker {
+		fmt.Fprintf(c.Stdout, "\n%s is running on the server as a worker (release %s); nothing is routed to it\n", res.App, res.Release)
+		return exitOK
+	}
 	fmt.Fprintf(c.Stdout, "\n%s is running on the server at 127.0.0.1:%d (release %s)\n", res.App, res.HostPort, res.Release)
 	if res.Routed {
 		fmt.Fprintf(c.Stdout, "%s routes %s to it\n", proxyName(res.Proxy), res.Domain)
@@ -329,7 +333,11 @@ func (c *CLI) runRollback(ctx context.Context, args []string) int {
 		return exitOK
 	}
 
-	fmt.Fprintf(c.Stdout, "\n%s is back on release %s, running on the server at 127.0.0.1:%d\n", res.App, res.Release, res.HostPort)
+	if res.Worker {
+		fmt.Fprintf(c.Stdout, "\n%s is back on release %s, running as a worker\n", res.App, res.Release)
+	} else {
+		fmt.Fprintf(c.Stdout, "\n%s is back on release %s, running on the server at 127.0.0.1:%d\n", res.App, res.Release, res.HostPort)
+	}
 	if res.Routed {
 		fmt.Fprintf(c.Stdout, "%s routes its domain to it\n", proxyName(res.Proxy))
 	}
@@ -382,7 +390,10 @@ func (c *CLI) runPs(ctx context.Context, args []string) int {
 	var notes []string
 	for _, ctr := range containers {
 		address := "-"
-		if ctr.HostPort != 0 {
+		switch {
+		case ctr.Worker:
+			address = "(worker)"
+		case ctr.HostPort != 0:
 			address = fmt.Sprintf("127.0.0.1:%d", ctr.HostPort)
 		}
 

@@ -651,3 +651,44 @@ func TestNoCheckIsReportedWhileAnAppIsLeftAlone(t *testing.T) {
 		t.Errorf("check of a stopped container = %+v, want a failure without a probe", f.checks[0])
 	}
 }
+
+// A worker has no port to ask; when its image has a HEALTHCHECK, the
+// monitor goes by that, as it goes by a failing health path.
+func TestWorkerUnhealthyByItsImageIsRestarted(t *testing.T) {
+	f := newFixture(t)
+	f.engine.Add(engine.Container{Name: "mailer-r1", App: "mailer", Release: "r1", Kind: "worker"})
+	unhealthy := true
+	f.engine.Health = func(string, int) string {
+		if unhealthy {
+			return engine.HealthUnhealthy
+		}
+		return engine.HealthHealthy
+	}
+
+	for range 3 {
+		f.advance(interval)
+	}
+	if f.engine.RestartCount["mailer-r1"] != 1 {
+		t.Fatalf("restarts = %d, want 1 after three unhealthy checks", f.engine.RestartCount["mailer-r1"])
+	}
+
+	// Healthy again: left alone.
+	unhealthy = false
+	for range 5 {
+		f.advance(time.Minute)
+	}
+	if f.engine.RestartCount["mailer-r1"] != 1 {
+		t.Errorf("restarts = %d; a healthy worker was restarted", f.engine.RestartCount["mailer-r1"])
+	}
+}
+
+func TestWorkerWithoutAHealthcheckIsOnlyCheckedForRunning(t *testing.T) {
+	f := newFixture(t)
+	f.engine.Add(engine.Container{Name: "mailer-r1", App: "mailer", Release: "r1", Kind: "worker"})
+	for range 5 {
+		f.advance(interval)
+	}
+	if f.engine.RestartCount["mailer-r1"] != 0 || f.probes != 0 {
+		t.Errorf("restarts %d, probes %d; want neither", f.engine.RestartCount["mailer-r1"], f.probes)
+	}
+}

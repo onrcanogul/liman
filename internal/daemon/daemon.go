@@ -65,12 +65,13 @@ Usage:
                                   the hooks.listen endpoint. A --preview
                                   token, for pull requests, can only ask
                                   what a deploy would change
-  limand app create <name> --repo <repository> --domain <domain>
+  limand app create <name> --repo <repository> (--domain <domain> | --worker)
                       [--key <name>] [--write-client <file>] [--url <url>]
                       [--preview-key [--preview-client <file>]]
                                   Register an app for deploys from CI: its
                                   image repository (no tag) and its domain,
-                                  which its pipeline cannot change. Creates
+                                  or that it is a worker (no domain, no
+                                  port), which its pipeline cannot change. Creates
                                   its deploy key, named <name>-ci unless
                                   --key, printed once; with --preview-key
                                   also a preview key, <name>-pr

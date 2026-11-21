@@ -55,6 +55,9 @@ type DeployResult struct {
 	Domain string `json:"domain,omitempty"`
 	Routed bool   `json:"routed"`
 	Proxy  string `json:"proxy,omitempty"`
+	// Worker says the app is a worker: it has no port and is reached
+	// from nowhere, so neither of the above applies.
+	Worker bool `json:"worker,omitempty"`
 
 	DryRun bool `json:"dry_run"`
 
@@ -141,6 +144,8 @@ type Container struct {
 	Domain      string    `json:"domain,omitempty"`
 	Healthcheck string    `json:"healthcheck,omitempty"`
 	Created     time.Time `json:"created"`
+	// Worker says the container runs a worker: no port, no domain.
+	Worker bool `json:"worker,omitempty"`
 
 	// Role is "current" for the container in service and "previous" for
 	// one that is stopped and kept for a rollback.

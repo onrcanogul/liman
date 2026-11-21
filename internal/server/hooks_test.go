@@ -416,3 +416,63 @@ func TestPreviewKeysPreviewOnly(t *testing.T) {
 		t.Errorf("a preview with variable values = %d %s; want 400", status, body)
 	}
 }
+
+const workerApp = `
+name: mailer
+image: ghcr.io/user/mailer
+kind: worker
+command: [node, mailer.js]
+healthcheck:
+  settle: 20ms
+`
+
+func TestTriggerDeploysAWorker(t *testing.T) {
+	h := servertest.New(t)
+	const workerRepo = "ghcr.io/user/mailer"
+	if err := h.Store.Register(ctx(), store.Registration{Name: "mailer", Repo: workerRepo, Kind: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	h.Engine.Registry = map[string]bool{workerRepo + "@" + digest("a"): true}
+	_, ci := h.DeployKey(t, "mailer-ci", "mailer")
+
+	res, err := ci.Trigger(ctx(), api.TriggerRequest{App: "mailer", Digest: digest("a"), Definition: workerApp}, io.Discard)
+	if err != nil || !res.OK || !res.Worker || res.Routed || res.HostPort != 0 {
+		t.Fatalf("Trigger() = %+v, %v; want a worker, routed nowhere", res, err)
+	}
+	spec := h.Engine.Specs[len(h.Engine.Specs)-1]
+	if spec.ContainerPort != 0 || spec.Kind != "worker" || strings.Join(spec.Command, " ") != "node mailer.js" {
+		t.Errorf("started %+v", spec)
+	}
+}
+
+// A worker is registered as one, and its key cannot put it on the
+// internet; nor can a web app's key make it a worker.
+func TestTriggerCannotChangeTheKind(t *testing.T) {
+	h, key, _ := registered(t)
+	if err := h.Store.Register(ctx(), store.Registration{Name: "mailer", Repo: "ghcr.io/user/mailer", Kind: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	h.Engine.Registry["ghcr.io/user/mailer@"+digest("a")] = true
+	workerKey, _ := h.DeployKey(t, "mailer-ci", "mailer")
+
+	asWeb := `
+name: mailer
+image: ghcr.io/user/mailer
+domain: mail.example.com
+port: 80
+`
+	status, body := trigger(t, h, workerKey, jsonOf(t, api.TriggerRequest{App: "mailer", Digest: digest("a"), Definition: asWeb}))
+	if status != http.StatusForbidden || !strings.Contains(body, "registered as a worker") {
+		t.Errorf("a worker's key deploying a web app: %d %s", status, body)
+	}
+
+	asWorker := `
+name: orders-api
+image: ghcr.io/user/orders-api
+kind: worker
+`
+	status, body = trigger(t, h, key, jsonOf(t, api.TriggerRequest{App: "orders-api", Digest: digest("a"), Definition: asWorker}))
+	if status != http.StatusForbidden || !strings.Contains(body, "registered as a web app") {
+		t.Errorf("a web app's key deploying a worker: %d %s", status, body)
+	}
+}

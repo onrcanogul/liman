@@ -273,8 +273,13 @@ func (m *Monitor) diagnose(ctx context.Context, eng engine.Engine, c engine.Cont
 	if !c.Running() {
 		return stoppedReason(ctx, eng, c), false, 0
 	}
-	// Without a health check, running is all that can be verified.
+	// Without a health path (a worker has no port to ask), the image's own
+	// HEALTHCHECK is what there is, if it has one; the listing does not
+	// carry its state.
 	if c.HealthPath == "" || c.HostPort == 0 {
+		if ins, err := eng.Inspect(ctx, c.Name); err == nil && ins.Health == engine.HealthUnhealthy {
+			return "the image's HEALTHCHECK reports it unhealthy", false, 0
+		}
 		return "", false, 0
 	}
 

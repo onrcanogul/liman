@@ -42,12 +42,13 @@ func (d *Daemon) runApp(ctx context.Context, args []string) int {
 }
 
 func (d *Daemon) appCreate(ctx context.Context, args []string) int {
-	const synopsis = "limand app create <name> --repo <repository> --domain <domain> [--key <name>] [--write-client <file>] [--url <url>] [--preview-key [--preview-client <file>]]"
+	const synopsis = "limand app create <name> --repo <repository> (--domain <domain> | --worker) [--key <name>] [--write-client <file>] [--url <url>] [--preview-key [--preview-client <file>]]"
 
 	fs := flag.NewFlagSet("app create", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	repo := fs.String("repo", "", "the image repository, without a tag: ghcr.io/team/orders-api")
 	domain := fs.String("domain", "", "the app's domain: api.example.com")
+	worker := fs.Bool("worker", false, "a worker: no domain, no port, reached from nowhere (a queue consumer, a scheduler, a bot)")
 	keyName := fs.String("key", "", "the deploy key's name (default <name>-ci)")
 	writeClient := fs.String("write-client", "", "write the deploy key to this client.yaml instead of printing it")
 	url := fs.String("url", "", "the trigger endpoint's URL to put into the client.yaml")
@@ -58,8 +59,14 @@ func (d *Daemon) appCreate(ctx context.Context, args []string) int {
 		return d.usageError(synopsis)
 	}
 	name := args[0]
-	if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 || *repo == "" || *domain == "" {
+	if err := fs.Parse(args[1:]); err != nil || fs.NArg() != 0 || *repo == "" {
 		return d.usageError(synopsis)
+	}
+	// One or the other: a web app's domain is what it is reached on, and a
+	// worker is reached on nothing.
+	if (*domain == "") == !*worker {
+		fmt.Fprintln(d.Stderr, "limand: give --domain for a web app, or --worker for one that serves no requests; not both")
+		return exitUsage
 	}
 	if *url != "" && *writeClient == "" {
 		fmt.Fprintln(d.Stderr, "limand: --url only makes sense together with --write-client")
@@ -84,7 +91,7 @@ func (d *Daemon) appCreate(ctx context.Context, args []string) int {
 	case !app.ValidRepository(*repo):
 		fmt.Fprintf(d.Stderr, "limand: --repo %q: give the image repository without a tag or digest, such as ghcr.io/team/%s; each deploy names its image by digest\n", *repo, name)
 		return exitUsage
-	case !app.ValidDomain(*domain):
+	case !*worker && !app.ValidDomain(*domain):
 		fmt.Fprintf(d.Stderr, "limand: --domain %q is not a valid domain, such as api.example.com\n", *domain)
 		return exitUsage
 	}
@@ -98,7 +105,11 @@ func (d *Daemon) appCreate(ctx context.Context, args []string) int {
 	}
 	defer func() { _ = st.Close() }()
 
-	if err := st.Register(ctx, store.Registration{Name: name, Repo: *repo, Domain: *domain}); err != nil {
+	kind := app.KindWeb
+	if *worker {
+		kind = app.KindWorker
+	}
+	if err := st.Register(ctx, store.Registration{Name: name, Repo: *repo, Domain: *domain, Kind: kind}); err != nil {
 		if errors.Is(err, store.ErrDomainTaken) {
 			owner, _ := st.DomainOwner(ctx, *domain)
 			return d.fail(fmt.Errorf("%s is registered to %s", *domain, owner))
@@ -119,7 +130,11 @@ func (d *Daemon) appCreate(ctx context.Context, args []string) int {
 		}
 	}
 	rec := d.auditor(st)
-	rec.Record(ctx, audit.ServerActor(), audit.AppRegister, name, *repo+", "+*domain, nil)
+	registered := *domain
+	if *worker {
+		registered = "worker"
+	}
+	rec.Record(ctx, audit.ServerActor(), audit.AppRegister, name, *repo+", "+registered, nil)
 	rec.Record(ctx, audit.ServerActor(), audit.TokenCreate, "", *keyName+" ("+store.ScopeDeploy+", "+name+")", nil)
 	if *previewKey {
 		rec.Record(ctx, audit.ServerActor(), audit.TokenCreate, "", name+"-pr ("+store.ScopePreview+", "+name+")", nil)
@@ -140,7 +155,11 @@ func (d *Daemon) appCreate(ctx context.Context, args []string) int {
 		_, _ = st.Unregister(ctx, name)
 		return code
 	}
-	fmt.Fprintf(d.Stdout, "Registered %s: images from %s, served at %s. Its pipeline deploys it with:\n  liman trigger --digest <digest> --file app.yaml\n", name, *repo, *domain)
+	where := "served at " + *domain
+	if *worker {
+		where = "a worker (its app.yaml says kind: worker)"
+	}
+	fmt.Fprintf(d.Stdout, "Registered %s: images from %s, %s. Its pipeline deploys it with:\n  liman trigger --digest <digest> --file app.yaml\n", name, *repo, where)
 	return exitOK
 }
 
@@ -174,7 +193,11 @@ func (d *Daemon) appList(ctx context.Context, args []string) int {
 		if state, found, err := st.DeployStateOf(ctx, r.Name); err == nil && found {
 			last = state.Release + " at " + state.UpdatedAt.Local().Format("2006-01-02 15:04")
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", r.Name, r.Repo, r.Domain, r.CreatedAt.Local().Format("2006-01-02 15:04"), last, describeKeys(tokens, r.Name, now))
+		domain := r.Domain
+		if r.Worker() {
+			domain = "(worker)"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", r.Name, r.Repo, domain, r.CreatedAt.Local().Format("2006-01-02 15:04"), last, describeKeys(tokens, r.Name, now))
 	}
 	if err := w.Flush(); err != nil {
 		return d.fail(err)
