@@ -793,7 +793,7 @@ is equivalent to root. The API is built around keeping everyone else out:
 - **Authorization by app.** A token created with `--app` reaches its apps
   and nothing else (see Tokens). Two places where one app could act on
   another are closed for every token: a deploy is refused when its domain
-  belongs to another app (see Routing with Nginx), and a question of a
+  belongs to another app (see Routing through a proxy), and a question of a
   step-by-step deploy can only be answered by the token that started it.
 - **Deploy keys.** The hooks listener is the one part of liman meant to
   be reachable from the internet, and it takes deploy and preview keys
@@ -1108,14 +1108,27 @@ account it uses, never the secret:
 If a pull is denied, the error says whether no credentials were found or the
 stored ones were rejected.
 
-## Routing with Nginx
+## Routing through a proxy
 
 Without further configuration an app is only reachable on its loopback port.
-To route the app's `domain` to it, tell the daemon where it may write Nginx
-config. On a server with Nginx installed, add to `config.yaml`:
+To route the app's `domain` to it, tell the daemon which reverse proxy to
+drive and where it may write that proxy's config: Nginx, Caddy or Traefik.
+All three are driven the same way. liman writes one file per app into a
+directory of its own, has the proxy load it, and waits until the proxy
+itself reports the new release before it retires the old one. It never reads
+or edits any other file of the proxy, so your own sites stay as they are.
+
+| Driver | liman writes | Your config needs | Test, reload | HTTPS |
+|---|---|---|---|---|
+| `nginx` (default) | `<app>.conf`, a server block | `include /etc/nginx/liman/*.conf;` in the `http` block | `nginx -t`, `nginx -s reload` | certificates liman obtains (`acme`) or puts there by hand |
+| `caddy` | `<app>.caddy`, a site block | `import /etc/caddy/liman.d/*.caddy` in the Caddyfile | `caddy validate`, `caddy reload` (both with `--config /etc/caddy/Caddyfile --adapter caddyfile`) | Caddy's own, for every domain a public CA issues for |
+| `traefik` | `<app>.yml`, a router, a service and a middleware | the file provider watching that directory | none: Traefik notices the file by itself | Traefik's own: TLS and a certificate resolver on an entry point |
+
+On a server with Nginx installed, add to `config.yaml`:
 
 ```yaml
-nginx:
+proxy:
+  driver: nginx                   # the default
   conf_dir: /etc/nginx/liman      # liman writes one <app>.conf here
   cert_dir: /etc/liman/certs      # optional: <domain>/fullchain.pem + privkey.pem
   acme_root: /var/lib/liman/acme  # optional: served for ACME HTTP-01 challenges
@@ -1127,6 +1140,55 @@ and include that directory once from the `http` block of your Nginx config:
 include /etc/nginx/liman/*.conf;
 ```
 
+A config with an `nginx:` section instead of `proxy:`, as written before
+there was a choice, means the same.
+
+**Caddy:**
+
+```yaml
+proxy:
+  driver: caddy
+  conf_dir: /etc/caddy/liman.d
+```
+
+```
+# /etc/caddy/Caddyfile, next to your own sites
+import /etc/caddy/liman.d/*.caddy
+```
+
+Caddy obtains certificates itself: a domain a public CA can issue for is
+served over HTTPS, and plain HTTP redirects to it; other names (`.localhost`,
+`.test`, `.internal` and the like) stay on plain HTTP. The `acme` section is
+refused with Caddy, as two parties obtaining certificates for one domain
+would fight over the CA's challenges.
+
+**Traefik:**
+
+```yaml
+proxy:
+  driver: traefik
+  conf_dir: /etc/traefik/liman.d
+```
+
+```yaml
+# Traefik's static configuration
+providers:
+  file:
+    directory: /etc/traefik/liman.d
+    watch: true
+```
+
+liman's routers name no entry point, so they serve on all of them; HTTPS is
+set up once in Traefik, on an entry point with TLS and a certificate
+resolver. liman uses the file provider rather than labels on the
+containers on purpose: with labels Traefik would send traffic to a new
+container as soon as it starts, before liman has found it healthy, and it
+would need access to Docker. Traefik takes a few seconds to notice a
+changed file; the deploy waits for it, and so does `liman stop`, which only
+removes the containers once Traefik no longer routes to them. A file
+Traefik cannot read is not applied (it keeps the last good configuration);
+the wait then times out and the deploy is undone.
+
 A domain belongs to one app at a time. A deploy whose domain another app
 has (a running container, one kept for a rollback, or a deploy of it in
 progress) is refused with a 409 before anything is started; stop that app
@@ -1134,8 +1196,9 @@ first. Nginx itself would accept both, with only a warning (`conflicting
 server name`), and send the domain's traffic to whichever file sorts
 first, so an app could quietly take another's traffic.
 
-liman never reads or edits any other Nginx file. A deploy then gains three
-steps between the health check and the retiring of the previous release:
+A deploy then gains three steps between the health check and the retiring
+of the previous release (with Nginx; the others name their proxy, and
+Traefik's second step is "Wait for Traefik to load the config"):
 
 ```
 ==> [5/8] Write Nginx config for whoami.localhost
@@ -1150,22 +1213,24 @@ steps between the health check and the retiring of the previous release:
 ==> [8/8] Retire previous containers of whoami
 ```
 
-The reload step runs `nginx -t` first, reloads, and then waits until Nginx
-itself reports the new release (through an `X-Liman-Release` response header)
-before the old container is removed. If anything fails the previous config is
-restored and reloaded.
+The reload step runs the test command first, reloads, and then waits until
+the proxy itself reports the new release (through an `X-Liman-Release`
+response header) before the old container is removed. If anything fails the
+previous config is restored and reloaded.
 
-A domain is served over HTTPS when `cert_dir/<domain>/fullchain.pem` and
-`privkey.pem` exist. liman obtains them itself when `acme` is set up (next
-section); certificates put there by hand work as well.
+With Nginx (and with Caddy, if you put certificates there) a domain is
+served over HTTPS when `cert_dir/<domain>/fullchain.pem` and `privkey.pem`
+exist. liman obtains them itself when `acme` is set up (next section);
+certificates put there by hand work as well.
 
 ### Certificates from Let's Encrypt
 
 With an `acme` section, liman obtains and renews certificates over ACME,
-the protocol Let's Encrypt speaks:
+the protocol Let's Encrypt speaks. This is for Nginx; Caddy and Traefik
+obtain their own.
 
 ```yaml
-nginx:
+proxy:
   conf_dir: /etc/nginx/liman
   cert_dir: /etc/liman/certs
   acme_root: /var/lib/liman/acme
@@ -1195,7 +1260,9 @@ again with the new CA by itself.
   logged as an error. Only domains an app still has are renewed: after
   `liman stop` the certificate stays in `cert_dir` for a later deploy, but
   is left to expire.
-- `.localhost` domains are left alone: no CA can validate them.
+- Names under the top-level domains reserved for local and test use
+  (`.localhost`, `.test`, `.example`, `.invalid`, `.local`, `.internal`,
+  `.home.arpa`) are left alone: no public CA can validate them.
 
 ```
 limand cert list               # domain, issuer, expiry, "renewal due" / "EXPIRED"
@@ -1208,9 +1275,11 @@ account key is not part of `limand backup`: losing it costs nothing but a
 new registration. For a test CA whose own HTTPS certificate is not publicly
 trusted (such as Pebble), `acme.ca_file` names the CA file to trust for it.
 
-Defaults assume Nginx runs on the host: `test_command: [nginx, -t]`,
-`reload_command: [nginx, -s, reload]`, `upstream_host: 127.0.0.1`,
-`probe_addr: 127.0.0.1:80`. All four can be overridden.
+Defaults assume the proxy runs on the host: `upstream_host: 127.0.0.1`,
+`probe_addr: 127.0.0.1:80`, and the driver's own `test_command` and
+`reload_command` (see the table above). All of them can be overridden, for
+example to run the commands through `sudo` or in a container with `docker
+exec`.
 
 ### Trying it locally
 
@@ -1247,7 +1316,7 @@ make build              # bin/liman and bin/limand, with version info
 make test               # unit tests
 make lint               # linters
 make check              # lint + test
-make test-integration   # tests that need a running Docker daemon
+make test-integration   # tests that need a running Docker daemon: Docker itself, Pebble, and real Nginx, Caddy and Traefik
 make load-test          # throughput, latency and leak checks (about a minute)
 ```
 
@@ -1262,8 +1331,10 @@ minutes in all:
   shellcheck, the tests with the race detector, and govulncheck, which
   fails the job for a known vulnerability in code liman calls. It also
   checks that Go is the release `go.mod`'s `toolchain` line names.
-- **integration:** `make test-integration`, against the runner's Docker and
-  a fixed Pebble release.
+- **integration:** `make test-integration`, against the runner's Docker, a
+  fixed Pebble release, and real Nginx, Caddy and Traefik containers, each
+  switched from one upstream to another under load without a failed
+  request.
 - **end to end:** [scripts/ci-e2e.sh](scripts/ci-e2e.sh) on the runner's
   fresh Ubuntu, as on a new server: `install.sh`, a local registry, an app
   registered with a deploy and a preview key, a preview, deploys through
@@ -1331,7 +1402,8 @@ internal/deploy/     the steps of a deploy and how each is undone
 internal/pipeline/   runs steps: dry run, confirmation, rollback
 internal/engine/     container engine interface and shared types
 internal/docker/     Docker implementation of the engine interface
-internal/nginx/      renders, writes, tests and reloads proxy config
+internal/proxy/      drives a file-configured reverse proxy: write, test, reload, wait for the release
+internal/proxy/nginx/, caddy/, traefik/   one dialect each: the file's text and the default commands
 internal/config/     config.yaml and client.yaml
 internal/monitor/    health monitor: periodic checks, restarts, backoff
 internal/health/     the HTTP health probe shared by deploys and the monitor
