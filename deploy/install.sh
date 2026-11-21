@@ -9,7 +9,8 @@
 #   1. creates the system user "liman" (in the docker group)
 #   2. copies the binary to /usr/local/bin/limand, keeping the one it
 #      replaces as /usr/local/bin/limand.previous
-#   3. writes /var/lib/liman/config.yaml, unless there is one
+#   3. writes /var/lib/liman/config.yaml, unless there is one; with
+#      --hooks-listen it turns on the endpoint CI pipelines deploy through
 #   4. creates /etc/nginx/liman.d and makes Nginx include it
 #   5. lets the liman user test and reload Nginx through sudo, nothing else
 #   6. installs and starts the systemd unit, and checks that the new
@@ -22,11 +23,12 @@
 # if it was, the way back is printed.
 #
 # Requirements: Ubuntu or Debian with systemd, Docker and (unless --no-nginx
-# is given) Nginx installed. The script installs no packages.
+# is given) Nginx installed and running. The script installs no packages.
 set -eu
 
 BINARY=
 LISTEN=
+HOOKS=
 NGINX=yes
 STATE=/var/lib/liman
 BACKUPS=/var/backups/liman
@@ -41,7 +43,7 @@ OLD_VERSION=
 PREVIOUS=/usr/local/bin/limand.previous
 
 usage() {
-    echo "usage: sudo $0 --binary <path to limand> --listen <private address:port> [--no-nginx]" >&2
+    echo "usage: sudo $0 --binary <path to limand> --listen <private address:port> [--hooks-listen <private address:port>] [--no-nginx]" >&2
     exit 2
 }
 
@@ -49,6 +51,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --binary) [ $# -ge 2 ] || usage; BINARY=$2; shift 2 ;;
         --listen) [ $# -ge 2 ] || usage; LISTEN=$2; shift 2 ;;
+        --hooks-listen) [ $# -ge 2 ] || usage; HOOKS=$2; shift 2 ;;
         --no-nginx) NGINX=no; shift ;;
         *) usage ;;
     esac
@@ -70,6 +73,9 @@ if [ "$NGINX" = yes ]; then
     command -v nginx >/dev/null || fail "Nginx is not installed (or pass --no-nginx)"
     command -v sudo >/dev/null || fail "sudo is required for reloading Nginx"
     [ -d /etc/nginx/conf.d ] || fail "/etc/nginx/conf.d does not exist; this Nginx is laid out differently"
+    # liman reloads Nginx on every deploy, and a stopped one cannot be
+    # reloaded: the first deploy would fail and be undone.
+    systemctl is-active --quiet nginx || fail "Nginx is installed but not running; start it with: systemctl enable --now nginx"
 fi
 
 # Run the binary before anything is changed: a file built for another
@@ -114,6 +120,10 @@ else
         echo "  listen: $LISTEN"
         echo "backup:"
         echo "  dir: $BACKUPS"
+        if [ -n "$HOOKS" ]; then
+            echo "hooks:"
+            echo "  listen: $HOOKS"
+        fi
         if [ "$NGINX" = yes ]; then
             echo "nginx:"
             echo "  conf_dir: $CONF_DIR"
@@ -124,7 +134,13 @@ else
     chown liman:liman "$STATE/config.yaml"
     chmod 0600 "$STATE/config.yaml"
     WROTE_CONFIG=yes
-    echo "    wrote config.yaml (listen: $LISTEN)"
+    echo "    wrote config.yaml (listen: $LISTEN${HOOKS:+, hooks: $HOOKS})"
+fi
+if [ -n "$HOOKS" ] && [ "$WROTE_CONFIG" = no ] && ! grep -q '^hooks:' "$STATE/config.yaml"; then
+    # Editing someone's YAML from a shell script is how settings get lost.
+    echo "    --hooks-listen was not applied: add it to config.yaml yourself, then systemctl restart limand:"
+    echo "      hooks:"
+    echo "        listen: $HOOKS"
 fi
 
 if [ "$NGINX" = yes ]; then
@@ -253,6 +269,15 @@ if [ "$UPGRADE" = yes ]; then
     exit 0
 fi
 
+HOOKS_NEXT=
+if [ -n "$HOOKS" ]; then
+    HOOKS_NEXT="
+  5. Deploys from CI arrive at $HOOKS. Make /hooks/ reachable there over
+     HTTPS, then register each app (README, Deploying from CI):
+       sudo -u liman env LIMAN_HOME=$STATE limand app create <name> --repo <repository> --domain <domain>
+"
+fi
+
 cat <<NEXT
 
 Done. Next:
@@ -270,7 +295,7 @@ Done. Next:
   4. The backups in $BACKUPS are on this server's disk. Copy them
      elsewhere regularly (rsync, restic, ...): a backup that dies with the
      disk it protects is only half of one.
-
+$HOOKS_NEXT
   Logs:    journalctl -u limand -f
   Status:  systemctl status limand
   Backups: systemctl list-timers limand-backup
