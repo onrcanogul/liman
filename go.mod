@@ -2,6 +2,11 @@ module github.com/onrcanogul/liman
 
 go 1.27.1
 
+// The Go release that builds liman, in CI too: 1.27.4 fixes vulnerabilities
+// in net/http and crypto/tls that liman reaches. The go line above stays the
+// oldest Go that can build it.
+toolchain go1.27.4
+
 require (
 	filippo.io/age v1.3.2
 	github.com/containerd/errdefs v1.0.0
