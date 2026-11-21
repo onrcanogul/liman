@@ -157,8 +157,9 @@ cat > "$WORK/worker.yaml" <<YAML
 name: mailer
 image: localhost:5000/mailer
 kind: worker
-# Any long-running process will do; this one listens only inside.
-command: [/whoami, --port, "8080"]
+# Any long-running process will do; this one listens only inside. The
+# image's ENTRYPOINT is /whoami, so these are its arguments.
+command: [--port, "8080"]
 deploy:
   strategy: replace
 YAML
@@ -178,6 +179,27 @@ if out=$(LIMAN_HOME="$WORK/worker" liman trigger --digest "$WORKER_DIGEST" --fil
 fi
 grep -q 'registered as a worker' <<<"$out" || fail "unexpected refusal: $out"
 as_liman app list | grep mailer
+
+step "A fixed port: tried first, then on its endpoint"
+sudo install -d -o liman -g liman -m 0700 "$STATE/e2e"
+as_liman app create edge --repo localhost:5000/whoami --publish 127.0.0.1:8090 \
+    --write-client "$STATE/e2e/edge.yaml" --url "http://$HOOKS"
+mkdir -m 0700 "$WORK/edge"
+sudo install -m 0600 -o "$(id -u)" -g "$(id -g)" "$STATE/e2e/edge.yaml" "$WORK/edge/client.yaml"
+sudo rm -rf "$STATE/e2e"
+edge_yaml() {
+    printf 'name: edge\nimage: localhost:5000/whoami\nport: 80\npublish: %s\nhealthcheck:\n  path: /health\n' "$1" > "$WORK/edge.yaml"
+}
+edge_yaml 127.0.0.1:8090
+LIMAN_HOME="$WORK/edge" liman trigger --digest "$DIGEST" --file "$WORK/edge.yaml" | tee "$WORK/edge.log"
+grep -q 'Try the new release on a free port' "$WORK/edge.log" || fail "the release was not tried first"
+curl -fsS http://127.0.0.1:8090/ | grep -q '^Hostname:' || fail "nothing answers on 127.0.0.1:8090"
+# Its key cannot move it onto every address: Docker's ports pass by ufw.
+edge_yaml 0.0.0.0:8090
+if out=$(LIMAN_HOME="$WORK/edge" liman trigger --digest "$DIGEST" --file "$WORK/edge.yaml" 2>&1); then
+    fail "a key moved its app onto 0.0.0.0"
+fi
+grep -q 'registered with 127.0.0.1:8090' <<<"$out" || fail "unexpected refusal: $out"
 
 step "Deleting the app revokes its keys"
 as_liman app delete whoami | tee "$WORK/delete.log"

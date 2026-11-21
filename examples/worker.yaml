@@ -7,9 +7,10 @@ image: traefik/whoami:v1.10
 
 kind: worker
 
-# Optional. Replaces the image's command. whoami serves HTTP, but here only
-# inside the container: a worker publishes nothing.
-command: [/whoami, --port, "8080"]
+# Optional. Replaces the image's command (CMD). With an ENTRYPOINT, as
+# whoami has, these are its arguments: here it serves HTTP on 8080, but only
+# inside the container, as a worker publishes nothing.
+command: [--port, "8080"]
 
 # Optional. "replace" stops the running release before the new one starts,
 # for a worker of which two must never run at once.
