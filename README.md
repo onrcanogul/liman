@@ -1632,6 +1632,33 @@ Mondays, as both can break without a commit. The load test runs only by
 hand ([load.yml](.github/workflows/load.yml)): on shared machines its
 numbers vary too much to decide anything.
 
+`main` takes changes only through pull requests, and only once all five
+jobs are green on them. The rules live in
+[.github/rulesets/](.github/rulesets) and
+[scripts/github-rules.sh](scripts/github-rules.sh) applies them, so they
+are reviewed like code:
+
+- a direct push, a force push or deleting `main` is refused, by GitHub
+  itself and for administrators too;
+- the five jobs above must pass, reported by GitHub Actions (another app
+  cannot report them under the same name), on a branch that is up to date
+  with `main`, so what lands is what was tested;
+- pull requests merge by rebase: each commit lands on `main` as it is, in a
+  straight line, and the branch is deleted;
+- `v*` tags cannot be moved or deleted once pushed: released files and
+  their attestation name that commit.
+
+A job's name is what the rules require, so renaming a job means changing
+`main.json` in the same pull request; otherwise pull requests wait for a
+check that never comes.
+
+```
+git switch -c some-change     # work, commit
+git push -u origin some-change && gh pr create --fill
+git rebase origin/main && git push --force-with-lease   # if main moved on
+gh pr merge --rebase --auto   # merges itself once the checks pass
+```
+
 A tag makes a release ([release.yml](.github/workflows/release.yml)). Its
 notes are written by hand first, in `docs/releases/<tag>.md`; without
 them the release stops before building:
@@ -1705,7 +1732,7 @@ internal/loadtest/   small load generator used by the load tests
 internal/buildinfo/  version metadata injected at build time
 deploy/              install.sh, which hands over to limand install
 internal/install/    limand install: what is on the server, the choices, the steps; the systemd units
-scripts/             local development helpers, and the end-to-end test CI runs
+scripts/             local development helpers, the tests CI runs, and the script that applies the GitHub rules
 docs/releases/       the notes of each release, written before its tag
-.github/             CI, release and weekly workflows; Dependabot
+.github/             CI, release and weekly workflows; Dependabot; the rules for main and release tags
 ```
