@@ -26,7 +26,7 @@ server, the CLI on your own machine (see Installing on a server).
 ## Requirements
 
 - Go 1.27+
-- Docker
+- Docker, or Podman (see Podman)
 - [golangci-lint](https://golangci-lint.run/) v2 for `make lint`
 
 ## Quick start (everything on one machine)
@@ -1235,6 +1235,52 @@ account it uses, never the secret:
 If a pull is denied, the error says whether no credentials were found or the
 stored ones were rejected.
 
+With Podman, `podman login` works the same way: its `auth.json` is read
+(`$REGISTRY_AUTH_FILE`, `$XDG_RUNTIME_DIR/containers/auth.json`, for root
+`/run/containers/0/auth.json`, then `~/.config/containers/auth.json`), and
+Docker's `config.json` after it.
+
+## Podman
+
+liman also runs apps with Podman instead of Docker, through the
+Docker-compatible API rootful Podman serves (`podman.socket`):
+
+```yaml
+# config.yaml
+engine:
+  driver: podman                    # docker is the default
+  socket: /run/podman/podman.sock   # the default for podman
+```
+
+```
+sudo systemctl enable --now podman.socket
+```
+
+Everything works as with Docker; a trial on Ubuntu 26.04 with Podman 5.7 ran
+deploys, workers, fixed ports, secret files, rollbacks and health checks
+unchanged. Two things differ, and liman takes care of them:
+
+- Podman's compatible API has no endpoint to ask a registry whether it has
+  an image, which every trigger and preview does, and its own
+  `/libpod/manifests` answers 404 for any failure (a refused login, a TLS
+  error) as much as for a missing image. liman asks the registry itself,
+  over its HTTP API, with the login `podman login` stored: a `HEAD` of the
+  manifest, nothing pulled. Like Docker, it tries plain HTTP after HTTPS
+  only for a registry on the machine itself.
+- `podman login` writes elsewhere than `docker login` (see Private images).
+
+Two are yours to know:
+
+- Docker takes a registry on `localhost` for a plain-HTTP one; Podman must
+  be told, in `/etc/containers/registries.conf.d/` (`insecure = true`).
+- The socket belongs to root. The daemon needs access to it, which, as
+  with Docker's group, amounts to root. Rootless Podman, where it would not,
+  is not supported yet; neither is `install.sh --podman`.
+
+CI checks both engines: the engine's integration tests and a deploy from a
+pipeline through a registry that wants a password also run against Podman
+([scripts/ci-podman.sh](scripts/ci-podman.sh)).
+
 ## Routing through a proxy
 
 Without further configuration an app is only reachable on its loopback port.
@@ -1450,7 +1496,7 @@ make load-test          # throughput, latency and leak checks (about a minute)
 ### CI and releases
 
 Every push to `main` and every pull request runs
-[ci.yml](.github/workflows/ci.yml), three jobs side by side, about four
+[ci.yml](.github/workflows/ci.yml), four jobs side by side, about four
 minutes in all:
 
 - **lint, vet, test:** golangci-lint, `go vet` also of the files behind the
@@ -1458,6 +1504,8 @@ minutes in all:
   shellcheck, the tests with the race detector, and govulncheck, which
   fails the job for a known vulnerability in code liman calls. It also
   checks that Go is the release `go.mod`'s `toolchain` line names.
+- **Podman:** [scripts/ci-podman.sh](scripts/ci-podman.sh), the engine's
+  integration tests and a deploy from a pipeline against rootful Podman.
 - **integration:** `make test-integration`, against the runner's Docker, a
   fixed Pebble release, and real Nginx, Caddy and Traefik containers, each
   switched from one upstream to another under load without a failed
