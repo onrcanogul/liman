@@ -140,8 +140,9 @@ type Daemon struct {
 	// Home is the directory holding config.yaml and liman.db.
 	Home string
 
-	// Connect returns the container engine.
-	Connect func(ctx context.Context) (engine.Engine, error)
+	// Connect returns the container engine config.yaml's engine section
+	// names.
+	Connect func(ctx context.Context, cfg config.Engine) (engine.Engine, error)
 
 	// ShutdownTimeout is how long running requests get to finish when the
 	// daemon is asked to stop. Zero means two minutes.
@@ -218,7 +219,7 @@ func (d *Daemon) serve(ctx context.Context) int {
 	}
 	defer func() { _ = st.Close() }()
 
-	connect := connectOnce(d.Connect)
+	connect := connectOnce(func(ctx context.Context) (engine.Engine, error) { return d.Connect(ctx, cfg.Engine) })
 	// One set of locks for everything that changes an app: the API handlers
 	// and the health monitor.
 	locks := &applock.Locks{}
@@ -359,6 +360,7 @@ func (d *Daemon) serve(ctx context.Context) int {
 		"listen", listener.Addr().String(),
 		"hooks", hooksAddr,
 		"version", buildinfo.Version,
+		"engine", engineName(cfg.Engine),
 		"proxy", proxyName(proxy),
 		"acme", cfg.ACME.Enabled(),
 		"monitor", !cfg.Monitor.Disabled,

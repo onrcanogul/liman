@@ -58,7 +58,7 @@ func newTestDaemon(t *testing.T) *testDaemon {
 		Stdout:          td.stdout,
 		Stderr:          td.stderr,
 		Home:            t.TempDir(),
-		Connect:         func(context.Context) (engine.Engine, error) { return td.engine, nil },
+		Connect:         func(context.Context, config.Engine) (engine.Engine, error) { return td.engine, nil },
 		ShutdownTimeout: 5 * time.Second,
 	}
 	// Port 0 asks the operating system for any free port, so parallel test

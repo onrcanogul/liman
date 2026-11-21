@@ -54,3 +54,11 @@ func proxyName(m *proxy.Manager) string {
 	}
 	return m.Name()
 }
+
+// engineName names the container engine for the log.
+func engineName(e config.Engine) string {
+	if e.Driver == "" {
+		return "docker"
+	}
+	return e.Driver
+}

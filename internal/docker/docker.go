@@ -26,6 +26,7 @@ import (
 
 	"github.com/onrcanogul/liman/internal/app"
 	"github.com/onrcanogul/liman/internal/engine"
+	"github.com/onrcanogul/liman/internal/registry"
 )
 
 // loopback is the host address container ports are published on unless an
@@ -39,6 +40,58 @@ type Client struct {
 
 	// creds finds registry credentials for pulling private images.
 	creds *credentialStore
+
+	// opts is what the client was connected with.
+	opts Options
+}
+
+// RegistryCheck is how ImageExists asks a registry whether it has an image.
+type RegistryCheck int
+
+const (
+	// CheckDistribution uses Docker's GET /distribution/{name}/json.
+	CheckDistribution RegistryCheck = iota
+	// CheckRegistry asks the registry itself, over its HTTP API. Podman's
+	// Docker-compatible API has no /distribution endpoint (a trial: 404
+	// for an image that is there), and its own /libpod/manifests answers
+	// 404 for any failure, a refused login or a TLS error as much as a
+	// missing image.
+	CheckRegistry
+)
+
+// Options say which engine speaking Docker's API the client talks to, and
+// how it differs. The engines liman knows come as presets (ForDocker,
+// ForPodman); only the daemon's wiring picks one.
+type Options struct {
+	// Name is the engine, as people write it: "Docker", "Podman".
+	Name string
+	// Host is the engine's address, such as unix:///run/podman/podman.sock.
+	// Empty uses DOCKER_HOST, then the default Docker socket.
+	Host string
+	// AuthFiles are where registry logins are read from, in order.
+	AuthFiles []string
+	// RegistryCheck is how ImageExists asks the registry.
+	RegistryCheck RegistryCheck
+}
+
+// ForDocker is Docker, at host (empty for DOCKER_HOST or the default).
+func ForDocker(host string) Options {
+	return Options{Name: "Docker", Host: host, AuthFiles: dockerAuthFiles(), RegistryCheck: CheckDistribution}
+}
+
+// DefaultPodmanSocket is rootful Podman's API socket, which systemd opens
+// with podman.socket.
+const DefaultPodmanSocket = "/run/podman/podman.sock"
+
+// ForPodman is rootful Podman's Docker-compatible API at socket (empty
+// for DefaultPodmanSocket). What a trial showed works there unchanged:
+// pulls (short names become docker.io/…), containers, files copied in,
+// labels, health checks, host.docker.internal. What differs is set here.
+func ForPodman(socket string) Options {
+	if socket == "" {
+		socket = DefaultPodmanSocket
+	}
+	return Options{Name: "Podman", Host: "unix://" + socket, AuthFiles: podmanAuthFiles(), RegistryCheck: CheckRegistry}
 }
 
 // This line makes the compiler verify that *Client implements engine.Engine.
@@ -46,23 +99,32 @@ type Client struct {
 // would only be reported where a *Client is first used as an Engine.
 var _ engine.Engine = (*Client)(nil)
 
-// Connect creates a client and checks that the daemon is reachable.
-//
-// The daemon address comes from the environment (DOCKER_HOST) and falls back
-// to the default socket, /var/run/docker.sock.
-func Connect(ctx context.Context) (*Client, error) {
-	api, err := client.New(client.FromEnv)
+// Connect creates a client for the engine opts describes and checks that
+// it is reachable.
+func Connect(ctx context.Context, opts Options) (*Client, error) {
+	if opts.Name == "" {
+		opts.Name = "Docker"
+	}
+	clientOpts := []client.Opt{client.FromEnv}
+	if opts.Host != "" {
+		clientOpts = append(clientOpts, client.WithHost(opts.Host))
+	}
+	api, err := client.New(clientOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("create docker client: %w", err)
+		return nil, fmt.Errorf("create %s client: %w", opts.Name, err)
 	}
 
 	// GET /_ping. Creating the client does not open a connection, so
 	// without this the first real call would fail with a confusing error.
 	if _, err := api.Ping(ctx, client.PingOptions{}); err != nil {
-		return nil, fmt.Errorf("connect to docker (is it running?): %w", err)
+		return nil, fmt.Errorf("connect to %s at %s (is it running?): %w", opts.Name, api.DaemonHost(), err)
 	}
 
-	return &Client{api: api, creds: newCredentialStore()}, nil
+	creds := newCredentialStore()
+	if len(opts.AuthFiles) > 0 {
+		creds = newCredentialStoreIn(opts.AuthFiles)
+	}
+	return &Client{api: api, creds: creds, opts: opts}, nil
 }
 
 // Pull implements engine.Engine. POST /images/create.
@@ -281,6 +343,13 @@ func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
 		if opts.EncodedRegistryAuth, err = encodeAuth(creds, ref); err != nil {
 			return false, fmt.Errorf("encode registry credentials for %s: %w", ref, err)
 		}
+	}
+	if c.opts.RegistryCheck == CheckRegistry {
+		ok, err := (&registry.Checker{}).Exists(ctx, ref, registry.Credentials{Username: creds.Username, Password: creds.Password})
+		if err != nil {
+			return false, err
+		}
+		return ok, nil
 	}
 	_, err = c.api.DistributionInspect(ctx, ref, opts)
 	switch {

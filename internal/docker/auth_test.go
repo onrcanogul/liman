@@ -50,7 +50,7 @@ func storeWithConfig(t *testing.T, content string) *credentialStore {
 		}
 	}
 	return &credentialStore{
-		configPath: path,
+		configPaths: []string{path},
 		runHelper: func(context.Context, string, string) ([]byte, error) {
 			t.Error("a credential helper was run unexpectedly")
 			return nil, errors.New("unexpected helper call")

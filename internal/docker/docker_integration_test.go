@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -31,7 +32,7 @@ func TestContainerLifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	c, err := Connect(ctx)
+	c, err := Connect(ctx, testEngine())
 	if err != nil {
 		t.Fatalf("Connect() error = %v", err)
 	}
@@ -46,7 +47,10 @@ func TestContainerLifecycle(t *testing.T) {
 	if err := c.Pull(ctx, testImage, &progress); err != nil {
 		t.Fatalf("Pull() error = %v", err)
 	}
-	if !strings.Contains(progress.String(), "Status:") {
+	// Docker ends a pull with a summary ("Status: Downloaded newer image");
+	// Podman's compatible API sends only per-layer lines, which are not
+	// shown.
+	if testEngine().Name == "Docker" && !strings.Contains(progress.String(), "Status:") {
 		t.Errorf("pull progress = %q, want a status line", progress.String())
 	}
 
@@ -153,7 +157,7 @@ func TestPullUnknownImage(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
-	c, err := Connect(ctx)
+	c, err := Connect(ctx, testEngine())
 	if err != nil {
 		t.Fatalf("Connect() error = %v", err)
 	}
@@ -166,7 +170,7 @@ func TestPullUnknownImage(t *testing.T) {
 func TestFilesAreInTheContainerAndNotInItsConfig(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	c, err := Connect(ctx)
+	c, err := Connect(ctx, testEngine())
 	if err != nil {
 		t.Fatalf("Connect() error = %v", err)
 	}
@@ -225,4 +229,13 @@ func TestFilesAreInTheContainerAndNotInItsConfig(t *testing.T) {
 	if body, _ := read(); body != value {
 		t.Errorf("after a restart the file holds %q", body)
 	}
+}
+
+// testEngine is the engine the tests run against: Docker, or Podman with
+// LIMAN_TEST_ENGINE=podman (CI runs both).
+func testEngine() Options {
+	if os.Getenv("LIMAN_TEST_ENGINE") == "podman" {
+		return ForPodman(os.Getenv("LIMAN_TEST_SOCKET"))
+	}
+	return ForDocker("")
 }

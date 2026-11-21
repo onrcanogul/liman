@@ -24,6 +24,7 @@ type Config struct {
 	Hooks   Hooks   `yaml:"hooks"`
 	Deploy  Deploy  `yaml:"deploy"`
 	Monitor Monitor `yaml:"monitor"`
+	Engine  Engine  `yaml:"engine"`
 	Proxy   Proxy   `yaml:"proxy"`
 	// LegacyNginx is the section the proxy had before there was a choice
 	// of proxies; "nginx:" still means "proxy:" with driver nginx.
@@ -148,6 +149,15 @@ type Hooks struct {
 // Enabled reports whether the trigger endpoint is served.
 func (h Hooks) Enabled() bool {
 	return h.Listen != ""
+}
+
+// Engine says which container engine runs the apps: docker (the default)
+// or podman, which speaks Docker's API too.
+type Engine struct {
+	Driver string `yaml:"driver"`
+	// Socket is the engine's API socket. Empty means DOCKER_HOST or the
+	// default socket for Docker, /run/podman/podman.sock for Podman.
+	Socket string `yaml:"socket"`
 }
 
 // DefaultListen is used when daemon.listen is not set.
@@ -305,6 +315,9 @@ func (c *Config) validate() error {
 		}
 	}
 
+	if c.Engine.Socket != "" && !filepath.IsAbs(c.Engine.Socket) {
+		errs = append(errs, fmt.Errorf("engine.socket: must be an absolute path, got %q", c.Engine.Socket))
+	}
 	if c.Backup.Dir != "" && !filepath.IsAbs(c.Backup.Dir) {
 		errs = append(errs, fmt.Errorf("backup.dir: must be an absolute path, got %q", c.Backup.Dir))
 	}

@@ -23,6 +23,17 @@ linters:
           deny:
             - pkg: github.com/onrcanogul/liman/internal/proxy/
               desc: a proxy dialect is chosen in internal/daemon/proxy.go only
+        # The container engine is chosen in cmd/limand alone; the rest of
+        # liman works with engine.Engine, whatever speaks it.
+        engine-only-in-wiring:
+          files:
+            - "$all"
+            - "!$test"
+            - "!**/cmd/limand/*.go"
+            - "!**/internal/docker/**"
+          deny:
+            - pkg: github.com/onrcanogul/liman/internal/docker
+              desc: the engine is chosen in cmd/limand/main.go only
         # The proxy packages turn a site into a file and drive a process;
         # they know nothing of deploys, the API or the database.
         proxy-stays-below:

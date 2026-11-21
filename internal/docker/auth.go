@@ -30,8 +30,10 @@ type credentials struct {
 // in the config file written by "docker login". liman keeps no credentials
 // of its own; logging in once with docker is all the setup there is.
 type credentialStore struct {
-	// configPath is the Docker config file, normally ~/.docker/config.json.
-	configPath string
+	// configPaths are the files to look in, in order: Docker's config.json,
+	// or the auth.json files Podman's login writes. The first that has the
+	// registry wins.
+	configPaths []string
 
 	// runHelper runs a credential helper program with input on stdin and
 	// returns its stdout. It is a field so tests can replace it.
@@ -42,16 +44,45 @@ type credentialStore struct {
 // docker CLI: $DOCKER_CONFIG/config.json if that variable is set, otherwise
 // ~/.docker/config.json.
 func newCredentialStore() *credentialStore {
+	return newCredentialStoreIn(dockerAuthFiles())
+}
+
+// newCredentialStoreIn returns a store that looks in files, in order.
+func newCredentialStoreIn(files []string) *credentialStore {
+	return &credentialStore{configPaths: files, runHelper: execHelper}
+}
+
+// dockerAuthFiles is where "docker login" writes: $DOCKER_CONFIG/config.json
+// if that variable is set, otherwise ~/.docker/config.json.
+func dockerAuthFiles() []string {
 	dir := os.Getenv("DOCKER_CONFIG")
 	if dir == "" {
 		if home, err := os.UserHomeDir(); err == nil {
 			dir = filepath.Join(home, ".docker")
 		}
 	}
-	return &credentialStore{
-		configPath: filepath.Join(dir, "config.json"),
-		runHelper:  execHelper,
+	return []string{filepath.Join(dir, "config.json")}
+}
+
+// podmanAuthFiles is where "podman login" writes, in the order Podman reads
+// them: $REGISTRY_AUTH_FILE, ${XDG_RUNTIME_DIR}/containers/auth.json (root's
+// is /run/containers/0/auth.json), then ~/.config/containers/auth.json.
+// Docker's config.json comes last, as Podman falls back to it too. The
+// format is the same.
+func podmanAuthFiles() []string {
+	var files []string
+	if f := os.Getenv("REGISTRY_AUTH_FILE"); f != "" {
+		files = append(files, f)
 	}
+	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
+		files = append(files, filepath.Join(dir, "containers", "auth.json"))
+	} else if os.Geteuid() == 0 {
+		files = append(files, "/run/containers/0/auth.json")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		files = append(files, filepath.Join(home, ".config", "containers", "auth.json"))
+	}
+	return append(files, dockerAuthFiles()...)
 }
 
 // dockerConfig is the part of Docker's config file that concerns
@@ -76,17 +107,28 @@ type dockerConfig struct {
 // found is false, with a nil error, when the user is simply not logged in
 // to that registry.
 func (s *credentialStore) lookup(ctx context.Context, image string) (creds credentials, found bool, err error) {
-	data, err := os.ReadFile(s.configPath)
+	for _, path := range s.configPaths {
+		creds, found, err := s.lookupIn(ctx, path, image)
+		if err != nil || found {
+			return creds, found, err
+		}
+	}
+	return credentials{}, false, nil
+}
+
+// lookupIn looks for image's registry in one config file.
+func (s *credentialStore) lookupIn(ctx context.Context, path, image string) (creds credentials, found bool, err error) {
+	data, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return credentials{}, false, nil
 	}
 	if err != nil {
-		return credentials{}, false, fmt.Errorf("read docker config: %w", err)
+		return credentials{}, false, fmt.Errorf("read %s: %w", path, err)
 	}
 
 	var cfg dockerConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return credentials{}, false, fmt.Errorf("parse %s: %w", s.configPath, err)
+		return credentials{}, false, fmt.Errorf("parse %s: %w", path, err)
 	}
 
 	host := registryHost(image)
@@ -102,19 +144,23 @@ func (s *credentialStore) lookup(ctx context.Context, image string) (creds crede
 	}
 
 	entry, ok := cfg.Auths[host]
+	// Docker writes Docker Hub under its old URL, Podman as docker.io.
+	if (!ok || entry.Auth == "") && host == dockerHub {
+		entry, ok = cfg.Auths["docker.io"]
+	}
 	if !ok || entry.Auth == "" {
 		return credentials{}, false, nil
 	}
 
 	decoded, err := base64.StdEncoding.DecodeString(entry.Auth)
 	if err != nil {
-		return credentials{}, false, fmt.Errorf("%s: credentials for %s are not valid base64", s.configPath, host)
+		return credentials{}, false, fmt.Errorf("%s: credentials for %s are not valid base64", path, host)
 	}
 	// The password may itself contain colons, so split at the first one
 	// only. strings.Cut does exactly that.
 	user, pass, ok := strings.Cut(string(decoded), ":")
 	if !ok {
-		return credentials{}, false, fmt.Errorf("%s: credentials for %s are malformed", s.configPath, host)
+		return credentials{}, false, fmt.Errorf("%s: credentials for %s are malformed", path, host)
 	}
 	return credentials{Username: user, Password: pass}, true, nil
 }
