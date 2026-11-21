@@ -28,7 +28,8 @@ import (
 	"github.com/onrcanogul/liman/internal/engine"
 )
 
-// loopback is the only host address container ports are published on. The
+// loopback is the host address container ports are published on unless an
+// app is published on an address of its own. The
 // app must be reachable by the local reverse proxy, not from the internet.
 var loopback = netip.MustParseAddr("127.0.0.1")
 
@@ -169,10 +170,18 @@ func (c *Client) Start(ctx context.Context, spec engine.Spec) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("container port: %w", err)
 		}
+		hostIP := loopback
+		if spec.HostIP != "" {
+			ip, err := netip.ParseAddr(spec.HostIP)
+			if err != nil {
+				return "", fmt.Errorf("host address: %w", err)
+			}
+			hostIP = ip
+		}
 		cfg.ExposedPorts = network.PortSet{port: struct{}{}}
 		hostCfg.PortBindings = network.PortMap{
 			port: []network.PortBinding{{
-				HostIP:   loopback,
+				HostIP:   hostIP,
 				HostPort: strconv.Itoa(spec.HostPort),
 			}},
 		}
@@ -326,7 +335,7 @@ func (c *Client) Inspect(ctx context.Context, ref string) (engine.Container, err
 		}
 	}
 	if info.HostConfig != nil {
-		out.HostPort = firstHostPort(info.HostConfig.PortBindings)
+		out.HostPort, out.HostIP = firstHostPort(info.HostConfig.PortBindings)
 	}
 	return out, nil
 }
@@ -417,6 +426,9 @@ func (c *Client) List(ctx context.Context) ([]engine.Container, error) {
 		for _, p := range item.Ports {
 			if p.PublicPort != 0 {
 				ctr.HostPort = int(p.PublicPort)
+				if p.IP.IsValid() {
+					ctr.HostIP = p.IP.String()
+				}
 				break
 			}
 		}
@@ -562,13 +574,17 @@ func envList(env map[string]string) []string {
 }
 
 // firstHostPort returns the first published host port, or 0.
-func firstHostPort(bindings network.PortMap) int {
+func firstHostPort(bindings network.PortMap) (int, string) {
 	for _, list := range bindings {
 		for _, b := range list {
 			if p, err := strconv.Atoi(b.HostPort); err == nil && p > 0 {
-				return p
+				ip := ""
+				if b.HostIP.IsValid() {
+					ip = b.HostIP.String()
+				}
+				return p, ip
 			}
 		}
 	}
-	return 0
+	return 0, ""
 }

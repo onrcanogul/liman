@@ -7,7 +7,9 @@ package health
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -41,7 +43,13 @@ func Probe(ctx context.Context, url string) error {
 	return nil
 }
 
-// URL returns the address to probe for a container published on hostPort.
-func URL(hostPort int, path string) string {
-	return fmt.Sprintf("http://127.0.0.1:%d%s", hostPort, path)
+// URL is the address of an app's health check: path on hostIP:hostPort,
+// where the container is published. An empty hostIP is 127.0.0.1; an app
+// published on another address is not reachable there.
+func URL(hostIP string, hostPort int, path string) string {
+	if hostIP == "" || hostIP == "0.0.0.0" || hostIP == "::" {
+		// Published on every address: the loopback one is among them.
+		hostIP = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(hostIP, strconv.Itoa(hostPort)) + path
 }

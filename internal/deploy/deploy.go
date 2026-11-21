@@ -123,6 +123,7 @@ type Result struct {
 	Release   string
 	Container string
 	HostPort  int
+	HostIP    string
 	// Worker says the release is a worker: no port, nothing routed to it.
 	Worker bool
 }
@@ -205,6 +206,7 @@ func (d *Deployer) Deploy(ctx context.Context, a *app.App, opts Options) (Result
 		worker:      a.Worker(),
 		replace:     a.Strategy() == app.StrategyReplace,
 		settle:      a.Settle(),
+		publish:     a.Publish,
 	}
 
 	popts := pipeline.Options{
@@ -218,7 +220,7 @@ func (d *Deployer) Deploy(ctx context.Context, a *app.App, opts Options) (Result
 	}
 
 	err = pipeline.Run(ctx, d.steps(st), popts)
-	res.HostPort = st.hostPort
+	res.HostPort, res.HostIP = st.hostPort, st.hostIP
 	if err == nil && !opts.DryRun {
 		d.enableHTTPS(ctx, st)
 	}
@@ -243,6 +245,10 @@ type state struct {
 	worker  bool
 	replace bool
 	settle  time.Duration
+	// publish are the app's fixed endpoints: none (a free port), one
+	// (tried on a free port first, then replacing the running release on
+	// it), or two (the releases take turns).
+	publish app.Publish
 
 	memory int64
 	// secretFiles are the values of the app's secret_files, by name.
@@ -252,8 +258,10 @@ type state struct {
 	container string
 	release   string
 
-	// hostPort is set by the port step.
+	// hostPort is set by the port step, and hostIP with it for an app
+	// published on an address of its own ("" is 127.0.0.1).
 	hostPort int
+	hostIP   string
 	// previous is set by the start step, or before it by the step that
 	// stops the running release: the app's containers that existed before
 	// this deploy. listed says it has been set.
@@ -282,21 +290,17 @@ func (d *Deployer) steps(st *state) []pipeline.Step {
 		// No Undo: a pulled image is harmless and speeds up the retry.
 	}}
 
-	// A worker publishes no port, so there is none to find.
-	if !st.worker {
-		steps = append(steps, pipeline.Step{
-			Name: "Allocate a free host port",
-			Run: func(context.Context) error {
-				port, err := d.AllocatePort()
-				if err != nil {
-					return err
-				}
-				st.hostPort = port
-				d.detail("127.0.0.1:%d", port)
-				return nil
-			},
-			// No Undo: the port is only reserved once a container binds it.
-		})
+	switch {
+	case st.worker:
+		// A worker publishes no port, so there is none to find.
+	case len(st.publish) == 2:
+		steps = append(steps, d.idlePortStep(st))
+	case len(st.publish) == 1:
+		// The trial runs on a free port; the release itself on the fixed
+		// one, after the trial.
+		steps = append(steps, d.freePortStep(st), d.trialStep(st))
+	default:
+		steps = append(steps, d.freePortStep(st))
 	}
 
 	if st.replace {
@@ -325,11 +329,12 @@ func (d *Deployer) steps(st *state) []pipeline.Step {
 				Files:         secretFiles(a, st.secretFiles),
 				MemoryBytes:   st.memory,
 				CPUs:          a.Resources.CPUs,
+				HostIP:        st.hostIP,
 				Release:       st.release,
 				HealthPath:    st.healthPath,
 				Domain:        a.Domain,
 				Kind:          a.Kind,
-				Strategy:      a.Deploy.Strategy,
+				Strategy:      a.Strategy(),
 			})
 			if err != nil {
 				return err
@@ -628,7 +633,7 @@ func runCommand(st *state) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "docker run -d --name %s --label %s=%s", st.container, engine.LabelApp, a.Name)
 	if !st.worker {
-		fmt.Fprintf(&b, " -p 127.0.0.1:%s:%d", port, a.Port)
+		fmt.Fprintf(&b, " -p %s:%s:%d", displayHost(st.hostIP), port, a.Port)
 	}
 	if a.Resources.Memory != "" {
 		fmt.Fprintf(&b, " --memory %s", a.Resources.Memory)

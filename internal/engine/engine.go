@@ -75,8 +75,10 @@ type Spec struct {
 	// ContainerPort is the port the app listens on inside the container.
 	// Zero publishes nothing: a worker.
 	ContainerPort int
-	// HostPort is the port on 127.0.0.1 that is forwarded to ContainerPort.
+	// HostPort is the port on the host that is forwarded to ContainerPort,
+	// on HostIP; an empty HostIP is 127.0.0.1.
 	HostPort int
+	HostIP   string
 
 	// Command replaces the image's command; empty keeps it.
 	Command []string
@@ -123,8 +125,10 @@ type Container struct {
 	// filled in by List.
 	Status string
 
-	// HostPort is 0 when no port is published.
+	// HostPort is 0 when no port is published; HostIP is the address it is
+	// published on.
 	HostPort int
+	HostIP   string
 
 	// Created is when the container was created. It is only filled in by
 	// List.

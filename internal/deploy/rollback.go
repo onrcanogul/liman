@@ -61,6 +61,7 @@ func (d *Deployer) Rollback(ctx context.Context, appName string, opts Options) (
 		container:  target.Name,
 		release:    target.Release,
 		hostPort:   target.HostPort,
+		hostIP:     target.HostIP,
 		worker:     target.Worker(),
 		// Either release asking for it is enough: the one running may
 		// have been deployed with replace, the one coming back without.
@@ -75,7 +76,7 @@ func (d *Deployer) Rollback(ctx context.Context, appName string, opts Options) (
 	if st.worker {
 		st.settle = d.WorkerSettle
 	}
-	res := Result{Release: target.Release, Container: target.Name, HostPort: target.HostPort, Worker: target.Worker()}
+	res := Result{Release: target.Release, Container: target.Name, HostPort: target.HostPort, HostIP: target.HostIP, Worker: target.Worker()}
 
 	var steps []pipeline.Step
 	// Releases that must never run side by side are swapped one after the

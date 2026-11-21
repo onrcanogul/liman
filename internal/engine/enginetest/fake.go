@@ -169,6 +169,7 @@ func (f *Fake) Start(_ context.Context, spec engine.Spec) (string, error) {
 		State:     state,
 		Status:    state,
 		HostPort:  spec.HostPort,
+		HostIP:    spec.HostIP,
 		ExitCode:  f.StartExitCode,
 		OOMKilled: f.StartOOMKilled,
 

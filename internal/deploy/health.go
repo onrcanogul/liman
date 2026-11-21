@@ -42,7 +42,7 @@ func (d *Deployer) waitHealthy(ctx context.Context, st *state) error {
 	switch {
 	case st.healthPath != "" && st.hostPort != 0:
 		method = byPath
-		url = health.URL(st.hostPort, st.healthPath)
+		url = health.URL(st.hostIP, st.hostPort, st.healthPath)
 		d.detail("GET %s", url)
 	case first.Health != "":
 		method = byImage

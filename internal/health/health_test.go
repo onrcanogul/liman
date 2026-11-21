@@ -54,13 +54,23 @@ func TestProbe(t *testing.T) {
 
 func TestProbeUnreachable(t *testing.T) {
 	// Nothing listens on port 1.
-	if err := Probe(context.Background(), URL(1, "/health")); err == nil {
+	if err := Probe(context.Background(), URL("", 1, "/health")); err == nil {
 		t.Error("Probe() of a closed port succeeded")
 	}
 }
 
 func TestURL(t *testing.T) {
-	if got, want := URL(40001, "/health?deep=1"), "http://127.0.0.1:40001/health?deep=1"; got != want {
+	for host, want := range map[string]string{
+		"10.8.0.1": "http://10.8.0.1:8080/health",
+		"fd00::1":  "http://[fd00::1]:8080/health",
+		"0.0.0.0":  "http://127.0.0.1:8080/health",
+		"":         "http://127.0.0.1:8080/health",
+	} {
+		if got := URL(host, 8080, "/health"); got != want {
+			t.Errorf("URL(%q) = %s, want %s", host, got, want)
+		}
+	}
+	if got, want := URL("", 40001, "/health?deep=1"), "http://127.0.0.1:40001/health?deep=1"; got != want {
 		t.Errorf("URL() = %q, want %q", got, want)
 	}
 }

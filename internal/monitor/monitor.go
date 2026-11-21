@@ -288,7 +288,7 @@ func (m *Monitor) diagnose(ctx context.Context, eng engine.Engine, c engine.Cont
 		probe = health.Probe
 	}
 	started := m.now()
-	err := probe(ctx, health.URL(c.HostPort, c.HealthPath))
+	err := probe(ctx, health.URL(c.HostIP, c.HostPort, c.HealthPath))
 	took = m.now().Sub(started)
 	if err != nil {
 		return "health check failed: " + err.Error(), true, took
