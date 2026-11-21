@@ -125,8 +125,13 @@ grep -q 'preview key' <<<"$out" || fail "unexpected refusal of the preview key: 
 
 step "Deploy, as after a merge"
 deploy_key liman trigger --digest "$DIGEST" --file "$WORK/app.yaml"
-first=$(release_served)
-[ -n "$first" ] || fail "Nginx does not serve $DOMAIN"
+# One request, kept whole: when it fails, what Nginx answered says why (a
+# 502 from the app, or the default server).
+answer=$(curl -sSI -H "Host: $DOMAIN" http://127.0.0.1/ 2>&1 | tr -d '\r')
+first=$(sed -n 's/^X-Liman-Release: //Ip' <<<"$answer")
+if [ -z "$first" ] || ! grep -q '^HTTP/[0-9.]* 200' <<<"$answer"; then
+    fail "Nginx does not serve $DOMAIN; it answered: $(head -4 <<<"$answer" | tr '\n' ' ')"
+fi
 curl -fsS -H "Host: $DOMAIN" http://127.0.0.1/ | grep -q '^Hostname:' || fail "the app's answer is not whoami's"
 echo "serving release $first"
 
