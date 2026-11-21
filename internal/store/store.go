@@ -205,6 +205,14 @@ var migrations = []string{
 	DROP TABLE apps;
 	ALTER TABLE apps_new RENAME TO apps;
 	`,
+
+	// 13: fixed endpoints. Like the domain, what a deploy key cannot
+	// change: Docker's published ports pass by ufw, so a key that could
+	// pick its address could put the app on the internet, or take the port
+	// of another service. "" is none; otherwise app.Publish's text.
+	`
+	ALTER TABLE apps ADD COLUMN publish TEXT NOT NULL DEFAULT '';
+	`,
 }
 
 // SchemaVersion is the schema version this build reads and writes.

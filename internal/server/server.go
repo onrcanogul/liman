@@ -447,6 +447,10 @@ func (s *Server) runDeploy(w http.ResponseWriter, r *http.Request, a *app.App, r
 			}
 			defer release()
 		}
+		if err := s.checkPublish(ctx, eng, r, a); err != nil {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 	}
 
 	// Everything up to here answered with a plain status code and a JSON
@@ -473,6 +477,7 @@ func (s *Server) runDeploy(w http.ResponseWriter, r *http.Request, a *app.App, r
 		Release:   res.Release,
 		Container: res.Container,
 		HostPort:  res.HostPort,
+		HostIP:    res.HostIP,
 		Domain:    a.Domain,
 		Routed:    err == nil && !dryRun && s.Proxy != nil && !res.Worker,
 		Proxy:     s.proxyName(),
@@ -583,6 +588,7 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 		Release:   res.Release,
 		Container: res.Container,
 		HostPort:  res.HostPort,
+		HostIP:    res.HostIP,
 		Routed:    err == nil && !dryRun && s.Proxy != nil && !res.Worker,
 		Proxy:     s.proxyName(),
 		Worker:    res.Worker,
@@ -669,6 +675,7 @@ func (s *Server) handleApps(w http.ResponseWriter, r *http.Request) {
 			State:     c.State,
 			Status:    c.Status,
 			HostPort:  c.HostPort,
+			HostIP:    c.HostIP,
 
 			Release:     c.Release,
 			Domain:      c.Domain,
@@ -1023,6 +1030,58 @@ func (s *Server) claimDomain(ctx context.Context, eng engine.Engine, r *http.Req
 		}
 	}
 	return release, nil
+}
+
+// checkPublish refuses a deploy whose fixed endpoints another app holds:
+// registered to it, or bound by one of its containers, running or kept
+// for a rollback. Docker would refuse a port that is bound at the moment,
+// but only once the running release of this app is already stopped, and
+// not a kept one, whose rollback would then fail.
+func (s *Server) checkPublish(ctx context.Context, eng engine.Engine, r *http.Request, a *app.App) error {
+	if len(a.Publish) == 0 {
+		return nil
+	}
+	taken := func(e app.Endpoint, other string) error {
+		if visible(r, other) {
+			return fmt.Errorf("%s is used by app %s; stop it, or publish on another port, first", e.Address(), other)
+		}
+		return fmt.Errorf("%s is used by another app", e.Address())
+	}
+	regs, err := s.Store.Registrations(ctx)
+	if err != nil {
+		return err
+	}
+	for _, reg := range regs {
+		if reg.Name == a.Name || reg.Publish == "" {
+			continue
+		}
+		theirs, err := app.ParsePublish(reg.Publish)
+		if err != nil {
+			continue
+		}
+		for _, e := range a.Publish {
+			for _, t := range theirs {
+				if e.Overlaps(t) {
+					return taken(e, reg.Name)
+				}
+			}
+		}
+	}
+	containers, err := eng.List(ctx)
+	if err != nil {
+		return fmt.Errorf("check published ports: %w", err)
+	}
+	for _, c := range containers {
+		if c.App == a.Name || c.HostPort == 0 {
+			continue
+		}
+		for _, e := range a.Publish {
+			if e.Overlaps(app.Endpoint{Host: c.HostIP, Port: c.HostPort}) {
+				return taken(e, c.App)
+			}
+		}
+	}
+	return nil
 }
 
 // listApps turns a listing's ?app= filter into the set of apps to read,

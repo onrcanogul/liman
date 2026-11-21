@@ -19,7 +19,10 @@ type Registration struct {
 	// Domain is "" for a worker, which is reached from nowhere.
 	Domain string
 	// Kind is "web" or "worker".
-	Kind      string
+	Kind string
+	// Publish is the app's fixed endpoints as app.Publish writes them,
+	// "" for none.
+	Publish   string
 	CreatedAt time.Time
 }
 
@@ -52,8 +55,8 @@ func (s *Store) Register(ctx context.Context, r Registration) error {
 	}
 	// No domain is NULL, not "": two workers would collide on "".
 	_, err = tx.ExecContext(ctx,
-		`INSERT INTO apps (name, repo, domain, kind, created_at) VALUES (?, ?, NULLIF(?, ''), ?, ?)`,
-		r.Name, r.Repo, r.Domain, kind, formatTime(time.Now()))
+		`INSERT INTO apps (name, repo, domain, kind, publish, created_at) VALUES (?, ?, NULLIF(?, ''), ?, ?, ?)`,
+		r.Name, r.Repo, r.Domain, kind, r.Publish, formatTime(time.Now()))
 	// SQLite names the column in a constraint failure; there is no error
 	// type to look at.
 	if err != nil && strings.Contains(err.Error(), "apps.domain") {
@@ -69,8 +72,8 @@ func (s *Store) Register(ctx context.Context, r Registration) error {
 // not registered.
 func (s *Store) Registration(ctx context.Context, app string) (r Registration, found bool, err error) {
 	var created string
-	err = s.db.QueryRowContext(ctx, `SELECT name, repo, COALESCE(domain, ''), kind, created_at FROM apps WHERE name = ?`, app).
-		Scan(&r.Name, &r.Repo, &r.Domain, &r.Kind, &created)
+	err = s.db.QueryRowContext(ctx, `SELECT name, repo, COALESCE(domain, ''), kind, publish, created_at FROM apps WHERE name = ?`, app).
+		Scan(&r.Name, &r.Repo, &r.Domain, &r.Kind, &r.Publish, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Registration{}, false, nil
 	}
@@ -101,7 +104,7 @@ func (s *Store) DomainOwner(ctx context.Context, domain string) (string, error) 
 
 // Registrations returns every registration, by name.
 func (s *Store) Registrations(ctx context.Context) ([]Registration, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT name, repo, COALESCE(domain, ''), kind, created_at FROM apps ORDER BY name`)
+	rows, err := s.db.QueryContext(ctx, `SELECT name, repo, COALESCE(domain, ''), kind, publish, created_at FROM apps ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("list registrations: %w", err)
 	}
@@ -110,7 +113,7 @@ func (s *Store) Registrations(ctx context.Context) ([]Registration, error) {
 	for rows.Next() {
 		var r Registration
 		var created string
-		if err := rows.Scan(&r.Name, &r.Repo, &r.Domain, &r.Kind, &created); err != nil {
+		if err := rows.Scan(&r.Name, &r.Repo, &r.Domain, &r.Kind, &r.Publish, &created); err != nil {
 			return nil, fmt.Errorf("list registrations: %w", err)
 		}
 		if r.CreatedAt, err = parseTime(created); err != nil {

@@ -49,6 +49,8 @@ type DeployResult struct {
 	Release   string `json:"release,omitempty"`
 	Container string `json:"container,omitempty"`
 	HostPort  int    `json:"host_port,omitempty"`
+	// HostIP is the address HostPort is on, "" for 127.0.0.1.
+	HostIP string `json:"host_ip,omitempty"`
 
 	// Domain is the app's domain; Routed says whether the proxy now sends
 	// that domain to the new release, and Proxy which one it is ("Nginx").
@@ -136,6 +138,7 @@ type Container struct {
 	State     string `json:"state"`
 	Status    string `json:"status"`
 	HostPort  int    `json:"host_port,omitempty"`
+	HostIP    string `json:"host_ip,omitempty"`
 
 	// Release, Domain and Healthcheck are what the container was deployed
 	// with; Created is when it was created. A client that only has the

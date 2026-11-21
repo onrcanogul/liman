@@ -809,6 +809,36 @@ func TestAppCreateWorker(t *testing.T) {
 	}
 }
 
+func TestAppCreatePublished(t *testing.T) {
+	td := newTestDaemon(t)
+	ctx := context.Background()
+	if code := td.Run(ctx, []string{"app", "create", "api", "--repo", "r.example.com/api", "--publish", "10.8.0.1:8080,10.8.0.1:8081"}); code != exitOK {
+		t.Fatalf("code %d, stderr %s", code, td.stderr.String())
+	}
+	if !strings.Contains(td.stdout.String(), "published on 10.8.0.1:8080,10.8.0.1:8081") {
+		t.Errorf("stdout:\n%s", td.stdout.String())
+	}
+	// Another app cannot take either endpoint, nor all addresses on the port.
+	if code := td.Run(ctx, []string{"app", "create", "other", "--repo", "r.example.com/other", "--publish", "0.0.0.0:8081"}); code != exitError || !strings.Contains(td.stderr.String(), "registered to api") {
+		t.Errorf("overlapping endpoint: code %d, stderr %s", code, td.stderr.String())
+	}
+	td.stderr.buf.Reset()
+	// A public address is allowed, with a word about the firewall.
+	if code := td.Run(ctx, []string{"app", "create", "edge", "--repo", "r.example.com/edge", "--publish", "0.0.0.0:9000"}); code != exitOK || !strings.Contains(td.stderr.String(), "pass by ufw") {
+		t.Errorf("public endpoint: code %d, stderr %s", code, td.stderr.String())
+	}
+	for _, args := range [][]string{
+		{"--publish", "lb.example.com:8080"},
+		{"--publish", "8080", "--worker"},
+		{"--publish", "10.8.0.1:8080", "--domain", "w.example.com"},
+	} {
+		td.stderr.buf.Reset()
+		if code := td.Run(ctx, append([]string{"app", "create", "bad", "--repo", "r.example.com/bad"}, args...)); code != exitUsage {
+			t.Errorf("%v: code %d, stderr %s", args, code, td.stderr.String())
+		}
+	}
+}
+
 func TestAppCreateRefusals(t *testing.T) {
 	td := newTestDaemon(t)
 	ctx := context.Background()
@@ -817,7 +847,7 @@ func TestAppCreateRefusals(t *testing.T) {
 		code int
 		want string
 	}{
-		{[]string{"app", "create", "web", "--repo", "r.example.com/web"}, exitUsage, "give --domain for a web app, or --worker"},
+		{[]string{"app", "create", "web", "--repo", "r.example.com/web"}, exitUsage, "give --domain and/or --publish for a web app, or --worker"},
 		{[]string{"app", "create", "web", "--repo", "r.example.com/web", "--domain", "w.example.com", "--worker"}, exitUsage, "not both"},
 		{[]string{"app", "create", "web", "--domain", "w.example.com"}, exitUsage, "usage: limand app create"},
 		{[]string{"app", "create", "Web", "--repo", "r.example.com/web", "--domain", "w.example.com"}, exitUsage, "not a valid app name"},

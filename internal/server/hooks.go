@@ -321,6 +321,15 @@ func (s *Server) checkDefinition(req api.TriggerRequest, reg store.Registration)
 	if a.Domain != reg.Domain {
 		return nil, http.StatusForbidden, fmt.Errorf("domain: %s is registered with %s, not %q; that is changed on the server, not by a pipeline", reg.Name, reg.Domain, a.Domain)
 	}
+	// Published ports pass by the firewall: where an app is published is
+	// fixed at registration, like its domain.
+	if got := a.Publish.String(); got != reg.Publish {
+		want := reg.Publish
+		if want == "" {
+			want = "no fixed port"
+		}
+		return nil, http.StatusForbidden, fmt.Errorf("publish: %s is registered with %s, not %q; that is changed on the server, not by a pipeline", reg.Name, want, got)
+	}
 	a.Image = reg.Repo
 	return a, http.StatusOK, nil
 }

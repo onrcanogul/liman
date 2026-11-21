@@ -351,7 +351,7 @@ function buildApps(list) {
     out.push({
       name: name, image: c.image, domain: c.domain, state: c.state, health: c.health, note: c.health_detail,
       restarts: num(c.restarts) || 0, release: c.release, container: c.container, uptime: c.status,
-      address: c.worker === true ? 'worker: no port, no domain' : (port ? '127.0.0.1:' + port : ''), healthcheck: c.healthcheck, deployed: c.created,
+      address: c.worker === true ? 'worker: no port, no domain' : (port ? (str(c.host_ip) || '127.0.0.1') + ':' + port : ''), healthcheck: c.healthcheck, deployed: c.created,
       previous: g.current ? g.previous : []
     });
   });

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/onrcanogul/liman/internal/api"
+	"github.com/onrcanogul/liman/internal/engine"
 	"github.com/onrcanogul/liman/internal/server/servertest"
 	"github.com/onrcanogul/liman/internal/store"
 )
@@ -474,5 +475,42 @@ kind: worker
 	status, body = trigger(t, h, key, jsonOf(t, api.TriggerRequest{App: "orders-api", Digest: digest("a"), Definition: asWorker}))
 	if status != http.StatusForbidden || !strings.Contains(body, "registered as a web app") {
 		t.Errorf("a web app's key deploying a worker: %d %s", status, body)
+	}
+}
+
+func TestTriggerKeepsTheRegisteredEndpoints(t *testing.T) {
+	h := servertest.New(t)
+	const apiRepo = "ghcr.io/user/api"
+	if err := h.Store.Register(ctx(), store.Registration{Name: "api", Repo: apiRepo, Publish: "10.8.0.1:8080"}); err != nil {
+		t.Fatal(err)
+	}
+	h.Engine.Registry = map[string]bool{apiRepo + "@" + digest("a"): true}
+	key, ci := h.DeployKey(t, "api-ci", "api")
+
+	def := func(publish string) string {
+		return "name: api\nimage: ghcr.io/user/api\nport: 3000\npublish: " + publish + "\nhealthcheck:\n  path: /health\n"
+	}
+	// Elsewhere, or onto every address: the key cannot.
+	for _, publish := range []string{"0.0.0.0:8080", "10.8.0.1:5432", "[10.8.0.1:8080, 10.8.0.1:8081]"} {
+		status, body := trigger(t, h, key, jsonOf(t, api.TriggerRequest{App: "api", Digest: digest("a"), Definition: def(publish)}))
+		if status != http.StatusForbidden || !strings.Contains(body, "registered with 10.8.0.1:8080") {
+			t.Errorf("publish %s: %d %s", publish, status, body)
+		}
+	}
+	res, err := ci.Trigger(ctx(), api.TriggerRequest{App: "api", Digest: digest("a"), Definition: def("10.8.0.1:8080")}, io.Discard)
+	if err != nil || !res.OK || res.HostPort != 8080 || res.HostIP != "10.8.0.1" {
+		t.Fatalf("Trigger() = %+v, %v", res, err)
+	}
+}
+
+// Two apps cannot be published on one port; another app's release kept for
+// a rollback holds it too.
+func TestDeployRefusesAnEndpointAnotherAppHolds(t *testing.T) {
+	h := servertest.New(t)
+	h.Engine.Add(engine.Container{Name: "other-r1", App: "other", HostPort: 8080, HostIP: "0.0.0.0", State: "exited"})
+	def := "name: api\nimage: nginx:1.27-alpine\nport: 80\npublish: 127.0.0.1:8080\n"
+	_, err := h.Client.Deploy(ctx(), []byte(def), api.DeployOptions{}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "127.0.0.1:8080 is used by app other") {
+		t.Errorf("Deploy() error = %v", err)
 	}
 }

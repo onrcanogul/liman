@@ -13,8 +13,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -223,10 +225,12 @@ func (c *CLI) runDeploy(ctx context.Context, args []string, planOnly bool) int {
 		fmt.Fprintf(c.Stdout, "\n%s is running on the server as a worker (release %s); nothing is routed to it\n", res.App, res.Release)
 		return exitOK
 	}
-	fmt.Fprintf(c.Stdout, "\n%s is running on the server at 127.0.0.1:%d (release %s)\n", res.App, res.HostPort, res.Release)
-	if res.Routed {
+	fmt.Fprintf(c.Stdout, "\n%s is running on the server at %s (release %s)\n", res.App, hostAddress(res.HostIP, res.HostPort), res.Release)
+	switch {
+	case res.Routed:
 		fmt.Fprintf(c.Stdout, "%s routes %s to it\n", proxyName(res.Proxy), res.Domain)
-	} else {
+	case res.Domain != "":
+		// An app without a domain is meant to be reached on its address.
 		fmt.Fprintln(c.Stdout, "No proxy is configured on the server, so it is only reachable on that address")
 	}
 	return exitOK
@@ -340,7 +344,7 @@ func (c *CLI) runRollback(ctx context.Context, args []string) int {
 	if res.Worker {
 		fmt.Fprintf(c.Stdout, "\n%s is back on release %s, running as a worker\n", res.App, res.Release)
 	} else {
-		fmt.Fprintf(c.Stdout, "\n%s is back on release %s, running on the server at 127.0.0.1:%d\n", res.App, res.Release, res.HostPort)
+		fmt.Fprintf(c.Stdout, "\n%s is back on release %s, running on the server at %s\n", res.App, res.Release, hostAddress(res.HostIP, res.HostPort))
 	}
 	if res.Routed {
 		fmt.Fprintf(c.Stdout, "%s routes its domain to it\n", proxyName(res.Proxy))
@@ -398,7 +402,7 @@ func (c *CLI) runPs(ctx context.Context, args []string) int {
 		case ctr.Worker:
 			address = "(worker)"
 		case ctr.HostPort != 0:
-			address = fmt.Sprintf("127.0.0.1:%d", ctr.HostPort)
+			address = hostAddress(ctr.HostIP, ctr.HostPort)
 		}
 
 		health := ctr.Health
@@ -729,4 +733,12 @@ func proxyName(name string) string {
 		return "Nginx"
 	}
 	return name
+}
+
+// hostAddress is where on the server a container is published.
+func hostAddress(ip string, port int) string {
+	if ip == "" {
+		ip = "127.0.0.1"
+	}
+	return net.JoinHostPort(ip, strconv.Itoa(port))
 }
