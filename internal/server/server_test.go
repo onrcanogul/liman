@@ -26,6 +26,7 @@ import (
 	"github.com/onrcanogul/liman/internal/audit"
 	"github.com/onrcanogul/liman/internal/engine"
 	"github.com/onrcanogul/liman/internal/panel"
+	"github.com/onrcanogul/liman/internal/proxy"
 	"github.com/onrcanogul/liman/internal/secrets"
 	"github.com/onrcanogul/liman/internal/server"
 	"github.com/onrcanogul/liman/internal/server/servertest"
@@ -593,6 +594,44 @@ func TestStopKeepsEverythingWhenReloadFails(t *testing.T) {
 	}
 	if len(h.Engine.Containers) != 1 {
 		t.Error("the container was removed although the proxy still routes to it")
+	}
+}
+
+// stuckProxy is a proxy that never lets go of a route: Traefik that has
+// not noticed the removed file yet, or never will.
+type stuckProxy struct{ *proxy.Manager }
+
+func (p stuckProxy) WaitRelease(ctx context.Context, domain, release string) error {
+	if release == "" {
+		return errors.New("Nginx did not switch web.example.com to release \"\": it serves release \"r1\"")
+	}
+	return p.Manager.WaitRelease(ctx, domain, release)
+}
+
+func TestStopWaitsUntilTheProxyLetsGo(t *testing.T) {
+	h := servertest.New(t)
+	m := h.WithProxy(t, "true")
+	h.Server.Proxy = stuckProxy{m}
+	h.Engine.Add(engine.Container{Name: "web-r1", App: "web", Domain: "web.example.com"})
+	conf, err := m.Render("web", "web.example.com", 40001, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Write("web", conf); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = h.Client.Stop(ctx(), "web")
+
+	if err == nil || !strings.Contains(err.Error(), `it serves release "r1"`) {
+		t.Fatalf("Stop() error = %v, want the proxy that still routes", err)
+	}
+	// Removing the container now would turn every request into a 502.
+	if len(h.Engine.Containers) != 1 {
+		t.Error("the container was removed although the proxy still routes to it")
+	}
+	if got, _ := os.ReadFile(m.Path("web")); string(got) != string(conf) {
+		t.Errorf("config after the failed stop = %q, want it back", got)
 	}
 }
 

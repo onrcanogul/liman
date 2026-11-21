@@ -758,11 +758,13 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Take the app out of the proxy first. The other way round there would
-	// be a moment in which the proxy forwards requests to a container that
-	// is already gone.
+	// Take the app out of the proxy first, and wait until the proxy has
+	// let go of it. The other way round there would be a moment in which
+	// the proxy forwards requests to a container that is already gone:
+	// Traefik, which notices the removed file on its own time, answered 502
+	// for a few seconds.
 	if s.Proxy != nil {
-		removed, err := s.unroute(ctx, name)
+		removed, err := s.unroute(ctx, name, containers[len(containers)-1].Domain)
 		if err != nil {
 			stopErr = err
 			writeError(w, http.StatusInternalServerError, err)
@@ -1648,10 +1650,12 @@ func (s *Server) proxyName() string {
 	return s.Proxy.Name()
 }
 
-// unroute removes the app's proxy config and reloads the proxy. If the
-// reload cannot be done the config is put back, so the file on disk keeps
-// matching what the proxy is actually serving.
-func (s *Server) unroute(ctx context.Context, appName string) (removed bool, err error) {
+// unroute removes the app's proxy config, reloads the proxy and waits until
+// it no longer serves the app's release for domain. If the reload cannot be
+// done, or the proxy keeps serving, the config is put back, so the file on
+// disk keeps matching what the proxy is actually serving. An empty domain
+// (a container from a liman that did not record it) skips the wait.
+func (s *Server) unroute(ctx context.Context, appName, domain string) (removed bool, err error) {
 	old, err := s.Proxy.Current(appName)
 	if err != nil {
 		return false, err
@@ -1672,6 +1676,20 @@ func (s *Server) unroute(ctx context.Context, appName string) (removed bool, err
 		// errors.Join keeps both: why the reload failed and, if it also
 		// happened, why the file could not be put back.
 		return false, errors.Join(err, s.Proxy.Restore(appName, old))
+	}
+	if domain == "" {
+		return true, nil
+	}
+	if err := s.Proxy.WaitRelease(ctx, domain, ""); err != nil {
+		// The proxy may still be sending requests to the app: keep it, and
+		// put its route back the way the proxy has it.
+		restoreErr := s.Proxy.Restore(appName, old)
+		if restoreErr == nil {
+			if restoreErr = s.Proxy.Test(ctx); restoreErr == nil {
+				restoreErr = s.Proxy.Reload(ctx)
+			}
+		}
+		return false, errors.Join(err, restoreErr)
 	}
 	return true, nil
 }
