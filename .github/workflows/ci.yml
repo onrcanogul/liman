@@ -1,0 +1,90 @@
+# Checks every push to main and every pull request. release.yml runs the
+# same jobs before it publishes anything.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  # pull_request, not pull_request_target: a pull request from a fork runs
+  # its own code, so it must not run with this repository's permissions.
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A newer push to a pull request makes the older run pointless. Every
+  # other run gets a group of its own: in a shared one a run waits for the
+  # one before it, and a waiting run is dropped when another arrives.
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  GOLANGCI_LINT_VERSION: v2.15.0
+  GOVULNCHECK_VERSION: v1.10.0
+
+jobs:
+  check:
+    name: lint, vet, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Go is the toolchain go.mod names
+        run: |
+          want=$(sed -n 's/^toolchain //p' go.mod)
+          go version
+          go version | grep -q " $want " || { echo "::error::built with $(go env GOVERSION), go.mod says $want"; exit 1; }
+      - name: Modules
+        run: |
+          go mod verify
+          go mod tidy -diff
+      - name: Lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+      - name: Vet the files behind build tags
+        # Nothing else compiles them: they could break unnoticed.
+        run: |
+          go vet -tags integration ./...
+          go vet -tags load ./...
+      - name: Shell scripts
+        run: shellcheck deploy/install.sh scripts/*.sh
+      - name: Test
+        run: go test -race -count=1 ./...
+      - name: Known vulnerabilities
+        # Only those in code liman calls. Fails the job when there is one.
+        run: go run golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }} ./...
+
+  integration:
+    name: integration (Docker, Pebble)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - run: make test-integration
+
+  e2e:
+    name: end to end (fresh server)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - run: scripts/ci-e2e.sh

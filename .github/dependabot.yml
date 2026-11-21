@@ -1,0 +1,18 @@
+# Pull requests that update the pinned actions and the Go modules, once a
+# week; ci.yml checks each like any other.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      modules:
+        patterns: ['*']
