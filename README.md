@@ -334,8 +334,8 @@ A digest is the hash of the image's content: unlike a tag, it cannot be
 moved to another image while the deploy runs, and the release records
 exactly which image ran.
 
-**On the server, once**, turn the trigger endpoint on (`install.sh
---hooks-listen 127.0.0.1:7443` does it on a new server). It gets a listener
+**On the server, once**, turn the trigger endpoint on (`limand install`
+asks, or takes `--hooks-listen 127.0.0.1:7443`, on a new server). It gets a listener
 of its own, which serves `POST /hooks/deploy` and nothing else:
 
 ```yaml
@@ -986,13 +986,14 @@ memory.
 
 ## Installing on a server
 
-What the server needs: Ubuntu or Debian with systemd, Docker, Nginx (running:
-liman reloads it on every deploy), and a private network between it and your
+What the server needs: Ubuntu or Debian with systemd; Docker or Podman; Nginx,
+Caddy or Traefik, running (liman has it load every deploy), or none for apps
+on fixed ports and workers; and a private network between it and your
 machine (WireGuard below). The installer adds no packages.
 
 **1. The binaries.** Each [release](https://github.com/onrcanogul/liman/releases)
-has them for amd64 and arm64, with `install.sh`, the systemd units and
-`SHA256SUMS`, built by the release workflow from the tagged commit. Check
+has them for amd64 and arm64, with `install.sh` and `SHA256SUMS`, built by
+the release workflow from the tagged commit. Check
 both that the files are intact and where they were built:
 
 ```
@@ -1032,23 +1033,68 @@ server's public key, `Endpoint = <server's public IP>:51820` and
 pubkey`. Open UDP port 51820 in the server's firewall, then
 `systemctl enable --now wg-quick@wg0`.
 
-**3. Install** (copy `deploy/` and the binary to the server first):
+**3. Install.** The binary installs itself (`install.sh` does the same,
+for the command lines written for it):
 
 ```
-sudo ./install.sh --binary ./limand-linux-amd64 --listen 10.8.0.1:7070 \
-    --hooks-listen 127.0.0.1:7443    # only for deploys from CI
+$ sudo ./limand-linux-amd64 install
+Looking at this server:
+  Docker  running
+  Podman  installed, not running
+  nginx   on port 80
+  caddy   not installed
+  traefik not installed
+
+Container engine
+  *[1] docker   running
+   [2] podman   installed
+> [1]
+Reverse proxy
+  *[1] nginx    on port 80
+   [2] none     apps on fixed ports, or workers
+> [1]
+API address (private: WireGuard or a private network)
+> [10.8.0.1:7070]
+Deploys from CI: open the trigger endpoint on 127.0.0.1:7443? [Y/n]
+
+Installing: docker, proxy nginx, API on 10.8.0.1:7070, trigger endpoint on 127.0.0.1:7443.
+The same without questions:
+  sudo limand install --binary ./limand-linux-amd64 --engine docker --proxy nginx --listen 10.8.0.1:7070 --hooks-listen 127.0.0.1:7443
 ```
 
-The script creates a system user `liman` (member of the `docker` group),
-installs the binary and the systemd unit, writes
-`/var/lib/liman/config.yaml`, creates `/etc/nginx/liman.d` with one include
-line in `/etc/nginx/conf.d/liman.conf`, and allows the `liman` user exactly
-two commands through sudo: `nginx -t` and `systemctl reload nginx`. Existing
-Nginx configuration is not touched. With `--hooks-listen` the config also
-turns on the endpoint CI pipelines deploy through (see Deploying from CI).
-It stops before changing anything if a requirement is missing, Nginx not
-running included. Running it again with a newer binary upgrades (see
-Upgrading) and leaves everything else as it is.
+It looks first: only what is installed is offered, what runs (or holds port
+80) is the default, and a WireGuard address is suggested for the API. A
+question with one possible answer is not asked. Without a terminal (a
+script, cloud-init, Ansible) nothing is asked: flags decide, then what was
+found if that leaves one answer; otherwise it stops and names the flag to
+give. `--yes` takes what was found without asking. Nothing is changed before
+every choice is settled and checked: a proxy that is installed but not
+running, for one, is refused.
+
+Then it:
+
+- creates a system user `liman` (in the `docker` group with Docker);
+- installs the binary and the systemd units, and writes
+  `/var/lib/liman/config.yaml` with the choices;
+- with **Nginx**, creates `/etc/nginx/liman.d` with one include line in
+  `/etc/nginx/conf.d/liman.conf`, and lets `liman` run exactly `nginx -t`
+  and `systemctl reload nginx` through sudo;
+- with **Caddy**, creates `/etc/caddy/liman.d` and adds one line to the
+  Caddyfile, `import /etc/caddy/liman.d/*.caddy`: the old file is kept as
+  `Caddyfile.before-liman`, the new one checked with `caddy validate`, and
+  put back if that fails. `liman` may run `systemctl reload caddy`;
+- with **Traefik**, creates `/etc/traefik/liman.d` but leaves Traefik's
+  static configuration alone (its place and format vary): if no file
+  provider watches that directory, it says what to add and stops;
+- with **Podman**, gives its API socket to the `liman` group (a drop-in
+  for `podman.socket`, and a tmpfiles rule for `/run/podman`, which
+  Podman's own makes `0700` at every boot);
+- with `--hooks-listen`, turns on the endpoint CI pipelines deploy through
+  (see Deploying from CI).
+
+Existing configuration of the proxy is not touched otherwise. Running it
+again with a newer binary upgrades (see Upgrading), asks nothing, and leaves
+config.yaml as it is.
 
 **4. A token, and the client:**
 
@@ -1088,11 +1134,10 @@ For private images, log in as the daemon's user:
 
 ### Upgrading
 
-Copy the new `limand` (and `deploy/`) to the server and run the installer
-again:
+Copy the new `limand` to the server and run it, or `install.sh`, again:
 
 ```
-sudo ./install.sh --binary ./limand-linux-amd64 --listen 10.8.0.1:7070
+sudo ./limand-linux-amd64 install
 ```
 
 Running apps are not touched; the API is away for the few seconds the
@@ -1200,7 +1245,7 @@ name the key they need, when the server does not have it. After `limand key
 rotate`, back up the new key too; backups made with the old one open as long
 as the old key is kept (see Rotating the master key).
 
-On a server installed with `install.sh` a systemd timer takes a backup every
+On a server installed with `limand install` a systemd timer takes a backup every
 day into `/var/backups/liman` and keeps the newest 14
 (`systemctl list-timers limand-backup`, `journalctl -u limand-backup`). Those
 files are on the server's own disk: copy them elsewhere with whatever you
@@ -1275,7 +1320,15 @@ Two are yours to know:
   be told, in `/etc/containers/registries.conf.d/` (`insecure = true`).
 - The socket belongs to root. The daemon needs access to it, which, as
   with Docker's group, amounts to root. Rootless Podman, where it would not,
-  is not supported yet; neither is `install.sh --podman`.
+  is not supported yet. `limand install --engine podman` sets the
+  socket's group up (see Installing on a server).
+
+For private images, log in to the file the daemon's user reads:
+
+```
+sudo REGISTRY_AUTH_FILE=/var/lib/liman/.config/containers/auth.json podman login ghcr.io
+sudo chown -R liman: /var/lib/liman/.config
+```
 
 CI checks both engines: the engine's integration tests and a deploy from a
 pipeline through a registry that wants a password also run against Podman
@@ -1505,7 +1558,9 @@ minutes in all:
   fails the job for a known vulnerability in code liman calls. It also
   checks that Go is the release `go.mod`'s `toolchain` line names.
 - **Podman:** [scripts/ci-podman.sh](scripts/ci-podman.sh), the engine's
-  integration tests and a deploy from a pipeline against rootful Podman.
+  integration tests against rootful Podman, then `limand install` with
+  Podman and Caddy as a service, and deploys from a pipeline through a
+  registry that wants a password: on a fixed port, and through Caddy.
 - **integration:** `make test-integration`, against the runner's Docker, a
   fixed Pebble release, and real Nginx, Caddy and Traefik containers, each
   switched from one upstream to another under load without a failed
@@ -1535,8 +1590,8 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 
 It runs ci.yml again, builds the binaries with the tag as their version
-(and checks that they say so), and publishes them with `install.sh`, the
-systemd units, `SHA256SUMS` and a provenance attestation. Started by hand
+(and checks that they say so), and publishes them with `install.sh`,
+`SHA256SUMS` and a provenance attestation. Started by hand
 it does everything but publish.
 
 ### Load tests
@@ -1588,7 +1643,8 @@ internal/applock/    per-app lock shared by the API and the monitor
 internal/textdiff/   line diff used to preview config changes
 internal/loadtest/   small load generator used by the load tests
 internal/buildinfo/  version metadata injected at build time
-deploy/              systemd units (daemon, daily backup) and the server install script
+deploy/              install.sh, which hands over to limand install
+internal/install/    limand install: what is on the server, the choices, the steps; the systemd units
 scripts/             local development helpers, and the end-to-end test CI runs
 .github/             CI, release and weekly workflows; Dependabot
 ```
