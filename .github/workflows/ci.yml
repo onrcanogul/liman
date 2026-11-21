@@ -4,7 +4,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci-deneme]
   # pull_request, not pull_request_target: a pull request from a fork runs
   # its own code, so it must not run with this repository's permissions.
   pull_request:
