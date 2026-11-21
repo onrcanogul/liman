@@ -283,7 +283,11 @@ func (c *CLI) runTrigger(ctx context.Context, args []string) int {
 	if res.Unchanged {
 		return exitOK
 	}
-	fmt.Fprintf(c.Stdout, "\n%s is running release %s, image %s\n", res.App, res.Release, *digest)
+	if res.Worker {
+		fmt.Fprintf(c.Stdout, "\n%s is running release %s as a worker, image %s\n", res.App, res.Release, *digest)
+	} else {
+		fmt.Fprintf(c.Stdout, "\n%s is running release %s, image %s\n", res.App, res.Release, *digest)
+	}
 	if len(res.Changed) > 0 {
 		fmt.Fprintf(c.Stdout, "Changed in the definition: %s\n", strings.Join(res.Changed, ", "))
 	}

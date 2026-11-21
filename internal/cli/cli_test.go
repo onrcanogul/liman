@@ -832,3 +832,22 @@ env:
 		}
 	}
 }
+
+func TestTriggerAWorker(t *testing.T) {
+	h := newHarness(t, "")
+	if err := h.Store.Register(context.Background(), store.Registration{Name: "mailer", Repo: "ghcr.io/user/mailer", Kind: "worker"}); err != nil {
+		t.Fatal(err)
+	}
+	d := "sha256:" + strings.Repeat("0b", 32)
+	h.Engine.Registry = map[string]bool{"ghcr.io/user/mailer@" + d: true}
+	_, key := h.DeployKey(t, "ci", "mailer")
+	h.cli.API = key
+	file := writeFile(t, "name: mailer\nimage: ghcr.io/user/mailer\nkind: worker\nhealthcheck:\n  settle: 10ms\n")
+
+	if code := h.run("trigger", "--digest", d, "--file", file); code != exitOK {
+		t.Fatalf("trigger: code %d, stderr %s", code, h.stderr.String())
+	}
+	if !strings.Contains(h.stdout.String(), "mailer is running release r1 as a worker, image "+d) {
+		t.Errorf("stdout = %s", h.stdout.String())
+	}
+}
