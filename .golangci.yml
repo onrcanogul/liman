@@ -4,9 +4,39 @@ linters:
   # The "standard" set: errcheck, govet, ineffassign, staticcheck, unused.
   default: standard
   enable:
+    - depguard
     - misspell
     - revive
   settings:
+    depguard:
+      rules:
+        # Only the daemon's wiring picks a proxy. Everything else works
+        # with whatever is behind deploy.Proxy: a deploy that knew it was
+        # talking to Caddy would be the first of many "if caddy" branches.
+        proxy-dialects-only-in-wiring:
+          files:
+            - "$all"
+            - "!$test"
+            - "!**/internal/daemon/*.go"
+            - "!**/internal/server/servertest/*.go"
+            - "!**/internal/proxy/*/*.go"
+          deny:
+            - pkg: github.com/onrcanogul/liman/internal/proxy/
+              desc: a proxy dialect is chosen in internal/daemon/proxy.go only
+        # The proxy packages turn a site into a file and drive a process;
+        # they know nothing of deploys, the API or the database.
+        proxy-stays-below:
+          files:
+            - "**/internal/proxy/**"
+          deny:
+            - pkg: github.com/onrcanogul/liman/internal/deploy
+              desc: deploy uses the proxy, not the other way round
+            - pkg: github.com/onrcanogul/liman/internal/server
+              desc: the proxy packages know nothing of the API
+            - pkg: github.com/onrcanogul/liman/internal/daemon
+              desc: the proxy packages know nothing of the wiring
+            - pkg: github.com/onrcanogul/liman/internal/store
+              desc: the proxy packages know nothing of the database
     errcheck:
       exclude-functions:
         # Failing to write CLI output is not actionable.
