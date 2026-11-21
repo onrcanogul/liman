@@ -165,9 +165,11 @@ YAML
 LIMAN_HOME="$WORK/worker" liman trigger --digest "$WORKER_DIGEST" --file "$WORK/worker.yaml" | tee "$WORK/worker.log"
 grep -q 'as a worker' "$WORK/worker.log" || fail "the worker was not deployed as one"
 grep -q 'must stay up for 10s' "$WORK/worker.log" || fail "the worker was not given its settle time"
-running=$(docker ps --filter label=liman.app=mailer --format '{{.Ports}}')
-[ -z "$running" ] || fail "the worker publishes a port: $running"
-docker ps --filter label=liman.app=mailer --format '{{.Names}}' | grep -q . || fail "the worker is not running"
+worker=$(docker ps --filter label=liman.app=mailer --format '{{.Names}}')
+[ -n "$worker" ] || fail "the worker is not running"
+# docker port lists what is published; an image's EXPOSE alone is not.
+published=$(docker port "$worker")
+[ -z "$published" ] || fail "the worker publishes a port: $published"
 sudo test ! -e /etc/nginx/liman.d/mailer.conf || fail "the worker got an Nginx config"
 # Its key cannot put it on the internet.
 printf 'name: mailer\nimage: localhost:5000/mailer\ndomain: mail.test\nport: 8080\n' > "$WORK/worker-web.yaml"
