@@ -9,14 +9,16 @@ import (
 	"github.com/onrcanogul/liman/internal/proxy"
 	"github.com/onrcanogul/liman/internal/proxy/caddy"
 	"github.com/onrcanogul/liman/internal/proxy/nginx"
+	"github.com/onrcanogul/liman/internal/proxy/traefik"
 )
 
 // dialects are the proxies liman can drive, by the name proxy.driver gives.
 // This is the only place that knows them: everything else works with a
 // *proxy.Manager, whatever proxy is behind it.
 var dialects = map[string]proxy.Dialect{
-	"nginx": nginx.Dialect{},
-	"caddy": caddy.Dialect{},
+	"nginx":   nginx.Dialect{},
+	"caddy":   caddy.Dialect{},
+	"traefik": traefik.Dialect{},
 }
 
 // newProxy returns the manager for the proxy cfg describes, or nil when
