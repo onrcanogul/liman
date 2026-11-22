@@ -164,7 +164,7 @@ $ liman deploy broken.yaml
 ==> [3/5] Start container web-20261119-181848-507
     c0fcb3eb3a90
 ==> [4/5] Health check
-    GET http://127.0.0.1:57840/nope
+    GET http://127.0.0.1:57840/nope (up to 30s)
     container output:
         ...
 <== Undo: Start container web-20261119-181848-507
@@ -183,6 +183,23 @@ liman history [-n N] [app]   # every executed step, with result and duration
 liman audit [-n N] [app]     # who changed what
 liman status                 # is the daemon reachable, is the token accepted
 ```
+
+### An app that is slow to start
+
+A release gets 30 seconds to become healthy. An app that needs longer, a
+JVM app that starts in half a minute, says so:
+
+```yaml
+healthcheck:
+  path: /actuator/health
+  timeout: 90s        # 1s to 10m
+```
+
+The timeout counts however health is decided: the path, the image's
+`HEALTHCHECK` (whichever of the two allows longer), or `settle`. It is kept
+on the container, so a rollback to that release waits as long. A failed
+deploy takes as long to be undone, so leave a margin, not an hour: about
+three times what the app takes on the server.
 
 ## Zero-downtime deploys and rollback
 
@@ -210,7 +227,7 @@ and no image pull:
 $ liman rollback whoami
 ==> [1/6] Start previous container whoami-20261119-221645-519
 ==> [2/6] Health check
-    GET http://127.0.0.1:62586/health
+    GET http://127.0.0.1:62586/health (up to 30s)
 ==> [3/6] Write Nginx config for whoami.localhost
 ==> [4/6] Reload Nginx
 ==> [5/6] Drain connections to the previous release
@@ -395,6 +412,17 @@ address the app is published on: an app on 10.8.0.1 only does not answer on
 Only one deploy or stop per app runs at a time; a second one is refused.
 Environment variable values are never printed. liman only lists and touches
 containers it started itself (label `liman.app`).
+
+**Logs on disk.** Docker's default log driver, `json-file`, keeps one file
+per container that grows until the disk is full. liman caps it at 20 MB
+in five files (100 MB per container, what Docker's `local` driver keeps by
+default); `liman logs` reads them as before. Rootless Podman's `k8s-file`
+gets 20 MB, after which Podman starts the file again. Other drivers
+(journald, a log shipper) keep the settings the administrator gave them.
+The cap is liman's, not the server's: a `max-size` or `max-file` set for
+`json-file` in `/etc/docker/daemon.json` gives way to it on liman's
+containers. A container started before the upgrade keeps growing until its
+app is deployed again.
 
 ## Deploying from CI
 
