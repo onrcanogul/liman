@@ -1882,9 +1882,11 @@ It runs ci.yml again, builds the binaries with the tag as their version
 (`limand` and `liman` for Linux, `liman` for macOS, each for amd64 and
 arm64), checks that each is built for what its name says and that they
 say the tag, and makes a **draft** release with them, `install.sh`,
-`SHA256SUMS` and a provenance attestation. v0.x and tags with
-a hyphen (`v1.0.0-rc.1`) are marked pre-releases. Nobody sees a draft;
-after downloading and checking its files, a person publishes it:
+`SHA256SUMS` and a provenance attestation. Tags with a hyphen
+(`v1.0.0-rc.1`) are marked pre-releases; any other, v0.x too, becomes the
+latest release once published, which is what `get.sh` installs (GitHub
+never counts a pre-release as the latest). Nobody sees a draft; after
+downloading and checking its files, a person publishes it:
 
 ```
 gh release download v0.1.0 -D /tmp/v0.1.0 && cd /tmp/v0.1.0 && sha256sum --check SHA256SUMS

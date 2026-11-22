@@ -2,8 +2,11 @@
 # installs itself), liman for macOS, install.sh, get.sh (the one-line
 # installer), their checksums and a provenance attestation, after every
 # check in ci.yml has passed, with the notes in docs/releases/v1.2.3.md.
-# v0.x and tags with a hyphen (v1.0.0-rc.1) are pre-releases. A person
-# looks at the draft and publishes it:
+# Tags with a hyphen (v1.0.0-rc.1) are pre-releases; any other becomes the
+# latest release once published, v0.x too: GitHub never counts a
+# pre-release as the latest, and releases/latest/download/get.sh, the
+# one-line installer's address, needs one. A person looks at the draft
+# and publishes it:
 #   gh release edit v1.2.3 --draft=false
 # Run by hand, it builds and checks the files without making a release.
 name: release
@@ -100,7 +103,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           pre=()
-          case "$GITHUB_REF_NAME" in v0.*|*-*) pre=(--prerelease) ;; esac
+          case "$GITHUB_REF_NAME" in *-*) pre=(--prerelease) ;; esac
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
             --draft "${pre[@]}" --title "$GITHUB_REF_NAME" \
             --notes-file "docs/releases/${GITHUB_REF_NAME}.md" dist/*
