@@ -48,6 +48,9 @@ type Client struct {
 	// lowestPort is the lowest host port a rootless engine can publish;
 	// 0 for no limit.
 	lowestPort int
+	// logDriver is where containers' output goes: the preset's, or the
+	// engine's default. It decides whether liman caps the logs.
+	logDriver string
 }
 
 // RegistryCheck is how ImageExists asks a registry whether it has an image.
@@ -191,11 +194,34 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 	if len(opts.AuthFiles) > 0 {
 		creds = newCredentialStoreIn(opts.AuthFiles)
 	}
-	c := &Client{api: api, creds: creds, opts: opts}
+	c := &Client{api: api, creds: creds, opts: opts, logDriver: opts.LogDriver}
 	if opts.Rootless {
 		c.lowestPort = unprivilegedPortStart()
 	}
+	if c.logDriver == "" {
+		// GET /info. The driver the administrator set in daemon.json (or
+		// containers.conf); without an answer liman sets no options, which
+		// is what it did before.
+		if info, err := api.Info(ctx, client.InfoOptions{}); err == nil {
+			c.logDriver = info.Info.LoggingDriver
+		}
+	}
 	return c, nil
+}
+
+// logOptions caps a container's output on the drivers that keep it in
+// files that otherwise grow until the disk is full: 20 MB, five files on
+// Docker's json-file (what its local driver keeps by default), 20 MB on
+// Podman's k8s-file, which truncates instead of keeping old files. Any
+// other driver keeps the administrator's settings: nil.
+func logOptions(driver string) map[string]string {
+	switch driver {
+	case "json-file":
+		return map[string]string{"max-size": "20m", "max-file": "5"}
+	case "k8s-file":
+		return map[string]string{"max-size": "20m"}
+	}
+	return nil
 }
 
 // Pull implements engine.Engine. POST /images/create.
@@ -300,8 +326,8 @@ func (c *Client) Start(ctx context.Context, spec engine.Spec) (string, error) {
 	if c.opts.NetworkMode != "" {
 		hostCfg.NetworkMode = container.NetworkMode(c.opts.NetworkMode)
 	}
-	if c.opts.LogDriver != "" {
-		hostCfg.LogConfig = container.LogConfig{Type: c.opts.LogDriver}
+	if logOpts := logOptions(c.logDriver); c.opts.LogDriver != "" || logOpts != nil {
+		hostCfg.LogConfig = container.LogConfig{Type: c.logDriver, Config: logOpts}
 	}
 	if c.opts.HostGateway {
 		hostCfg.ExtraHosts = []string{hostGateway}
