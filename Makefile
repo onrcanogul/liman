@@ -17,12 +17,17 @@ build: ## Build the CLI (bin/liman) and the daemon (bin/limand)
 # The binaries contain no C code (the SQLite driver is pure Go), so building
 # for another operating system and CPU needs no cross-compiler: GOOS and
 # GOARCH are all it takes. -trimpath leaves this machine's paths out.
-release: ## Build for Linux servers into dist/ (amd64 and arm64)
-	@for arch in amd64 arm64; do \
-		for cmd in liman limand; do \
-			echo "dist/$$cmd-linux-$$arch"; \
-			CGO_ENABLED=0 GOOS=linux GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" -o dist/$$cmd-linux-$$arch ./cmd/$$cmd || exit 1; \
-		done; \
+# The daemon runs on Linux servers only; the CLI also on the Macs people
+# deploy from.
+RELEASE := limand-linux-amd64 limand-linux-arm64 \
+           liman-linux-amd64 liman-linux-arm64 \
+           liman-darwin-amd64 liman-darwin-arm64
+
+release: ## Build into dist/: limand and liman for Linux, liman for macOS (amd64 and arm64)
+	@for f in $(RELEASE); do \
+		cmd=$${f%%-*}; rest=$${f#*-}; os=$${rest%-*}; arch=$${rest#*-}; \
+		echo "dist/$$f"; \
+		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" -o dist/$$f ./cmd/$$cmd || exit 1; \
 	done
 
 test: ## Run all tests with the race detector
