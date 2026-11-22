@@ -66,13 +66,19 @@ one app behind a load balancer: liman runs one container per app.
 
 ## Try it
 
-- **On your machine**, with Go 1.27+ and Docker: clone the repository, run
-  `make build`, and follow [Quick start](#quick-start-everything-on-one-machine).
 - **On a server**: download `limand` from the
   [releases](https://github.com/onrcanogul/liman/releases) and run
   `sudo ./limand-linux-amd64 install`, which looks at the server and asks a
   few questions. The API needs a private network between the server and your
   machine first; see [Installing on a server](#installing-on-a-server).
+- **On your machine**, the CLI: download `liman` for macOS
+  (`liman-darwin-arm64`, or `liman-darwin-amd64` on Intel) or Linux from the
+  same release. It needs no Go and no Docker, only the server's address and
+  a token.
+- **Everything on one machine**, with Go 1.27+ and Docker: clone the
+  repository, run `make build`, and follow
+  [Quick start](#quick-start-everything-on-one-machine). The daemon is
+  released for Linux only, so this way builds both from source.
 
 ## Status
 
@@ -1067,9 +1073,17 @@ on fixed ports and workers; and a private network between it and your
 machine (WireGuard below). The installer adds no packages.
 
 **1. The binaries.** Each [release](https://github.com/onrcanogul/liman/releases)
-has them for amd64 and arm64, with `install.sh` and `SHA256SUMS`, built by
-the release workflow from the tagged commit. Check
-both that the files are intact and where they were built:
+has, built by the release workflow from the tagged commit:
+
+| File | Where it runs |
+|---|---|
+| `limand-linux-amd64`, `limand-linux-arm64` | the server |
+| `liman-linux-amd64`, `liman-linux-arm64` | your machine, if it runs Linux |
+| `liman-darwin-arm64` | your Mac, with Apple silicon |
+| `liman-darwin-amd64` | your Mac, with an Intel CPU |
+
+with `install.sh` and `SHA256SUMS`. Check both that the files are intact
+and where they were built, on the server:
 
 ```
 sha256sum --check --ignore-missing SHA256SUMS
@@ -1081,10 +1095,25 @@ that the file was built by this repository's release workflow from that
 commit; a checksum alone only proves that the file matches the list next
 to it.
 
+The CLI on a Mac, the same way (the macOS files come with the releases
+after v0.1.0; `<tag>` is the release's name):
+
+```
+gh release download <tag> --repo onrcanogul/liman -p liman-darwin-arm64 -p SHA256SUMS
+shasum -a 256 --check --ignore-missing SHA256SUMS
+gh attestation verify liman-darwin-arm64 --repo onrcanogul/liman
+chmod +x liman-darwin-arm64 && sudo mv liman-darwin-arm64 /usr/local/bin/liman
+```
+
+The macOS binaries are not notarized by Apple. Downloaded with `gh` or
+`curl` they run as they are; a browser marks the file as downloaded, and
+macOS then refuses to open it until the mark is removed with
+`xattr -d com.apple.quarantine liman-darwin-arm64`.
+
 Or build them yourself (no cross-compiler is needed):
 
 ```
-make release        # dist/limand-linux-amd64, dist/limand-linux-arm64, and the CLI
+make release        # all of them, into dist/
 ```
 
 **2. A private network.** The API is unencrypted and the daemon refuses to
@@ -1740,8 +1769,10 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 
 It runs ci.yml again, builds the binaries with the tag as their version
-(and checks that they say so), and makes a **draft** release with them,
-`install.sh`, `SHA256SUMS` and a provenance attestation. v0.x and tags with
+(`limand` and `liman` for Linux, `liman` for macOS, each for amd64 and
+arm64), checks that each is built for what its name says and that they
+say the tag, and makes a **draft** release with them, `install.sh`,
+`SHA256SUMS` and a provenance attestation. v0.x and tags with
 a hyphen (`v1.0.0-rc.1`) are marked pre-releases. Nobody sees a draft;
 after downloading and checking its files, a person publishes it:
 
