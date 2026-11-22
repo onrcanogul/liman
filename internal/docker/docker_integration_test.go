@@ -16,7 +16,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +30,9 @@ import (
 )
 
 const testImage = "traefik/whoami:v1.10"
+
+// probeImage has a shell and wget, which whoami (built FROM scratch) lacks.
+const probeImage = "busybox:1.37"
 
 func TestContainerLifecycle(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -228,6 +234,68 @@ func TestFilesAreInTheContainerAndNotInItsConfig(t *testing.T) {
 	}
 	if body, _ := read(); body != value {
 		t.Errorf("after a restart the file holds %q", body)
+	}
+}
+
+// An app reaches the server as host.docker.internal on every engine: a
+// listener here stands in for a database on the server, and a container
+// asks it for a path only this run knows.
+func TestTheServerIsHostDockerInternal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	opts := testEngine()
+	c, err := Connect(ctx, opts)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	// On Linux the container arrives on the bridge's address, not on
+	// loopback, so listen on all of them. Docker Desktop on a Mac hands
+	// host.docker.internal to the Mac's loopback; listening there only
+	// spares the firewall's "accept incoming connections" question.
+	addr := "0.0.0.0:0"
+	if runtime.GOOS == "darwin" {
+		addr = "127.0.0.1:0"
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type request struct{ path, from string }
+	got := make(chan request, 1)
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case got <- request{r.URL.Path, r.RemoteAddr}:
+		default:
+		}
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	const name = "liman-integration-host"
+	_ = c.Remove(ctx, name)
+	t.Cleanup(func() { _ = c.Remove(context.Background(), name) })
+	if err := c.Pull(ctx, probeImage, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+
+	token := fmt.Sprintf("/probe-%d", time.Now().UnixNano())
+	url := fmt.Sprintf("http://host.docker.internal:%d%s", ln.Addr().(*net.TCPAddr).Port, token)
+	if _, err := c.Start(ctx, engine.Spec{
+		App: "liman-integration", Name: name, Image: probeImage, Kind: "worker",
+		Command: []string{"wget", "-q", "-O", "/dev/null", url},
+	}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	select {
+	case r := <-got:
+		if r.path != token {
+			t.Fatalf("the host got %q, want %q", r.path, token)
+		}
+		t.Logf("%s: the host saw the container as %s", opts.Name, r.from)
+	case <-time.After(30 * time.Second):
+		t.Fatalf("no request from the container reached the host on %s", opts.Name)
 	}
 }
 
