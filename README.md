@@ -195,11 +195,12 @@ healthcheck:
   timeout: 90s        # 1s to 10m
 ```
 
-The timeout counts however health is decided: the path, the image's
-`HEALTHCHECK` (whichever of the two allows longer), or `settle`. It is kept
-on the container, so a rollback to that release waits as long. A failed
-deploy takes as long to be undone, so leave a margin, not an hour: about
-three times what the app takes on the server.
+It applies to the path; to the image's `HEALTHCHECK`, unless that check's
+own window is longer; and after `settle`. It is kept on the container: a
+rollback to that release waits as long, and the health monitor gives a
+release it restarted at least that long before checking it again. A deploy
+that fails waits the whole timeout before it is undone, so leave a margin,
+not an hour: about three times what the app takes on the server.
 
 ## Zero-downtime deploys and rollback
 
