@@ -1,8 +1,9 @@
 # A tag v1.2.3 makes a draft release: limand and liman for Linux (limand
-# installs itself), liman for macOS, install.sh, their checksums and a
-# provenance attestation, after every check in ci.yml has passed, with
-# the notes in docs/releases/v1.2.3.md. v0.x and tags with a hyphen
-# (v1.0.0-rc.1) are pre-releases. A person looks at the draft and publishes it:
+# installs itself), liman for macOS, install.sh, get.sh (the one-line
+# installer), their checksums and a provenance attestation, after every
+# check in ci.yml has passed, with the notes in docs/releases/v1.2.3.md.
+# v0.x and tags with a hyphen (v1.0.0-rc.1) are pre-releases. A person
+# looks at the draft and publishes it:
 #   gh release edit v1.2.3 --draft=false
 # Run by hand, it builds and checks the files without making a release.
 name: release
@@ -63,7 +64,7 @@ jobs:
           done
       - name: Files and checksums
         run: |
-          cp deploy/install.sh dist/
+          cp deploy/install.sh deploy/get.sh dist/
           cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
