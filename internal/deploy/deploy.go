@@ -194,19 +194,20 @@ func (d *Deployer) Deploy(ctx context.Context, a *app.App, opts Options) (Result
 	// state is shared by the step closures below: one step fills a field
 	// in, a later step reads it.
 	st := &state{
-		app:         a,
-		name:        a.Name,
-		domain:      a.Domain,
-		healthPath:  healthPath(a),
-		memoryLimit: a.Resources.Memory,
-		memory:      memory,
-		container:   res.Container,
-		release:     release,
-		secretFiles: opts.SecretFiles,
-		worker:      a.Worker(),
-		replace:     a.Strategy() == app.StrategyReplace,
-		settle:      a.Settle(),
-		publish:     a.Publish,
+		app:           a,
+		name:          a.Name,
+		domain:        a.Domain,
+		healthPath:    healthPath(a),
+		memoryLimit:   a.Resources.Memory,
+		memory:        memory,
+		container:     res.Container,
+		release:       release,
+		secretFiles:   opts.SecretFiles,
+		worker:        a.Worker(),
+		replace:       a.Strategy() == app.StrategyReplace,
+		settle:        a.Settle(),
+		healthTimeout: healthTimeout(a),
+		publish:       a.Publish,
 	}
 
 	popts := pipeline.Options{
@@ -245,6 +246,9 @@ type state struct {
 	worker  bool
 	replace bool
 	settle  time.Duration
+	// healthTimeout is healthcheck.timeout, zero for the deployer's
+	// HealthTimeout.
+	healthTimeout time.Duration
 	// publish are the app's fixed endpoints: none (a free port), one
 	// (tried on a free port first, then replacing the running release on
 	// it), or two (the releases take turns).
@@ -332,6 +336,7 @@ func (d *Deployer) steps(st *state) []pipeline.Step {
 				HostIP:        st.hostIP,
 				Release:       st.release,
 				HealthPath:    st.healthPath,
+				HealthTimeout: st.healthTimeout,
 				Domain:        a.Domain,
 				Kind:          a.Kind,
 				Strategy:      a.Strategy(),
@@ -735,6 +740,14 @@ func healthPath(a *app.App) string {
 		return ""
 	}
 	return a.Healthcheck.Path
+}
+
+// healthTimeout returns the app's healthcheck.timeout, or zero if it sets none.
+func healthTimeout(a *app.App) time.Duration {
+	if a.Healthcheck == nil {
+		return 0
+	}
+	return time.Duration(a.Healthcheck.Timeout)
 }
 
 // shellQuote quotes arg for a shell when it needs it, for display.

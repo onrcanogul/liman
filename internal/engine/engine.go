@@ -40,6 +40,10 @@ const (
 	// LabelStrategy is "overlap" or "replace": how a rollback must swap the
 	// releases, as the deploy did.
 	LabelStrategy = "liman.strategy"
+	// LabelHealthTimeout is how long the release may take to become
+	// healthy, as healthcheck.timeout said, or empty for the daemon's
+	// default. A rollback starts the release again and waits as long.
+	LabelHealthTimeout = "liman.healthcheck.timeout"
 )
 
 // The states of an engine's own health check (Docker's HEALTHCHECK), as
@@ -101,6 +105,8 @@ type Spec struct {
 	Domain     string
 	Kind       string
 	Strategy   string
+	// HealthTimeout is stored as a label too; zero means the default.
+	HealthTimeout time.Duration
 }
 
 // File is a file to put into a container.
@@ -147,6 +153,9 @@ type Container struct {
 	Domain     string
 	Kind       string
 	Strategy   string
+	// HealthTimeout is healthcheck.timeout, from its label; zero means
+	// the daemon's default.
+	HealthTimeout time.Duration
 
 	// Health is the state of the engine's own health check (one of the
 	// Health constants), "" when the container has none. HealthWindow is

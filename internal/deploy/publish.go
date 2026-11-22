@@ -86,6 +86,7 @@ func (d *Deployer) trialStep(st *state) pipeline.Step {
 				MemoryBytes:   st.memory,
 				CPUs:          a.Resources.CPUs,
 				HealthPath:    st.healthPath,
+				HealthTimeout: st.healthTimeout,
 				Kind:          a.Kind,
 			}); err != nil {
 				return err

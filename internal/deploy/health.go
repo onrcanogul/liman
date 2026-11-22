@@ -37,23 +37,28 @@ func (d *Deployer) waitHealthy(ctx context.Context, st *state) error {
 		return err
 	}
 
-	method, timeout := byInterval, d.HealthTimeout
+	// The app's own healthcheck.timeout, or the deployer's.
+	base := d.HealthTimeout
+	if st.healthTimeout > 0 {
+		base = st.healthTimeout
+	}
+	method, timeout := byInterval, base
 	url := ""
 	switch {
 	case st.healthPath != "" && st.hostPort != 0:
 		method = byPath
 		url = health.URL(st.hostIP, st.hostPort, st.healthPath)
-		d.detail("GET %s", url)
+		d.detail("GET %s (up to %s)", url, timeout)
 	case first.Health != "":
 		method = byImage
 		// Docker checks every 30 seconds unless the image says otherwise:
 		// waiting less than the image's own window would give up before
 		// its first verdict.
-		timeout = max(d.HealthTimeout, first.HealthWindow+d.HealthInterval)
+		timeout = max(base, first.HealthWindow+d.HealthInterval)
 		d.detail("waiting for the image's HEALTHCHECK (up to %s)", timeout)
 	case st.settle > 0:
 		method = bySettle
-		timeout = st.settle + d.HealthTimeout
+		timeout = st.settle + base
 		d.detail("no health check; the container must stay up for %s", st.settle)
 	default:
 		d.detail("no healthcheck defined; checking that the container stays up")

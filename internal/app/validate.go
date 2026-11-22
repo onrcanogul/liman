@@ -43,6 +43,8 @@ const (
 	maxDomainLength     = 253
 	maxCommandArgs      = 64
 	maxSettle           = 10 * time.Minute
+	minHealthTimeout    = time.Second
+	maxHealthTimeout    = 10 * time.Minute
 	maxHealthPathLength = 200
 	maxEnvVars          = 200
 )
@@ -251,8 +253,11 @@ func (a *App) Validate() error {
 		if s := time.Duration(a.Healthcheck.Settle); s < 0 || s > maxSettle {
 			errs = append(errs, fmt.Errorf("healthcheck.settle: must be between 0s and %s, got %s", maxSettle, s))
 		}
+		if d := time.Duration(a.Healthcheck.Timeout); d != 0 && !ValidHealthTimeout(d) {
+			errs = append(errs, fmt.Errorf("healthcheck.timeout: must be between %s and %s, got %s", minHealthTimeout, maxHealthTimeout, d))
+		}
 	}
-	if a.Healthcheck != nil && (a.Healthcheck.Path != "" || a.Healthcheck.Settle == 0) {
+	if a.Healthcheck != nil && (a.Healthcheck.Path != "" || (a.Healthcheck.Settle == 0 && a.Healthcheck.Timeout == 0)) {
 		path := a.Healthcheck.Path
 		switch {
 		case !strings.HasPrefix(path, "/"):
@@ -331,4 +336,11 @@ func (r Resources) MemoryBytes() (int64, error) {
 		n *= 1 << 30
 	}
 	return n, nil
+}
+
+// ValidHealthTimeout reports whether d is a health check timeout an app
+// definition may set. It is also how a timeout read back from a
+// container's label is checked.
+func ValidHealthTimeout(d time.Duration) bool {
+	return d >= minHealthTimeout && d <= maxHealthTimeout
 }
