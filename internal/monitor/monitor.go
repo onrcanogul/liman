@@ -340,7 +340,9 @@ func (m *Monitor) restart(ctx context.Context, eng engine.Engine, c engine.Conta
 	st.status.LastRestart = finished
 	// Wait before looking again: the app needs time to start, and an app
 	// that fails again and again must not be restarted in a tight loop.
-	delay := m.backoff(st.status.Restarts)
+	// An app that said how long it takes (healthcheck.timeout) gets at
+	// least that: a JVM would otherwise be restarted while it boots.
+	delay := max(m.backoff(st.status.Restarts), c.HealthTimeout)
 	st.notBefore = finished.Add(delay)
 	if err != nil {
 		st.status.Health = Down
