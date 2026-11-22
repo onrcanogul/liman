@@ -299,8 +299,6 @@ func TestTheServerIsHostDockerInternal(t *testing.T) {
 	}
 }
 
-// testEngine is the engine the tests run against: Docker, or Podman with
-// LIMAN_TEST_ENGINE=podman, or podman-rootless (CI runs all three).
 func TestLogsAreCapped(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -331,7 +329,11 @@ func TestLogsAreCapped(t *testing.T) {
 	}
 	got := info.Container.HostConfig.LogConfig
 	t.Logf("%s: log driver %q, options %v", opts.Name, got.Type, got.Config)
-	for k, v := range logOptions(c.logDriver) {
+	driver := c.logDriverNow(ctx)
+	if driver == "" {
+		t.Logf("%s: the engine names no log driver; liman caps nothing", opts.Name)
+	}
+	for k, v := range logOptions(driver) {
 		if got.Config[k] != v {
 			t.Errorf("log option %s = %q, want %q (driver %q)", k, got.Config[k], v, got.Type)
 		}
@@ -351,6 +353,8 @@ func TestLogsAreCapped(t *testing.T) {
 	}
 }
 
+// testEngine is the engine the tests run against: Docker, or Podman with
+// LIMAN_TEST_ENGINE=podman, or podman-rootless (CI runs all three).
 func testEngine() Options {
 	switch os.Getenv("LIMAN_TEST_ENGINE") {
 	case "podman":
