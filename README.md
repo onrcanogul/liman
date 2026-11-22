@@ -420,6 +420,9 @@ in five files (100 MB per container, what Docker's `local` driver keeps by
 default); `liman logs` reads them as before. Rootless Podman's `k8s-file`
 gets 20 MB, after which Podman starts the file again. Other drivers
 (journald, a log shipper) keep the settings the administrator gave them.
+Rootful Podman does not name its default driver to liman (CI: journald,
+reported as nothing), so liman leaves its logs alone; if yours writes to
+`k8s-file`, set `log_size_max` in `/etc/containers/containers.conf`.
 The cap is liman's, not the server's: a `max-size` or `max-file` set for
 `json-file` in `/etc/docker/daemon.json` gives way to it on liman's
 containers. A container started before the upgrade keeps growing until its
