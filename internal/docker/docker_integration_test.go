@@ -13,6 +13,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -330,12 +331,25 @@ func TestLogsAreCapped(t *testing.T) {
 	got := info.Container.HostConfig.LogConfig
 	t.Logf("%s: log driver %q, options %v", opts.Name, got.Type, got.Config)
 	driver := c.logDriverNow(ctx)
-	if driver == "" {
+	switch {
+	case driver == "":
 		t.Logf("%s: the engine names no log driver; liman caps nothing", opts.Name)
-	}
-	for k, v := range logOptions(driver) {
-		if got.Config[k] != v {
-			t.Errorf("log option %s = %q, want %q (driver %q)", k, got.Config[k], v, got.Type)
+	case opts.Name == "Podman" && logOptions(driver) != nil:
+		// Podman's Docker-compatible inspect calls k8s-file json-file and
+		// leaves the options out; its own API reports the size it keeps.
+		size, err := podmanLogSize(ctx, opts.Host, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("%s: %s keeps at most %q", opts.Name, driver, size)
+		if size == "" || size == "-1" || size == "0B" {
+			t.Errorf("Podman log size = %q, want a limit of about 20 MB", size)
+		}
+	default:
+		for k, v := range logOptions(driver) {
+			if got.Config[k] != v {
+				t.Errorf("log option %s = %q, want %q (driver %q)", k, got.Config[k], v, got.Type)
+			}
 		}
 	}
 
@@ -351,6 +365,42 @@ func TestLogsAreCapped(t *testing.T) {
 	if !strings.Contains(out.String(), "capped-logs-ok") {
 		t.Errorf("Logs() = %q, want the container's output", out.String())
 	}
+}
+
+// podmanLogSize asks Podman's own API (GET /libpod/containers/{name}/json)
+// how large the container's log file may grow, as Podman writes it ("-1"
+// or empty for no limit).
+func podmanLogSize(ctx context.Context, host, name string) (string, error) {
+	socket := strings.TrimPrefix(host, "unix://")
+	hc := &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+		},
+	}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://podman/v4.0.0/libpod/containers/"+name+"/json", nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("libpod inspect %s: %w", name, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("libpod inspect %s: %s", name, resp.Status)
+	}
+	var out struct {
+		HostConfig struct {
+			LogConfig struct {
+				Type string
+				Size string
+			}
+		}
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", fmt.Errorf("libpod inspect %s: %w", name, err)
+	}
+	return out.HostConfig.LogConfig.Size, nil
 }
 
 // testEngine is the engine the tests run against: Docker, or Podman with
