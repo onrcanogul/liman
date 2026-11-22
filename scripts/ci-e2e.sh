@@ -198,7 +198,7 @@ as_liman app list | grep mailer
 step "A database on the server, reached as host.docker.internal"
 # The README's recipe ("A database on the server"), as written there.
 command -v psql >/dev/null || { sudo apt-get update -qq; sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql >/dev/null; }
-PG=$(ls /etc/postgresql | sort -V | tail -1)
+PG=$(pg_lsclusters -h | awk '$2 == "main" { print $1 }' | sort -V | tail -1)
 GW=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')
 NET=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Subnet}}')
 echo "listen_addresses = 'localhost,$GW'" | sudo tee "/etc/postgresql/$PG/main/conf.d/docker.conf" >/dev/null
