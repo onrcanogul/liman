@@ -114,6 +114,9 @@ func (a *App) Fields() map[string]string {
 	// from the default, so that the checksum of a definition written
 	// before them stays what it was, and upgrading liman redeploys
 	// nothing by itself.
+	if a.Healthcheck != nil && a.Healthcheck.Timeout != 0 {
+		f["healthcheck.timeout"] = time.Duration(a.Healthcheck.Timeout).String()
+	}
 	if a.Kind != "" && a.Kind != KindWeb {
 		f["kind"] = a.Kind
 	}

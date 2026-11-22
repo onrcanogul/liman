@@ -478,6 +478,8 @@ func (c *Client) Inspect(ctx context.Context, ref string) (engine.Container, err
 		Domain:     trusted(info.Config.Labels[engine.LabelDomain], app.ValidDomain),
 		Kind:       trusted(info.Config.Labels[engine.LabelKind], isWorker),
 		Strategy:   trusted(info.Config.Labels[engine.LabelStrategy], isReplace),
+
+		HealthTimeout: healthTimeoutLabel(info.Config.Labels[engine.LabelHealthTimeout]),
 	}
 	if info.State != nil {
 		out.State = string(info.State.Status)
@@ -572,6 +574,8 @@ func (c *Client) List(ctx context.Context) ([]engine.Container, error) {
 			Domain:     trusted(item.Labels[engine.LabelDomain], app.ValidDomain),
 			Kind:       trusted(item.Labels[engine.LabelKind], isWorker),
 			Strategy:   trusted(item.Labels[engine.LabelStrategy], isReplace),
+
+			HealthTimeout: healthTimeoutLabel(item.Labels[engine.LabelHealthTimeout]),
 		}
 		if len(item.Names) > 0 {
 			ctr.Name = strings.TrimPrefix(item.Names[0], "/")
@@ -642,13 +646,32 @@ func labels(spec engine.Spec) map[string]string {
 	// labels are read back later and acted on (the health path is requested
 	// every few seconds, the domain is written into the proxy config).
 	return map[string]string{
-		engine.LabelApp:        spec.App,
-		engine.LabelRelease:    spec.Release,
-		engine.LabelHealthPath: spec.HealthPath,
-		engine.LabelDomain:     spec.Domain,
-		engine.LabelKind:       kindLabel(spec.Kind),
-		engine.LabelStrategy:   strategyLabel(spec.Strategy),
+		engine.LabelApp:           spec.App,
+		engine.LabelRelease:       spec.Release,
+		engine.LabelHealthPath:    spec.HealthPath,
+		engine.LabelDomain:        spec.Domain,
+		engine.LabelKind:          kindLabel(spec.Kind),
+		engine.LabelStrategy:      strategyLabel(spec.Strategy),
+		engine.LabelHealthTimeout: healthTimeoutText(spec.HealthTimeout),
 	}
+}
+
+// healthTimeoutText is the label's value: empty for the default.
+func healthTimeoutText(d time.Duration) string {
+	if d == 0 {
+		return ""
+	}
+	return d.String()
+}
+
+// healthTimeoutLabel reads the label back, checked like healthcheck.timeout
+// in a definition; anything else counts as not set.
+func healthTimeoutLabel(value string) time.Duration {
+	d, err := time.ParseDuration(value)
+	if err != nil || !app.ValidHealthTimeout(d) {
+		return 0
+	}
+	return d
 }
 
 func strategyLabel(strategy string) string {

@@ -62,11 +62,14 @@ func (d *Deployer) Rollback(ctx context.Context, appName string, opts Options) (
 		name:       appName,
 		domain:     target.Domain,
 		healthPath: target.HealthPath,
-		container:  target.Name,
-		release:    target.Release,
-		hostPort:   target.HostPort,
-		hostIP:     target.HostIP,
-		worker:     target.Worker(),
+		// What healthcheck.timeout said is on the container: a release
+		// that takes long to start gets as long again.
+		healthTimeout: target.HealthTimeout,
+		container:     target.Name,
+		release:       target.Release,
+		hostPort:      target.HostPort,
+		hostIP:        target.HostIP,
+		worker:        target.Worker(),
 		// Either release asking for it is enough: the one running may
 		// have been deployed with replace, the one coming back without.
 		replace: target.Replace() || current.Replace(),

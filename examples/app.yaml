@@ -26,3 +26,6 @@ resources:
 # Optional. Without it liman only waits for the container to be running.
 healthcheck:
   path: /health
+  # How long a release may take to become healthy; 30s unless set, at most
+  # 10m. A JVM app that takes half a minute to start needs more.
+  # timeout: 90s

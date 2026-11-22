@@ -178,6 +178,8 @@ func (f *Fake) Start(_ context.Context, spec engine.Spec) (string, error) {
 		Domain:     spec.Domain,
 		Kind:       workerOrNot(spec.Kind),
 		Strategy:   replaceOrNot(spec.Strategy),
+
+		HealthTimeout: spec.HealthTimeout,
 	})
 	return f.Containers[spec.Name].ID, nil
 }

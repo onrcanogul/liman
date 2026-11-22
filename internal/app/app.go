@@ -163,6 +163,10 @@ type Healthcheck struct {
 	// Settle is how long the container must stay up to count as healthy
 	// when there is neither a path nor an image HEALTHCHECK.
 	Settle Duration `yaml:"settle"`
+	// Timeout is how long a release may take to become healthy, however
+	// that is decided; zero leaves it to the daemon (30 seconds). A JVM
+	// app that takes half a minute to start needs more.
+	Timeout Duration `yaml:"timeout"`
 }
 
 // Load reads, parses and validates the app definition at path.
