@@ -1,8 +1,8 @@
-# A tag v1.2.3 makes a draft release: the binaries for Linux (limand
-# installs itself), install.sh, their checksums and a provenance
-# attestation, after every check in ci.yml has passed, with the notes in
-# docs/releases/v1.2.3.md. v0.x and tags with a hyphen (v1.0.0-rc.1) are
-# pre-releases. A person looks at the draft and publishes it:
+# A tag v1.2.3 makes a draft release: limand and liman for Linux (limand
+# installs itself), liman for macOS, install.sh, their checksums and a
+# provenance attestation, after every check in ci.yml has passed, with
+# the notes in docs/releases/v1.2.3.md. v0.x and tags with a hyphen
+# (v1.0.0-rc.1) are pre-releases. A person looks at the draft and publishes it:
 #   gh release edit v1.2.3 --draft=false
 # Run by hand, it builds and checks the files without making a release.
 name: release
@@ -39,6 +39,21 @@ jobs:
           go-version-file: go.mod
       - name: Build
         run: make release
+      # The macOS ones cannot run here, but their build information says
+      # what they were built for.
+      - name: Every binary is there, built for what its name says
+        run: |
+          for f in limand-linux-amd64 limand-linux-arm64 liman-linux-amd64 liman-linux-arm64 \
+                   liman-darwin-amd64 liman-darwin-arm64; do
+            got=$(go version -m "dist/$f" | awk '
+              $2 ~ /^GOOS=/   { os = substr($2, 6) }
+              $2 ~ /^GOARCH=/ { arch = substr($2, 8) }
+              END { print os "-" arch }')
+            test "$got" = "${f#*-}" ||
+              { echo "::error::dist/$f is built for '$got'"; exit 1; }
+            echo "dist/$f: $got"
+          done
+      # One make run gives every binary the same version.
       - name: The binaries say the version
         if: github.ref_type == 'tag'
         run: |
