@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end test on a fresh Ubuntu machine, as CI runs it: install liman
-# with install.sh, then deploy an app the way its pipeline would, through
+# with get.sh, piped to sh from a copy of a release served here, then with
+# install.sh again, then deploy an app the way its pipeline would, through
 # a registry and the trigger endpoint, and check what a user would see.
 #
 #   scripts/ci-e2e.sh            # on a throwaway machine only
@@ -20,6 +21,10 @@ STATE=/var/lib/liman
 WORK=$(mktemp -d)
 HOOKS=127.0.0.1:7443
 DOMAIN=whoami.test
+# get.sh downloads from here: the files of a release, laid out as GitHub
+# serves them (latest/download/<file>, download/<tag>/<file>).
+RELEASES=http://127.0.0.1:8780
+SERVER=
 
 step() { echo "::endgroup::"; echo "::group::$*"; }
 fail() { echo "::error::$*"; exit 1; }
@@ -32,6 +37,7 @@ on_exit() {
         echo "::group::nginx"; sudo nginx -t 2>&1 || true; sudo ls -l /etc/nginx/liman.d 2>/dev/null || true; echo "::endgroup::"
         echo "::group::containers"; docker ps -a || true; echo "::endgroup::"
     fi
+    [ -z "$SERVER" ] || kill "$SERVER" 2>/dev/null || true
     rm -rf "$WORK"
 }
 trap on_exit EXIT
@@ -48,6 +54,19 @@ step "Build"
 make release >/dev/null
 dist/limand-linux-amd64 version | head -1
 sudo install -m 0755 dist/liman-linux-amd64 /usr/local/bin/liman
+
+step "A release, served as GitHub does"
+REL=$WORK/releases
+mkdir -p "$REL/latest/download" "$REL/download/v0.0.0-tampered"
+cp dist/limand-linux-amd64 dist/limand-linux-arm64 deploy/install.sh deploy/get.sh "$REL/latest/download/"
+(cd "$REL/latest/download" && sha256sum -- * > SHA256SUMS)
+# The same list, with one byte added to the binary it lists.
+cp "$REL/latest/download/SHA256SUMS" "$REL/download/v0.0.0-tampered/"
+{ cat dist/limand-linux-amd64; printf x; } > "$REL/download/v0.0.0-tampered/limand-linux-amd64"
+python3 -m http.server --bind 127.0.0.1 --directory "$REL" 8780 >"$WORK/http.log" 2>&1 &
+SERVER=$!
+for _ in $(seq 50); do curl -fsS -o /dev/null "$RELEASES/latest/download/SHA256SUMS" && break; sleep 0.1; done
+get_sh() { curl -fsS "$RELEASES/latest/download/get.sh" | sudo env LIMAN_RELEASES="$RELEASES" sh -s -- "$@"; }
 
 step "install.sh refuses a stopped Nginx"
 command -v nginx >/dev/null || { sudo apt-get update -qq; sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx >/dev/null; }
@@ -67,12 +86,26 @@ grep -q 'give --proxy' <<<"$out" || fail "unexpected refusal: $out"
 [ "$had_liman" = yes ] || ! id liman >/dev/null 2>&1 || fail "install.sh changed the machine before refusing"
 echo "refused, nothing changed"
 
-step "install.sh, engine and proxy as found"
+step "get.sh refuses a file that does not match SHA256SUMS"
+if out=$(get_sh --version v0.0.0-tampered --listen 127.0.0.1:7070 2>&1); then
+    fail "get.sh installed a tampered file"
+fi
+grep -q 'does not match SHA256SUMS' <<<"$out" || fail "unexpected refusal: $out"
+[ ! -e /usr/local/bin/limand ] || fail "get.sh installed the binary before refusing"
+[ "$had_liman" = yes ] || ! id liman >/dev/null 2>&1 || fail "get.sh changed the machine before refusing"
+echo "refused, nothing changed"
+
+step "get.sh, piped to sh: engine and proxy as found"
 sudo systemctl enable --now nginx
-# No --engine, no --proxy, no terminal: Docker because it runs (Podman is
-# installed too), Nginx because it holds port 80.
-sudo deploy/install.sh --binary dist/limand-linux-amd64 --listen 127.0.0.1:7070 --hooks-listen "$HOOKS" </dev/null | tee "$WORK/install.log"
+# As the README has it: curl ... | sudo sh -s -- <flags>. No --engine, no
+# --proxy, no terminal: Docker because it runs (Podman is installed too),
+# Nginx because it holds port 80.
+get_sh --listen 127.0.0.1:7070 --hooks-listen "$HOOKS" | tee "$WORK/install.log"
+grep -q 'Checksum: matches SHA256SUMS' "$WORK/install.log" || fail "get.sh did not check the checksum"
 grep -q 'Installing: docker, proxy nginx' "$WORK/install.log" || fail "not what was found"
+cmp -s dist/limand-linux-amd64 /usr/local/bin/limand || fail "the installed limand is not the released one"
+left=$(sudo find /tmp -maxdepth 2 -name 'limand-linux-*')
+[ -z "$left" ] || fail "get.sh left its download behind: $left"
 systemctl is-active limand
 sudo ss -ltn | grep -q " $HOOKS " || fail "nothing listens on $HOOKS"
 
