@@ -111,8 +111,16 @@ if [ "$MODE" = rootless ]; then
     step "The engine's integration tests, against liman's rootless Podman"
     go test -c -tags integration -o "$WORK/docker.test" ./internal/docker/
     chmod 755 "$WORK/docker.test"
+    # limand is stopped while they run: its health monitor looks after every
+    # container with a liman.app label on this Podman, the tests' too, and
+    # would restart the one they have just killed or stopped. On a server a
+    # deploy or a stop holds the app's lock and the monitor waits; the tests
+    # do not take it. (Against rootful Podman they run before the install.)
+    sudo systemctl stop limand
     as_liman LIMAN_TEST_ENGINE=podman-rootless LIMAN_TEST_SOCKET="$S" "$WORK/docker.test" -test.count=1 ||
         fail "the integration tests fail on rootless Podman"
+    sudo systemctl start limand
+    for _ in $(seq 1 20); do curl -s -o /dev/null http://127.0.0.1:7070/ && break; sleep 0.5; done
 else
     # The socket's directory, as liman's tmpfiles rule makes it at boot
     # even with Podman's own rule there: all of them, as at boot.
