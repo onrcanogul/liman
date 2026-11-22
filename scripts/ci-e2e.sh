@@ -195,6 +195,50 @@ fi
 grep -q 'registered as a worker' <<<"$out" || fail "unexpected refusal: $out"
 as_liman app list | grep mailer
 
+step "A database on the server, reached as host.docker.internal"
+# The README's recipe ("A database on the server"), as written there.
+command -v psql >/dev/null || { sudo apt-get update -qq; sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql >/dev/null; }
+PG=$(ls /etc/postgresql | sort -V | tail -1)
+GW=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')
+NET=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Subnet}}')
+echo "listen_addresses = 'localhost,$GW'" | sudo tee "/etc/postgresql/$PG/main/conf.d/docker.conf" >/dev/null
+echo "host all all $NET scram-sha-256" | sudo tee -a "/etc/postgresql/$PG/main/pg_hba.conf" >/dev/null
+sudo install -d /etc/systemd/system/postgresql@.service.d
+printf '[Unit]\nAfter=docker.service\n' | sudo tee /etc/systemd/system/postgresql@.service.d/after-docker.conf >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl restart "postgresql@$PG-main"
+systemctl show "postgresql@$PG-main" -p After | grep -q docker.service || fail "PostgreSQL is not ordered after Docker"
+PGPW=$(openssl rand -hex 16)
+sudo -u postgres psql -q -v ON_ERROR_STOP=1 -v pw="$PGPW" <<'SQL'
+CREATE ROLE shop LOGIN PASSWORD :'pw';
+CREATE DATABASE shop OWNER shop;
+REVOKE CONNECT ON DATABASE shop FROM PUBLIC;
+SQL
+docker pull -q postgres:17-alpine >/dev/null
+docker tag postgres:17-alpine localhost:5000/dbcheck:ci
+DB_DIGEST=$(docker push localhost:5000/dbcheck:ci | grep -o 'sha256:[0-9a-f]\{64\}' | tail -1)
+sudo install -d -o liman -g liman -m 0700 "$STATE/e2e"
+as_liman app create dbcheck --repo localhost:5000/dbcheck --worker \
+    --write-client "$STATE/e2e/dbcheck.yaml" --url "http://$HOOKS"
+mkdir -m 0700 "$WORK/dbcheck"
+sudo install -m 0600 -o "$(id -u)" -g "$(id -g)" "$STATE/e2e/dbcheck.yaml" "$WORK/dbcheck/client.yaml"
+sudo rm -rf "$STATE/e2e"
+cat > "$WORK/dbcheck.yaml" <<'YAML'
+name: dbcheck
+image: localhost:5000/dbcheck
+kind: worker
+env:
+  DATABASE_URL: ${DATABASE_URL}
+# Writes once, then stays up for the worker's settle time and after.
+command: [sh, -c, 'psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c "create table if not exists liman_ok (at timestamptz default now())" && exec sleep infinity']
+deploy:
+  strategy: replace
+YAML
+LIMAN_HOME="$WORK/dbcheck" DATABASE_URL="postgresql://shop:$PGPW@host.docker.internal:5432/shop" \
+    liman trigger --digest "$DB_DIGEST" --file "$WORK/dbcheck.yaml" | tee "$WORK/dbcheck.log"
+[ "$(sudo -u postgres psql -d shop -tAc "select to_regclass('liman_ok')")" = liman_ok ] ||
+    fail "the app did not reach the server's PostgreSQL"
+
 step "A fixed port: tried first, then on its endpoint"
 sudo install -d -o liman -g liman -m 0700 "$STATE/e2e"
 as_liman app create edge --repo localhost:5000/whoami --publish 127.0.0.1:8090 \
