@@ -1736,3 +1736,7 @@ scripts/             local development helpers, the tests CI runs, and the scrip
 docs/releases/       the notes of each release, written before its tag
 .github/             CI, release and weekly workflows; Dependabot; the rules for main and release tags
 ```
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
