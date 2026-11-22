@@ -115,3 +115,14 @@ func TestImageExistsOnPodmanAsksTheRegistry(t *testing.T) {
 		t.Errorf("an image that is not there: %v, %v", ok, err)
 	}
 }
+
+// Docker on Linux has no name for the server; Docker Desktop and Podman
+// add host.docker.internal themselves.
+func TestOnlyDockerNeedsTheHostGatewayEntry(t *testing.T) {
+	if !ForDocker("").HostGateway {
+		t.Error("ForDocker: HostGateway = false, want true: Docker on Linux has no host.docker.internal")
+	}
+	if ForPodman("").HostGateway || ForPodmanRootless("/tmp/p.sock").HostGateway {
+		t.Error("Podman presets: HostGateway = true, want false: Podman adds the name itself")
+	}
+}

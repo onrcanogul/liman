@@ -86,11 +86,21 @@ type Options struct {
 	// LogDriver is where containers write their output; empty is the
 	// engine's default.
 	LogDriver string
+	// HostGateway adds host.docker.internal, pointing at the server, to
+	// every container, so an app reaches a database on the server by a
+	// name that is the same everywhere. Docker on Linux needs it; Docker
+	// Desktop and Podman add the name themselves. It opens nothing new:
+	// the address behind it is reachable from containers anyway.
+	HostGateway bool
 }
+
+// hostGateway is the extra host HostGateway adds; host-gateway is
+// Docker's word for the server's address on the container's network.
+const hostGateway = "host.docker.internal:host-gateway"
 
 // ForDocker is Docker, at host (empty for DOCKER_HOST or the default).
 func ForDocker(host string) Options {
-	return Options{Name: "Docker", Host: host, AuthFiles: dockerAuthFiles(), RegistryCheck: CheckDistribution}
+	return Options{Name: "Docker", Host: host, AuthFiles: dockerAuthFiles(), RegistryCheck: CheckDistribution, HostGateway: true}
 }
 
 // DefaultPodmanSocket is rootful Podman's API socket, which systemd opens
@@ -292,6 +302,9 @@ func (c *Client) Start(ctx context.Context, spec engine.Spec) (string, error) {
 	}
 	if c.opts.LogDriver != "" {
 		hostCfg.LogConfig = container.LogConfig{Type: c.opts.LogDriver}
+	}
+	if c.opts.HostGateway {
+		hostCfg.ExtraHosts = []string{hostGateway}
 	}
 	// A worker publishes no port: nothing on the host reaches it.
 	if spec.ContainerPort != 0 {
