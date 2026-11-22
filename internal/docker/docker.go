@@ -48,9 +48,6 @@ type Client struct {
 	// lowestPort is the lowest host port a rootless engine can publish;
 	// 0 for no limit.
 	lowestPort int
-	// logDriver is where containers' output goes: the preset's, or the
-	// engine's default. It decides whether liman caps the logs.
-	logDriver string
 }
 
 // RegistryCheck is how ImageExists asks a registry whether it has an image.
@@ -194,19 +191,28 @@ func Connect(ctx context.Context, opts Options) (*Client, error) {
 	if len(opts.AuthFiles) > 0 {
 		creds = newCredentialStoreIn(opts.AuthFiles)
 	}
-	c := &Client{api: api, creds: creds, opts: opts, logDriver: opts.LogDriver}
+	c := &Client{api: api, creds: creds, opts: opts}
 	if opts.Rootless {
 		c.lowestPort = unprivilegedPortStart()
 	}
-	if c.logDriver == "" {
-		// GET /info. The driver the administrator set in daemon.json (or
-		// containers.conf); without an answer liman sets no options, which
-		// is what it did before.
-		if info, err := api.Info(ctx, client.InfoOptions{}); err == nil {
-			c.logDriver = info.Info.LoggingDriver
-		}
-	}
 	return c, nil
+}
+
+// logDriverNow is where a container started now writes its output: the
+// preset's driver, or the engine's default (GET /info). It is asked for
+// every container, not once: the daemon keeps one client for its life,
+// and the administrator may change daemon.json and restart the engine
+// without restarting limand. Without an answer it is "", and liman sets
+// no options, which is what it did before.
+func (c *Client) logDriverNow(ctx context.Context) string {
+	if c.opts.LogDriver != "" {
+		return c.opts.LogDriver
+	}
+	info, err := c.api.Info(ctx, client.InfoOptions{})
+	if err != nil {
+		return ""
+	}
+	return info.Info.LoggingDriver
 }
 
 // logOptions caps a container's output on the drivers that keep it in
@@ -326,8 +332,8 @@ func (c *Client) Start(ctx context.Context, spec engine.Spec) (string, error) {
 	if c.opts.NetworkMode != "" {
 		hostCfg.NetworkMode = container.NetworkMode(c.opts.NetworkMode)
 	}
-	if logOpts := logOptions(c.logDriver); c.opts.LogDriver != "" || logOpts != nil {
-		hostCfg.LogConfig = container.LogConfig{Type: c.logDriver, Config: logOpts}
+	if driver := c.logDriverNow(ctx); c.opts.LogDriver != "" || logOptions(driver) != nil {
+		hostCfg.LogConfig = container.LogConfig{Type: driver, Config: logOptions(driver)}
 	}
 	if c.opts.HostGateway {
 		hostCfg.ExtraHosts = []string{hostGateway}
