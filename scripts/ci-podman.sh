@@ -67,7 +67,7 @@ else
 
     step "The engine's integration tests, against rootful Podman"
     as_root "GOPATH=$(go env GOPATH)" "GOMODCACHE=$(go env GOMODCACHE)" "GOCACHE=$(go env GOCACHE)" \
-        LIMAN_TEST_ENGINE=podman go test -count=1 -tags integration ./internal/docker/
+        LIMAN_TEST_ENGINE=podman go test -v -count=1 -tags integration ./internal/docker/
 fi
 
 step "A registry that wants a password"
@@ -117,7 +117,7 @@ if [ "$MODE" = rootless ]; then
     # deploy or a stop holds the app's lock and the monitor waits; the tests
     # do not take it. (Against rootful Podman they run before the install.)
     sudo systemctl stop limand
-    as_liman LIMAN_TEST_ENGINE=podman-rootless LIMAN_TEST_SOCKET="$S" "$WORK/docker.test" -test.count=1 ||
+    as_liman LIMAN_TEST_ENGINE=podman-rootless LIMAN_TEST_SOCKET="$S" "$WORK/docker.test" -test.v -test.count=1 ||
         fail "the integration tests fail on rootless Podman"
     sudo systemctl start limand
     for _ in $(seq 1 20); do curl -s -o /dev/null http://127.0.0.1:7070/ && break; sleep 0.5; done
