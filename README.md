@@ -2,13 +2,85 @@
 
 [![ci](https://github.com/onrcanogul/liman/actions/workflows/ci.yml/badge.svg)](https://github.com/onrcanogul/liman/actions/workflows/ci.yml)
 
-A small PaaS for a single server, written in Go. It automates the deploy steps
-usually done by hand over SSH: pull an image, start a container with limits,
-health check it, point the proxy (Nginx, Caddy or Traefik) at it, remove the
-old one.
+**Deploy containers to your own server, one visible step at a time.**
 
-This is a learning project. See [ROADMAP.md](ROADMAP.md) for the plan and
-current status.
+liman puts an image your CI built into service on a single Linux server. It
+starts the new release next to the running one, health checks it, points your
+proxy (Nginx, Caddy or Traefik) at it, waits until the proxy really serves it,
+and only then stops the old one. Every step is shown before it runs, and
+undone if it fails.
+
+```
+$ liman deploy --dry-run examples/whoami.yaml
+Dry run for whoami: nothing will be changed.
+
+==> [1/5] Pull image traefik/whoami:v1.10
+    $ docker pull traefik/whoami:v1.10
+==> [2/5] Allocate a free host port
+==> [3/5] Start container whoami-20261119-181805-123
+    $ docker run -d --name whoami-20261119-181805-123 --label liman.app=whoami -p 127.0.0.1:<free port>:80 --memory 64m --cpus 0.5 -e WHOAMI_NAME=*** traefik/whoami:v1.10
+==> [4/5] Health check
+    $ curl --fail http://127.0.0.1:<free port>/health
+==> [5/5] Retire previous containers of whoami
+    $ docker stop <current container of whoami>   # kept for rollback; older ones are removed
+```
+
+## Why liman
+
+- **Nothing hidden.** `--dry-run` prints every step with the command you
+  would have typed by hand; `--step` asks before each one.
+- **A failed deploy changes nothing.** The completed steps are undone in
+  reverse order and the previous release keeps serving. `liman rollback`
+  puts the previous release back.
+- **Zero downtime you can check.** The old release stops only after the
+  proxy answers with the new release's header, and requests it had already
+  accepted get time to finish.
+- **It moves in next to what you have.** One file per app in its own
+  directory and one include line in your proxy's config; your hand-written
+  sites stay as they are. Docker or rootless Podman; Nginx, Caddy, Traefik,
+  or no proxy at all.
+- **Made to be left alone.** A health monitor restarts apps that stop
+  answering, Let's Encrypt certificates renew themselves, backups are one
+  command, and a web panel shows what is going on.
+- **Locked down by default.** The API listens only on loopback or a private
+  network. Tokens are stored hashed and can be read-only or limited to one
+  app. Secrets are encrypted at rest, every change goes into an audit trail,
+  and the release binaries come with build attestations.
+- **One binary on the server.** No database server and no queue: state
+  lives in SQLite.
+
+## liman and the alternatives
+
+| | liman | Kamal | Dokku | Coolify |
+|---|---|---|---|---|
+| You deploy with | a CLI that talks to a daemon on the server | a CLI that runs commands over SSH | `git push` to the server | a web dashboard |
+| Images are built | in your CI | by Kamal, on a builder you choose | on the server | on the server, or pulled ready-made |
+| Proxy | your own Nginx, Caddy or Traefik | kamal-proxy | its own Nginx, by default | its own Traefik or Caddy |
+| Servers | one | many | one, by default | many |
+
+liman fits when you have one server, your CI already builds images, and you
+want to see and control every step. Something else fits better if you want to
+click through a dashboard (Coolify), push source code and have it built
+(Dokku), deploy to several servers (Kamal, Coolify), or run several copies of
+one app behind a load balancer: liman runs one container per app.
+
+## Try it
+
+- **On your machine**, with Go 1.27+ and Docker: clone the repository, run
+  `make build`, and follow [Quick start](#quick-start-everything-on-one-machine).
+- **On a server**: download `limand` from the
+  [releases](https://github.com/onrcanogul/liman/releases) and run
+  `sudo ./limand-linux-amd64 install`, which looks at the server and asks a
+  few questions. The API needs a private network between the server and your
+  machine first; see [Installing on a server](#installing-on-a-server).
+
+## Status
+
+Early. v0.1.0 is a pre-release. On every change, CI installs liman as a
+service and deploys real images through it: with Docker and Nginx, and with
+rootless and rootful Podman and Caddy. liman has not run a production server
+yet. It started as a project to learn Go and infrastructure; see
+[ROADMAP.md](ROADMAP.md).
 
 ## How it fits together
 
