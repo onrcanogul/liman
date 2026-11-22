@@ -739,6 +739,69 @@ secrets in the database are sealed with it, and lists the backups signed
 with it, which only `--force` gives up. After that those backups cannot be
 checked or restored, unless the key file is put back.
 
+## A database on the server
+
+An app that connects to `localhost` reaches its own container, not the
+server. A database that runs on the server itself, PostgreSQL installed
+with apt for example, is reached as `host.docker.internal`: liman adds the
+name to every container on Docker, and Podman adds it on its own.
+
+```sh
+liman secret set shop DATABASE_URL
+# postgresql://shop:<password>@host.docker.internal:5432/shop
+# Spring Boot: SPRING_DATASOURCE_URL=jdbc:postgresql://host.docker.internal:5432/shop
+```
+
+One PostgreSQL for all the apps on the server, with a database and a user
+of its own for each, is the usual setup:
+
+```sql
+CREATE ROLE shop LOGIN PASSWORD '...';
+CREATE DATABASE shop OWNER shop;
+REVOKE CONNECT ON DATABASE shop FROM PUBLIC;
+```
+
+PostgreSQL listens on `localhost` only, by default, and a container is not
+`localhost` to it. Where the connections come from depends on the engine:
+
+| Engine | Connections come from | PostgreSQL listens on |
+|---|---|---|
+| Docker | Docker's bridge, `172.17.0.0/16` | `localhost` and the bridge's gateway, `172.17.0.1` |
+| Podman | Podman's network, `10.88.0.0/16` | `*` (the network exists only while a container runs) |
+| Podman, rootless | the server's own address | `localhost` and the server's address |
+
+Docker's addresses can differ on a server that sets its own:
+`docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}} {{(index .IPAM.Config 0).Subnet}}'`
+prints both. With Docker, as CI sets it up on a fresh Ubuntu server and then
+deploys an app through liman that writes to its database:
+
+```sh
+# /etc/postgresql/<version>/main/conf.d/docker.conf
+listen_addresses = 'localhost,172.17.0.1'
+
+# appended to /etc/postgresql/<version>/main/pg_hba.conf
+host all all 172.17.0.0/16 scram-sha-256
+
+# /etc/systemd/system/postgresql@.service.d/after-docker.conf
+[Unit]
+After=docker.service
+```
+
+then `systemctl daemon-reload` and restart PostgreSQL. The last file is
+about booting: PostgreSQL cannot listen on `172.17.0.1` before Docker has
+made its bridge. Started first, it warns that it could not create a
+listen socket for that address, listens on `localhost` only, and the apps
+cannot connect until it is restarted.
+
+With Podman, the `pg_hba.conf` line names the network or the address of
+the table instead. CI checks the Docker row end to end; the Podman rows
+say where CI saw a container's connection to the server come from. Listening on `*`, or on a server's public address,
+puts the port on the internet: `pg_hba.conf` turns away everyone it does
+not name, but close 5432 to the outside in the firewall all the same. A
+firewall is also the first thing to check when an app cannot connect:
+`ufw` drops traffic from containers to the server unless it is allowed,
+`ufw allow in on docker0 to any port 5432` for Docker.
+
 ## The panel
 
 While it runs, the daemon serves a web panel at `/ui/` on its listen address (`http://127.0.0.1:7070/ui/` by default):
