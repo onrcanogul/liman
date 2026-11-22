@@ -749,7 +749,16 @@ name to every container on Docker, and Podman adds it on its own.
 ```sh
 liman secret set shop DATABASE_URL
 # postgresql://shop:<password>@host.docker.internal:5432/shop
-# Spring Boot: SPRING_DATASOURCE_URL=jdbc:postgresql://host.docker.internal:5432/shop
+```
+
+Spring Boot's JDBC URL carries no user or password, so it takes three:
+
+```yaml
+env:
+  SPRING_DATASOURCE_URL: "jdbc:postgresql://host.docker.internal:5432/shop"
+  SPRING_DATASOURCE_USERNAME: "shop"
+secrets:
+  - SPRING_DATASOURCE_PASSWORD
 ```
 
 One PostgreSQL for all the apps on the server, with a database and a user
@@ -768,7 +777,7 @@ PostgreSQL listens on `localhost` only, by default, and a container is not
 |---|---|---|
 | Docker | Docker's bridge, `172.17.0.0/16` | `localhost` and the bridge's gateway, `172.17.0.1` |
 | Podman | Podman's network, `10.88.0.0/16` | `*` (the network exists only while a container runs) |
-| Podman, rootless | the server's own address | `localhost` and the server's address |
+| Podman, rootless | the server's own address | `*` (the address may come up after PostgreSQL does) |
 
 Docker's addresses can differ on a server that sets its own:
 `docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}} {{(index .IPAM.Config 0).Subnet}}'`
@@ -793,11 +802,17 @@ made its bridge. Started first, it warns that it could not create a
 listen socket for that address, listens on `localhost` only, and the apps
 cannot connect until it is restarted.
 
-With Podman, the `pg_hba.conf` line names the network or the address of
-the table instead. CI checks the Docker row end to end; the Podman rows
-say where CI saw a container's connection to the server come from. Listening on `*`, or on a server's public address,
-puts the port on the internet: `pg_hba.conf` turns away everyone it does
-not name, but close 5432 to the outside in the firewall all the same. A
+With Podman, `listen_addresses = '*'` and no systemd file: Podman's
+network appears only with its first container, and a cloud server's own
+address often arrives by DHCP after PostgreSQL has started, so listening
+on a named address there fails the same way after a reboot. The
+`pg_hba.conf` line uses that row's network, or for rootless Podman the
+server's address as a `/32`. CI checks the Docker row end to end; the
+Podman rows say where CI saw a container's connection come from.
+
+Listening on `*` puts the port on the internet: `pg_hba.conf` turns away
+everyone it does not name, but close 5432 to the outside in the firewall
+all the same. A
 firewall is also the first thing to check when an app cannot connect:
 `ufw` drops traffic from containers to the server unless it is allowed,
 `ufw allow in on docker0 to any port 5432` for Docker.
