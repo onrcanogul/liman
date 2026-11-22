@@ -692,3 +692,28 @@ func TestWorkerWithoutAHealthcheckIsOnlyCheckedForRunning(t *testing.T) {
 		t.Errorf("restarts %d, probes %d; want neither", f.engine.RestartCount["mailer-r1"], f.probes)
 	}
 }
+
+func TestASlowAppGetsItsHealthTimeoutAfterARestart(t *testing.T) {
+	f := newFixture(t)
+	name := "api-r1"
+	f.engine.Add(engine.Container{Name: name, App: "api", HostPort: 40001, Release: "r1", HealthPath: "/health",
+		HealthTimeout: 90 * time.Second})
+	f.advance(interval)
+
+	// It crashes and is restarted; like a JVM, it does not answer for a
+	// while after that.
+	f.engine.SetState(name, "exited")
+	f.advance(interval)
+	f.setProbe(40001, errors.New("connection refused"))
+	if st := f.health(t, "api"); !strings.Contains(st.Detail, "next check in 1m30s") {
+		t.Errorf("status = %+v, want the next check after its 90s health timeout", st)
+	}
+
+	// The time healthcheck.timeout gave it is not cut short.
+	for elapsed := time.Duration(0); elapsed < 85*time.Second; elapsed += interval {
+		f.advance(interval)
+	}
+	if got := f.engine.Restarts(name); got != 1 {
+		t.Errorf("restarts = %d within its 90s health timeout, want 1", got)
+	}
+}
