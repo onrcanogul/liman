@@ -301,6 +301,56 @@ func TestTheServerIsHostDockerInternal(t *testing.T) {
 
 // testEngine is the engine the tests run against: Docker, or Podman with
 // LIMAN_TEST_ENGINE=podman, or podman-rootless (CI runs all three).
+func TestLogsAreCapped(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	opts := testEngine()
+	c, err := Connect(ctx, opts)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	const name = "liman-integration-logs"
+	_ = c.Remove(ctx, name)
+	t.Cleanup(func() { _ = c.Remove(context.Background(), name) })
+	if err := c.Pull(ctx, probeImage, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	// The engine must accept the options, and the output must still be
+	// readable through them.
+	if _, err := c.Start(ctx, engine.Spec{
+		App: "liman-integration", Name: name, Image: probeImage, Kind: "worker",
+		Command: []string{"sh", "-c", "echo capped-logs-ok; exec sleep 60"},
+	}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	info, err := c.api.ContainerInspect(ctx, name, client.ContainerInspectOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := info.Container.HostConfig.LogConfig
+	t.Logf("%s: log driver %q, options %v", opts.Name, got.Type, got.Config)
+	for k, v := range logOptions(c.logDriver) {
+		if got.Config[k] != v {
+			t.Errorf("log option %s = %q, want %q (driver %q)", k, got.Config[k], v, got.Type)
+		}
+	}
+
+	var out strings.Builder
+	deadline := time.Now().Add(20 * time.Second)
+	for !strings.Contains(out.String(), "capped-logs-ok") && time.Now().Before(deadline) {
+		out.Reset()
+		if err := c.Logs(ctx, name, false, &out, &out); err != nil {
+			t.Fatalf("Logs() error = %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if !strings.Contains(out.String(), "capped-logs-ok") {
+		t.Errorf("Logs() = %q, want the container's output", out.String())
+	}
+}
+
 func testEngine() Options {
 	switch os.Getenv("LIMAN_TEST_ENGINE") {
 	case "podman":
