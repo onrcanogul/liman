@@ -66,11 +66,17 @@ one app behind a load balancer: liman runs one container per app.
 
 ## Try it
 
-- **On a server**: download `limand` from the
-  [releases](https://github.com/onrcanogul/liman/releases) and run
-  `sudo ./limand-linux-amd64 install`, which looks at the server and asks a
-  few questions. The API needs a private network between the server and your
-  machine first; see [Installing on a server](#installing-on-a-server).
+- **On a server**, one command downloads `limand` for its CPU, checks it
+  against the release's checksums, and installs it as a service, asking a
+  few questions about the server:
+
+  ```
+  curl -fsSL https://github.com/onrcanogul/liman/releases/latest/download/get.sh | sudo sh -s -- --listen 10.8.0.1:7070
+  ```
+
+  The API needs a private network between the server and your machine
+  first, and the script can be read before it runs; see
+  [Installing on a server](#installing-on-a-server).
 - **On your machine**, the CLI: download `liman` for macOS
   (`liman-darwin-arm64`, or `liman-darwin-amd64` on Intel) or Linux from the
   same release. It needs no Go and no Docker, only the server's address and
@@ -1182,6 +1188,37 @@ Caddy or Traefik, running (liman has it load every deploy), or none for apps
 on fixed ports and workers; and a private network between it and your
 machine (WireGuard below). The installer adds no packages.
 
+**The short way.** Once the server has its private address (step 2),
+one command downloads, checks and installs `limand` from the latest
+release:
+
+```
+curl -fsSL https://github.com/onrcanogul/liman/releases/latest/download/get.sh | sudo sh -s -- --listen 10.8.0.1:7070
+```
+
+[get.sh](deploy/get.sh) downloads `limand-linux-amd64` or `-arm64`, as the
+server is, and `SHA256SUMS` into a temporary directory, removed
+afterwards, and installs nothing unless the checksum matches. When `gh` is
+logged in on the server it checks the attestation too (step 1), and
+otherwise says it did not. Then it runs `limand install` (step 3) with
+every other flag as given: what the flags leave open it asks, reading the
+answers from the terminal although its input is the pipe; without a
+terminal (cloud-init, Ansible) flags decide. `--version v0.1.3` installs
+that release instead of the latest.
+
+A script piped to `sudo sh` runs as root, so read it before it runs:
+
+```
+curl -fsSLO https://github.com/onrcanogul/liman/releases/latest/download/get.sh
+gh attestation verify get.sh --repo onrcanogul/liman   # optional: built by the release workflow
+less get.sh
+sudo sh get.sh --listen 10.8.0.1:7070
+```
+
+Its checksum comes from the same release as the binary: it proves the
+download arrived whole, not who made it; the attestation does that. The
+steps below are the same by hand, with every file checked yourself.
+
 **1. The binaries.** Each [release](https://github.com/onrcanogul/liman/releases)
 has, built by the release workflow from the tagged commit:
 
@@ -1192,7 +1229,7 @@ has, built by the release workflow from the tagged commit:
 | `liman-darwin-arm64` | your Mac, with Apple silicon |
 | `liman-darwin-amd64` | your Mac, with an Intel CPU |
 
-with `install.sh` and `SHA256SUMS`. Check both that the files are intact
+with `install.sh`, `get.sh` and `SHA256SUMS`. Check both that the files are intact
 and where they were built, on the server:
 
 ```
@@ -1247,8 +1284,8 @@ server's public key, `Endpoint = <server's public IP>:51820` and
 pubkey`. Open UDP port 51820 in the server's firewall, then
 `systemctl enable --now wg-quick@wg0`.
 
-**3. Install.** The binary installs itself (`install.sh` does the same,
-for the command lines written for it):
+**3. Install.** The binary installs itself (`get.sh` ends with the same
+command, and `install.sh` does it for the command lines written for it):
 
 ```
 $ sudo ./limand-linux-amd64 install
@@ -1356,7 +1393,8 @@ For private images, log in as the daemon's user:
 
 ### Upgrading
 
-Copy the new `limand` to the server and run it, or `install.sh`, again:
+Run the one-line installer again, which takes the latest release, or copy
+the new `limand` to the server and run it, or `install.sh`, again:
 
 ```
 sudo ./limand-linux-amd64 install
@@ -1826,7 +1864,9 @@ minutes in all:
   switched from one upstream to another under load without a failed
   request.
 - **end to end:** [scripts/ci-e2e.sh](scripts/ci-e2e.sh) on the runner's
-  fresh Ubuntu, as on a new server: `install.sh`, a local registry, an app
+  fresh Ubuntu, as on a new server: `get.sh` piped to `sudo sh` from a
+  copy of a release served on the runner (after refusing one whose binary
+  does not match its `SHA256SUMS`), `install.sh` again, a local registry, an app
   registered with a deploy and a preview key, a preview, deploys through
   the trigger endpoint, what Nginx serves, a worker (no port, no Nginx
   config, its key refused a domain), an app on a fixed port (tried first,
@@ -1882,7 +1922,7 @@ It runs ci.yml again, builds the binaries with the tag as their version
 (`limand` and `liman` for Linux, `liman` for macOS, each for amd64 and
 arm64), checks that each is built for what its name says and that they
 say the tag, and makes a **draft** release with them, `install.sh`,
-`SHA256SUMS` and a provenance attestation. Tags with a hyphen
+`get.sh`, `SHA256SUMS` and a provenance attestation. Tags with a hyphen
 (`v1.0.0-rc.1`) are marked pre-releases; any other, v0.x too, becomes the
 latest release once published, which is what `get.sh` installs (GitHub
 never counts a pre-release as the latest). Nobody sees a draft; after
@@ -1945,7 +1985,7 @@ internal/applock/    per-app lock shared by the API and the monitor
 internal/textdiff/   line diff used to preview config changes
 internal/loadtest/   small load generator used by the load tests
 internal/buildinfo/  version metadata injected at build time
-deploy/              install.sh, which hands over to limand install
+deploy/              install.sh, and get.sh (download, check, install): both hand over to limand install
 internal/install/    limand install: what is on the server, the choices, the steps; the systemd units
 scripts/             local development helpers, the tests CI runs, and the script that applies the GitHub rules
 docs/releases/       the notes of each release, written before its tag
